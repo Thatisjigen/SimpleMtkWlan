@@ -55,7 +55,8 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   (tags follow Linux `mt76_connac_mcu.h`).
 - `mtk80211/openbsd/net80211/`: 802.11 stack (state machine, EAPOL, crypto, BA
   reordering). `mtk80211/compat.cpp`: bus_dma, interrupts, timeouts glue.
-- `include/FwBinary.cpp`: embedded firmware (MT7961 = MT7921/RZ608, MT7922).
+- `include/FwBinary.cpp`: embedded firmware (MT7961 = MT7921/RZ608, MT7922);
+  MT7920 comes from `include/FwMT7920.inc`, generated, not in Git.
 
 ## Logging and debugging
 

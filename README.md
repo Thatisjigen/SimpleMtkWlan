@@ -68,6 +68,7 @@ hardware layer:
 | MediaTek MT7922 (RZ616) | `14c3:0616` | 15.6 / 26.7.1 Tahoe | PCIe attach and MT7922 firmware selection verified; Tahoe native Wi-Fi, WPA2, VHT160/HE160 2-NSS, about 460–500 Mbit/s in the local HTTPS test |
 | MediaTek MT7922 | `14c3:7922` | Tahoe (upstream PR #5) | legacy 20 MHz on 5 GHz |
 | MediaTek MT7921 | `14c3:7961` | — | same chip family as RZ608, expected to work |
+| MediaTek MT7920 | `14c3:7920` | — | branch `acer/mt7920`: detection and firmware as in Linux, builds and links on 26.7.2 (25G332); **not run on a card yet** |
 
 Other MediaTek devices are not supported.
 
@@ -211,6 +212,16 @@ UBSan by default; CI can enable ASan as well):
 
 CI builds Debug and Release on every push and pull request; pushing a tag
 `vX.Y.Z` publishes a GitHub release with the zipped kexts.
+
+### MT7920 firmware
+
+The MT7920 needs its own firmware pair (`WIFI_MT7961_patch_mcu_1a_2_hdr.bin`,
+`WIFI_RAM_CODE_MT7961_1a.bin`). MediaTek's licence does not allow a form that
+would put these files under the GPL, so they are not in this repository:
+`tools/gen-mt7920-fw.py` fetches them from linux-firmware, pinned by commit and
+SHA-256, checks them and writes `include/FwMT7920.inc` (ignored by Git).
+`build-macos.sh` runs it if the file is missing. Without the file the kext
+builds, and the MT7920 stops at attach with `firmware lookup failed`.
 
 ## Repository layout
 

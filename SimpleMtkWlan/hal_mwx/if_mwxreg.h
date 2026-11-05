@@ -373,6 +373,7 @@
 #define	MT_WFDMA_NEED_REINIT		(1U << 1)
 
 #define	MT_HW_BOUND			0x70010020
+#define	MT_HW_BOUND_MT7920		(1U << 7)
 #define	MT_HW_CHIPID			0x70010200
 #define	MT_HW_REV			0x70010204
 

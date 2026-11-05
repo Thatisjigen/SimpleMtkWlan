@@ -22,3 +22,4 @@ DerivedData/
 *.zip
 tests/scan/scan.cpp
 tests/scan/scan-test
+include/FwMT7920.inc

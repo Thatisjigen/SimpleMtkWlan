@@ -62,6 +62,7 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #endif
 
 #define PCI_VENDOR_MEDIATEK            0x14c3
+#define PCI_PRODUCT_MEDIATEK_MT7920    0x7920
 #define PCI_PRODUCT_MEDIATEK_MT7921    0x7961
 #define PCI_PRODUCT_MEDIATEK_MT7921K   0x0608
 #define PCI_PRODUCT_MEDIATEK_MT7922    0x7922
@@ -361,6 +362,7 @@ MCLGETL(struct mbuf *m, int how, size_t len)
 }
 
 static const struct pci_matchid mwx_devices[] = {
+	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7920 },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7921 },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7921K },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7922 },
@@ -371,6 +373,8 @@ static const struct pci_matchid mwx_devices[] = {
  * The PCIe interrupt and MCU paths can otherwise flood the kernel log. */
 /* #define MWX_DEBUG	1 */
 
+#define	MT7920_ROM_PATCH	"mwx-mt7961_patch_mcu_1a_2_hdr"
+#define	MT7920_FIRMWARE_WM	"mwx-mt7961_ram_code_1a"
 #define	MT7921_ROM_PATCH	"mwx-mt7961_patch_mcu_1_2_hdr"
 #define	MT7921_FIRMWARE_WM	"mwx-mt7961_ram_code_1"
 #define	MT7922_ROM_PATCH	"mwx-mt7922_patch_mcu_1_1_hdr"
@@ -505,6 +509,7 @@ struct mwx_vif {
 enum mwx_hw_type {
 	MWX_HW_MT7921,
 	MWX_HW_MT7922,
+	MWX_HW_MT7920,
 };
 
 struct mwx_setkey_task_arg {
@@ -2869,6 +2874,51 @@ mwx_attach_hook(struct device *self)
 	MWX_DEV_LOG(sc, "attach hook done fw_loaded=%d\n", sc->sc_fw_loaded);
 }
 
+static const char *
+mwx_hw_name(enum mwx_hw_type type)
+{
+	switch (type) {
+	case MWX_HW_MT7920:
+		return "MT7920";
+	case MWX_HW_MT7922:
+		return "MT7922";
+	default:
+		return "MT7921";
+	}
+}
+
+/*
+ * MT7920 is MT7921 silicon: the chip ID reads 0x7961 on both. Like Linux
+ * mt7921_pci_probe(), bit 7 of MT_HW_BOUND picks the type, because it decides
+ * which firmware the chip needs. Other chip IDs keep the type from the PCI ID.
+ */
+static enum mwx_hw_type
+mwx_hw_type_from_chip(enum mwx_hw_type type, uint32_t hwid, uint32_t hwbound)
+{
+	if (hwid != 0x7961)
+		return type;
+	return (hwbound & MT_HW_BOUND_MT7920) != 0 ? MWX_HW_MT7920 : MWX_HW_MT7921;
+}
+
+static void
+mwx_hw_firmware(enum mwx_hw_type type, const char **rompatch, const char **fw)
+{
+	switch (type) {
+	case MWX_HW_MT7920:
+		*rompatch = MT7920_ROM_PATCH;
+		*fw = MT7920_FIRMWARE_WM;
+		break;
+	case MWX_HW_MT7922:
+		*rompatch = MT7922_ROM_PATCH;
+		*fw = MT7922_FIRMWARE_WM;
+		break;
+	default:
+		*rompatch = MT7921_ROM_PATCH;
+		*fw = MT7921_FIRMWARE_WM;
+		break;
+	}
+}
+
 bool
 mwx_attach(struct device *parent, struct device *self, void *aux)
 {
@@ -2878,7 +2928,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	struct pci_attach_args *pa = (struct pci_attach_args *)aux;
 	pci_intr_handle_t ih;
 	pcireg_t memtype;
-	uint32_t hwid, hwrev;
+	uint32_t hwid, hwrev, hwbound;
 	int error;
 
 	MWX_DEV_LOG(sc, "attach start pci_id=0x%08x vendor=0x%04x product=0x%04x\n",
@@ -2891,10 +2941,11 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922 ||
 	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922_PCIE)
 		sc->sc_hwtype = MWX_HW_MT7922;
+	else if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7920)
+		sc->sc_hwtype = MWX_HW_MT7920;
 	else
 		sc->sc_hwtype = MWX_HW_MT7921;
-	MWX_DEV_LOG(sc, "attach hardware type=%s\n",
-	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
+	MWX_DEV_LOG(sc, "attach hardware type=%s\n", mwx_hw_name(sc->sc_hwtype));
 	/* Resolve this before advertising VHT capabilities, not in preinit. */
 	{
 		int flag = 0;
@@ -2953,9 +3004,12 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	hwid = mwx_read(sc, MT_HW_CHIPID) & 0xffff;
 	hwrev = mwx_read(sc, MT_HW_REV) & 0xff;
+	hwbound = mwx_read(sc, MT_HW_BOUND);
+	sc->sc_hwtype = mwx_hw_type_from_chip(sc->sc_hwtype, hwid, hwbound);
 
-	MWX_DEV_LOG(sc, "attach chip id=0x%04x hwrev=0x%02x interrupt=%s\n",
-	    hwid, hwrev, pci_intr_string(pa->pa_pc, ih));
+	MWX_DEV_LOG(sc, "attach chip id=0x%04x hwrev=0x%02x hwbound=0x%08x type=%s interrupt=%s\n",
+	    hwid, hwrev, hwbound, mwx_hw_name(sc->sc_hwtype),
+	    pci_intr_string(pa->pa_pc, ih));
 
 	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
 	if (mwx_wfsys_reset(sc) != 0) {
@@ -5253,23 +5307,14 @@ mwx_load_firmware(struct mwx_softc *sc)
 	int i, rv, sem;
 
 	MWX_DEV_LOG(sc, "firmware load start hwtype=%s\n",
-	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
+	    mwx_hw_name(sc->sc_hwtype));
 	reg = mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY;
 	if (reg != 0) {
 		MWX_DEV_LOG(sc, "firmware already downloaded status=0x%08x\n", reg);
 		return 0;
 	}
 
-	switch (sc->sc_hwtype) {
-	case MWX_HW_MT7921:
-		rompatch = MT7921_ROM_PATCH;
-		fw = MT7921_FIRMWARE_WM;
-		break;
-	case MWX_HW_MT7922:
-		rompatch = MT7922_ROM_PATCH;
-		fw = MT7922_FIRMWARE_WM;
-		break;
-	}
+	mwx_hw_firmware(sc->sc_hwtype, &rompatch, &fw);
 	MWX_DEV_LOG(sc, "firmware selected patch=%s wm=%s\n", rompatch, fw);
 
 	if ((rv = loadfirmware(rompatch, &buf, &buflen)) != 0) {
@@ -8485,7 +8530,7 @@ MtkMwx::getFirmwareVersion()
 {
 	if (com == NULL)
 		return "MT792x";
-	return com->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921";
+	return mwx_hw_name(com->sc_hwtype);
 }
 
 int16_t
@@ -8509,9 +8554,12 @@ MtkMwx::getTxNSS()
 const char *
 MtkMwx::getFirmwareName()
 {
-	if (com == NULL || com->sc_hwtype == MWX_HW_MT7922)
+	const char *rompatch, *fw;
+
+	if (com == NULL)
 		return MT7922_FIRMWARE_WM;
-	return MT7921_FIRMWARE_WM;
+	mwx_hw_firmware(com->sc_hwtype, &rompatch, &fw);
+	return fw;
 }
 
 UInt32

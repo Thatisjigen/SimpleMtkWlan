@@ -6,6 +6,7 @@ Run from the repository root with Python 3 and clang++:
 python3 tests/lifecycle/test-queue.py
 python3 tests/lifecycle/test-detach.py
 python3 tests/lifecycle/test-basics.py
+python3 tests/lifecycle/test-mt7920.py
 sh tests/scan/run.sh
 ```
 

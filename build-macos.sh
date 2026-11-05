@@ -17,6 +17,7 @@ libkmod="$kernelsdk/Library/x86_64/libkmod.a"
 clangxx="$(xcrun -f clang++)"; clang="$(xcrun -f clang)"; ld64="$(xcrun -f ld)"
 otool="$(xcrun -f otool)"; nm_tool="$(xcrun -f nm)"
 [[ -e "$libkmod" ]] || { echo "MacKernelSDK not found at $kernelsdk (set MACKERNELSDK)" >&2; exit 1; }
+[[ -e "$here/include/FwMT7920.inc" ]] || python3 -I "$here/tools/gen-mt7920-fw.py"
 case "$config" in
 	Debug)   opt=(-O0 -DDEBUG=1) ;;
 	Release) opt=(-O1) ;;

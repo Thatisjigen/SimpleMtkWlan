@@ -170513,10 +170513,23 @@ unsigned char mwx_mt7922_ram_code_1[] = {
 };
 unsigned int mwx_mt7922_ram_code_1_len = 1018692;
 
+/*
+ * MT7920 images are not in the repository: tools/gen-mt7920-fw.py fetches them
+ * from linux-firmware, checks them and writes this file (see its header).
+ */
+#if __has_include("FwMT7920.inc")
+#include "FwMT7920.inc"
+#define MTK_HAVE_MT7920_FW 1
+#endif
+
 const struct FwDesc fwList[] = {
     {MTK_FW_DESC("mwx-mt7961_patch_mcu_1_2_hdr", mwx_mt7961_patch_mcu_1_2_hdr, (int)mwx_mt7961_patch_mcu_1_2_hdr_len)},
     {MTK_FW_DESC("mwx-mt7961_ram_code_1", mwx_mt7961_ram_code_1, (int)mwx_mt7961_ram_code_1_len)},
     {MTK_FW_DESC("mwx-mt7922_patch_mcu_1_1_hdr", mwx_mt7922_patch_mcu_1_1_hdr, (int)mwx_mt7922_patch_mcu_1_1_hdr_len)},
     {MTK_FW_DESC("mwx-mt7922_ram_code_1", mwx_mt7922_ram_code_1, (int)mwx_mt7922_ram_code_1_len)},
+#ifdef MTK_HAVE_MT7920_FW
+    {MTK_FW_DESC("mwx-mt7961_patch_mcu_1a_2_hdr", mwx_mt7961_patch_mcu_1a_2_hdr, (int)mwx_mt7961_patch_mcu_1a_2_hdr_len)},
+    {MTK_FW_DESC("mwx-mt7961_ram_code_1a", mwx_mt7961_ram_code_1a, (int)mwx_mt7961_ram_code_1a_len)},
+#endif
 };
-const int fwNumber = 4;
+const int fwNumber = sizeof(fwList) / sizeof(fwList[0]);
