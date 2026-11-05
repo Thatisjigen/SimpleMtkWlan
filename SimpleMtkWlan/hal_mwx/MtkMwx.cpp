@@ -2807,8 +2807,14 @@ mwx_preinit(struct mwx_softc *sc)
 
 	{
 		int on = 0;
+		/*
+		 * MT7920 has the HE capabilities of the MT7921 in Linux
+		 * mt7921: HE80, no 160 MHz, which mwx_init_he_caps() keeps
+		 * for MT7922 through sc_vht160.
+		 */
 		sc->sc_he_enabled = PE_parse_boot_argn("-mtkhe", &on,
-		    sizeof(on)) && sc->sc_hwtype == MWX_HW_MT7922;
+		    sizeof(on)) && (sc->sc_hwtype == MWX_HW_MT7922 ||
+		    sc->sc_hwtype == MWX_HW_MT7920);
 	}	{
 		int only = 0;
 		sc->sc_he_only = sc->sc_he_enabled &&
