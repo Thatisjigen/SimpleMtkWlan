@@ -1360,7 +1360,7 @@ mwx_init_hw(struct ifnet *ifp)
 	MWX_DEV_LOG(sc, "init counters reset\n");
 
 	mn = &sc->sc_vif.vif_mn;
-	MWX_DEV_LOG(sc, "init vif node=%p wcid=%u\n", mn,
+	MWX_DEV_LOG(sc, "init vif wcid=%u\n",
 	    mn != NULL ? mn->wcid : 0);
 
 	mwx_mac_wtbl_update(sc, mn->wcid);
@@ -2104,8 +2104,8 @@ mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	struct mwx_setkey_task_arg *a;
 
-	DPRINTF("%s: set_key: ni %p, k_id %d, k_flags %x k_cipher %d\n",
-	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
+	DPRINTF("%s: set_key: k_id %d, k_flags %x k_cipher %d\n",
+	    DEVNAME(sc), k->k_id, k->k_flags, k->k_cipher);
 
 	/*
 	 * MT7921 does not reliably decrypt group-addressed frames with the
@@ -2144,8 +2144,8 @@ mwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 
-	DPRINTF("%s: delete_key: ni %p, k_id %d, k_flags %x k_cipher %d\n",
-	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
+	DPRINTF("%s: delete_key: k_id %d, k_flags %x k_cipher %d\n",
+	    DEVNAME(sc), k->k_id, k->k_flags, k->k_cipher);
 
 	MwxRxAmsduTransition transition(sc);
 	if (!transition.ok()) {
@@ -2228,9 +2228,8 @@ mwx_tx_linearize(struct mbuf *m)
 			for (c = m; c != NULL && off < sizeof(chain) - 12;
 			    c = mbuf_next(c))
 				off += snprintf(chain + off, sizeof(chain) - off,
-				    "%zu%s@%p,", mbuf_len(c),
-				    (mbuf_flags(c) & MBUF_EXT) ? "e" : "",
-				    mbuf_data(c));
+				    "%zu%s,", mbuf_len(c),
+				    (mbuf_flags(c) & MBUF_EXT) ? "e" : "");
 			MWX_LOG("tx linearize len=%zu chain=%s\n", len, chain);
 			lin_log_count++;
 		}
@@ -3033,8 +3032,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		printf("%s: can't establish interrupt\n", DEVNAME(sc));
 		goto fail;
 	}
-	MWX_DEV_LOG(sc, "attach interrupt established handle=%p\n",
-	    (void *)sc->sc_ih);
+	MWX_DEV_LOG(sc, "attach interrupt established\n");
 
 	if ((error = mwx_txwi_alloc(sc, MWX_TXWI_MAX)) != 0) {
 		printf("%s: failed to allocate DMA resources %d\n",
@@ -8243,11 +8241,11 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	if (m == NULL)
 		return ENOBUFS;
 
-	DPRINTF("%s: %s: ni %p, k_id %d, k_flags %x k_cipher %d wcid %d\n",
-	    DEVNAME(sc), "add key", ni, k->k_id, k->k_flags, k->k_cipher, wcid);
+	DPRINTF("%s: %s: k_id %d, k_flags %x k_cipher %d wcid %d\n",
+	    DEVNAME(sc), "add key", k->k_id, k->k_flags, k->k_cipher, wcid);
 	MWX_DEV_LOG(sc,
-	    "key add request id=%d flags=0x%x cipher=%d len=%d wcid=%u muar=%u ni=%p\n",
-	    k->k_id, k->k_flags, k->k_cipher, k->k_len, wcid, muar_idx, ni);
+	    "key add request id=%d flags=0x%x cipher=%d len=%d wcid=%u muar=%u\n",
+	    k->k_id, k->k_flags, k->k_cipher, k->k_len, wcid, muar_idx);
 
 	mt7921_mcu_add_key_tlv(m, &tlvnum, k, 1);
 	m = mwx_fill_sta_req_hdr(m, mvif, muar_idx, wcid, tlvnum);
@@ -8311,8 +8309,8 @@ mt7921_mcu_sta_key_delete(struct mwx_softc *sc, struct ieee80211_node *ni,
 	if (m == NULL)
 		return;
 
-	DPRINTF("%s: %s: ni %p, k_id %d, k_flags %x k_cipher %d wcid %d\n",
-	    DEVNAME(sc), "delete key", ni, k->k_id, k->k_flags, k->k_cipher,
+	DPRINTF("%s: %s: k_id %d, k_flags %x k_cipher %d wcid %d\n",
+	    DEVNAME(sc), "delete key", k->k_id, k->k_flags, k->k_cipher,
 	    wcid);
 
 	mt7921_mcu_add_key_tlv(m, &tlvnum, k, 0);
@@ -8344,14 +8342,13 @@ MtkMwx::mwx_match(IOPCIDevice *device)
 bool
 MtkMwx::attach(IOPCIDevice *device)
 {
-	MWX_LOG("HAL attach begin device=%p\n", (void *)device);
+	MWX_LOG("HAL attach begin\n");
 	if (com == NULL)
 		com = (struct mwx_softc *)malloc(sizeof(*com), M_DEVBUF, M_WAITOK | M_ZERO);
 	if (pci == NULL)
 		pci = (struct pci_attach_args *)malloc(sizeof(*pci), M_DEVBUF, M_WAITOK | M_ZERO);
 	if (com == NULL || pci == NULL) {
-		MWX_LOG("HAL attach allocation failed com=%p pci=%p\n",
-		    (void *)com, (void *)pci);
+		MWX_LOG("HAL attach allocation failed\n");
 		releaseAll();
 		return false;
 	}
@@ -8373,8 +8370,7 @@ MtkMwx::attach(IOPCIDevice *device)
 		releaseAll();
 		return false;
 	}
-	MWX_LOG("HAL attach allocated com=%p pci=%p\n",
-	    (void *)com, (void *)pci);
+	MWX_LOG("HAL attach allocated\n");
 
 	if (!taskq_init()) {
 		releaseAll();
@@ -8387,8 +8383,8 @@ MtkMwx::attach(IOPCIDevice *device)
 	pci->pa_id = ((pcireg_t)device->configRead16(kIOPCIConfigDeviceID) << 16) |
 	    device->configRead16(kIOPCIConfigVendorID);
 	strlcpy(com->sc_dev.dv_xname, "mwx0", sizeof(com->sc_dev.dv_xname));
-	MWX_LOG("HAL attach pci_id=0x%08x workloop=%p\n",
-	    pci->pa_id, (void *)pci->workloop);
+	MWX_LOG("HAL attach pci_id=0x%08x\n",
+	    pci->pa_id);
 	if (!mwx_attach(NULL, (struct device *)com, pci)) {
 		MWX_LOG("HAL attach failed inside mwx_attach\n");
 		detach(device);
@@ -8401,7 +8397,7 @@ MtkMwx::attach(IOPCIDevice *device)
 void
 MtkMwx::detach(IOPCIDevice *device)
 {
-    MWX_LOG("HAL detach begin device=%p com=%p\n", (void *)device, (void *)com);
+    MWX_LOG("HAL detach begin\n");
     if (com == NULL) {
         if (taskQueueOwned) { taskq_destroy(systq); taskQueueOwned = false; }
         releaseAll();
@@ -8453,8 +8449,7 @@ MtkMwx::detach(IOPCIDevice *device)
 IOReturn
 MtkMwx::enable(IONetworkInterface *interface)
 {
-	MWX_LOG("HAL enable begin interface=%p com=%p\n",
-	    (void *)interface, (void *)com);
+	MWX_LOG("HAL enable begin\n");
 	if (com == NULL) {
 		MWX_LOG("HAL enable failed: not attached\n");
 		return kIOReturnNotAttached;
@@ -8475,8 +8470,7 @@ MtkMwx::enable(IONetworkInterface *interface)
 IOReturn
 MtkMwx::disable(IONetworkInterface *interface)
 {
-	MWX_LOG("HAL disable begin interface=%p com=%p\n",
-	    (void *)interface, (void *)com);
+	MWX_LOG("HAL disable begin\n");
 	if (com == NULL)
 		return kIOReturnSuccess;
 	struct ifnet *ifp = &com->sc_ic.ic_if;
@@ -8636,7 +8630,7 @@ MtkMwx::setMulticastList(IOEthernetAddress *addr, int count)
 void
 MtkMwx::releaseAll()
 {
-	MWX_LOG("HAL releaseAll com=%p pci=%p\n", (void *)com, (void *)pci);
+	MWX_LOG("HAL releaseAll\n");
 	if (com) {
 		mwx_rx_amsdu_purge(com);
 		mwx_rx_pool_free(com);
