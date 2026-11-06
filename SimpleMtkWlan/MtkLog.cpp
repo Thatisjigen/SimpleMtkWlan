@@ -8,6 +8,7 @@
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
 #include <kern/clock.h>
+#include <pexpert/pexpert.h>
 
 /*
  * Persistent debug log. Early boot messages are lost from the unified log
@@ -59,13 +60,29 @@ extern "C" void mtk_dbg_log(const char *fmt, ...)
     mtkDbgUnlock();
 }
 
+/*
+ * The log holds raw kernel state (object pointers, interface addresses) that is
+ * only useful while debugging an attach failure. Publishing it as an IORegistry
+ * property makes it world-readable (any user, "ioreg -l"), which defeats KASLR,
+ * so it is published only when asked for with the -mtkdbglog boot argument.
+ */
+static bool mtkDbgPublishAllowed()
+{
+    static int allowed = -1;
+    if (allowed < 0) {
+        char flag[16];
+        allowed = PE_parse_boot_argn("-mtkdbglog", flag, sizeof(flag)) ? 1 : 0;
+    }
+    return allowed > 0;
+}
+
 void mtk_dbg_publish()
 {
     IOService *nub = gMtkDbgNub;
     char *copy;
     size_t len;
 
-    if (nub == NULL)
+    if (nub == NULL || !mtkDbgPublishAllowed())
         return;
     copy = (char *)IOMalloc(MTK_DBG_BUF_SIZE);
     if (copy == NULL)
