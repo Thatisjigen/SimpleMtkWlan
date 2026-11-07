@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Actual mwx_rx and crypto helpers; bounded fill_rx hardware-removal stub."""
+"""Actual mwx_rx, CCMP header restore and crypto helpers; bounded fill_rx stub."""
 from pathlib import Path
 import ast,re,subprocess,tempfile
 root=Path(__file__).resolve().parents[2]
@@ -16,20 +16,23 @@ def extract(path,name):
   depth+=(s[pos]=='{')-(s[pos]=='}');pos+=1
  return s[m.start():pos]
 metadata=root/'SimpleMtkWlan/hal_mwx/RxAmsduMetadata.hpp';assembler=root/'SimpleMtkWlan/hal_mwx/RxAmsduReassembly.hpp'
-regs=(root/'SimpleMtkWlan/hal_mwx/if_mwxreg.h').read_text();defs=[]
+regs=(root/'SimpleMtkWlan/hal_mwx/if_mwxreg.h').read_text();defs=[re.search(r'enum mt76_cipher_type \{.*?\};',regs,re.S).group()]
+hal=(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text();defs.append(re.search(r'struct mwx_rx_sec \{.*?\n\};',hal,re.S).group())
 for name in sorted(set(re.findall(r'\bMT_RXD\w+',metadata.read_text()))):
  m=re.search(r'^#define\s+'+name+r'\s+([^\n]+)',regs,re.M);assert m,name;defs.append('#define '+name+' '+m.group(1))
 before=r'''
-using u_int8_t=uint8_t;using u_int64_t=uint64_t;using caddr_t=char*;
+using u_int8_t=uint8_t;using u_int64_t=uint64_t;using u_int=unsigned;using caddr_t=char*;
 #define mtod(m,t) ((t)mbuf_data(m))
+#define M_DONTWAIT 0
 #define m_freem mbuf_freem
 #define MWX_DEV_LOG(...) ((void)0)
 #define NBPFILTER 0
-#define IEEE80211_FC1_PROTECTED 0x40
 #define IEEE80211_FC0_TYPE_MASK 0x0c
 #define IEEE80211_FC0_SUBTYPE_MASK 0xf0
 #define IEEE80211_FC0_TYPE_DATA 0x08
 #define IEEE80211_FC0_TYPE_CTL 0x04
+#define IEEE80211_FC1_PROTECTED 0x40
+#define IEEE80211_WEP_EXTIV 0x20
 #define IEEE80211_FC0_SUBTYPE_BAR 0x80
 #define IEEE80211_S_RUN 4
 #define IEEE80211_RXI_HWDEC 1
@@ -54,6 +57,10 @@ static uint8_t ieee80211_get_qos(ieee80211_frame*wh){return ((uint8_t*)wh)[24];}
 static int ieee80211_tkip_get_tsc(uint64_t*,uint64_t**,mbuf_t,ieee80211_key*){assert(false);return EINVAL;}
 static size_t mbuf_maxlen(mbuf_t m){return m->storage.size();}
 static mbuf_t mbuf_nextpkt(mbuf_t){return nullptr;}
+static size_t m_leadingspace(mbuf_t m){return mbuf_leadingspace(m);}
+static unsigned prepend_calls=0;
+static mbuf_t m_prepend(mbuf_t m,size_t n,int){++prepend_calls;if(m->off>=n){m->off-=n;m->len+=n;m->pklen+=n;return m;}std::vector<uint8_t>s(m->storage.size()+n);std::copy(m->storage.begin(),m->storage.end(),s.begin()+n);m->storage.swap(s);m->len+=n;m->pklen+=n;return m;}
+static mbuf_t m_pullup(mbuf_t m,size_t n){if(m->len>=n)return m;if(n>m->pklen){mbuf_freem(m);return nullptr;}mbuf_t r=packet({},m->pklen);r->len=r->pklen=m->pklen;assert(mbuf_copydata(m,0,m->pklen,mbuf_data(r))==0);mbuf_freem(m);return r;}
 '''
 after=r'''
 struct IOLock {std::mutex mutex;};
@@ -69,7 +76,7 @@ using IOReturn=int;struct OSObject{};constexpr int kIOReturnSuccess=0;
 struct MwxRxAmsduBarrier {mwx_softc*sc;int operation;bool finished,accepted;};
 static std::recursive_mutex main_gate;static thread_local unsigned gate_depth=0;
 struct TestGateScope {TestGateScope(){assert(!held_lock);main_gate.lock();++gate_depth;}~TestGateScope(){assert(gate_depth&&!held_lock);--gate_depth;main_gate.unlock();}};
-static unsigned mwx_rx_ctl_cnt=0,mwx_rx_bar_cnt=0,mwx_rx_hwdec_cnt=0,mwx_rx_swdec_cnt=0,fill_calls=0,refs=0;
+static unsigned mwx_rx_ctl_cnt=0,mwx_rx_bar_cnt=0,mwx_rx_hwdec_cnt=0,mwx_rx_swdec_cnt=0,fill_calls=0,refs=0;static uint32_t mwx_rx_hwdec_nopn_cnt=0;
 static std::atomic<uint64_t> now_ms{1};
 static uint64_t mach_absolute_time(){return now_ms.load()*1000000;}
 static void absolutetime_to_nanoseconds(uint64_t t,uint64_t*p){*p=t;}
@@ -80,13 +87,15 @@ struct Delivery{mbuf_t packet;ieee80211_rxinfo rxi;};static std::vector<Delivery
 static void ieee80211_inputm(ifnet*,mbuf_t m,ieee80211_node*,ieee80211_rxinfo*rxi,mbuf_list*){assert(!held_lock&&gate_depth);deliveries.push_back({m,*rxi});}
 static int fill_mode=0,fill_rssi=-33;
 static void(*fill_hook)(mwx_softc*)=nullptr;
-// This bounded stub models only the unchanged hardware descriptor removal and
-// Protected clearing of mt7921_mac_fill_rx. Actual integrated mwx_rx is below.
-static int mt7921_mac_fill_rx(mwx_softc*sc,mbuf_t m,ieee80211_rxinfo*rxi){
- assert(!held_lock);++fill_calls;if(fill_hook){auto hook=fill_hook;fill_hook=nullptr;hook(sc);}if(fill_mode==1)return -1;auto*p=(uint8_t*)mbuf_data(m);if(m->len<24)return -1;
- uint32_t d1=mtkRxAmsduLe32(p+4),d2=mtkRxAmsduLe32(p+8);size_t gap=24;
- if(d1&MT_RXD1_NORMAL_GROUP_4)gap+=16;if(d1&MT_RXD1_NORMAL_GROUP_1)gap+=16;if(d1&MT_RXD1_NORMAL_GROUP_2)gap+=8;if(d1&MT_RXD1_NORMAL_GROUP_3){gap+=8;if(d1&MT_RXD1_NORMAL_GROUP_5)gap+=72;}gap+=2*((d2>>14)&3);
- if(m->len<gap+26)return -1;mbuf_adj(m,gap);auto*h=(uint8_t*)mbuf_data(m);bool hw=((d1>>16)&31)!=0&&!(d1&(MT_RXD1_NORMAL_CM|MT_RXD1_NORMAL_CLM));rxi->rxi_flags=hw?IEEE80211_RXI_HWDEC:0;rxi->rxi_chan=40;rxi->rxi_rssi=fill_rssi;if(hw)h[1]&=~0x40;
+// This bounded stub models only the hardware descriptor removal and the
+// GROUP_1 packet number of mt7921_mac_fill_rx (the frame header is left as
+// received). Actual integrated mwx_rx and mwx_rx_hwdec_restore are below.
+static int mt7921_mac_fill_rx(mwx_softc*sc,mbuf_t m,ieee80211_rxinfo*rxi,mwx_rx_sec*sec){
+ assert(!held_lock);++fill_calls;*sec={};if(fill_hook){auto hook=fill_hook;fill_hook=nullptr;hook(sc);}if(fill_mode==1)return -1;auto*p=(uint8_t*)mbuf_data(m);if(m->len<24)return -1;
+ uint32_t d1=mtkRxAmsduLe32(p+4),d2=mtkRxAmsduLe32(p+8);size_t gap=24,g1=24;
+ if(d1&MT_RXD1_NORMAL_GROUP_4){gap+=16;g1+=16;}if(d1&MT_RXD1_NORMAL_GROUP_1)gap+=16;if(d1&MT_RXD1_NORMAL_GROUP_2)gap+=8;if(d1&MT_RXD1_NORMAL_GROUP_3){gap+=8;if(d1&MT_RXD1_NORMAL_GROUP_5)gap+=72;}gap+=2*((d2>>14)&3);
+ if(m->len<gap+26)return -1;bool hw=((d1>>16)&31)!=0&&!(d1&(MT_RXD1_NORMAL_CM|MT_RXD1_NORMAL_CLM));sec->sec_mode=(d1>>16)&31;sec->key_id=(d1>>21)&3;if(hw&&(d1&MT_RXD1_NORMAL_GROUP_1)){memcpy(sec->pn,p+g1,6);sec->pn_valid=1;}
+ mbuf_adj(m,gap);rxi->rxi_flags=hw?IEEE80211_RXI_HWDEC:0;rxi->rxi_chan=40;rxi->rxi_rssi=fill_rssi;
  if(fill_mode==2){m->len=27;m->pklen=27;}return 0;
 }
 static std::vector<uint8_t> subframe(unsigned payload,unsigned marker){
@@ -96,14 +105,14 @@ static std::vector<uint8_t> raw(unsigned fmt,unsigned payload=17,unsigned marker
  const size_t gap=24+(group1?16:0);auto h=frame(cipher!=0);auto body=subframe(payload,marker);std::vector<uint8_t>b(gap+26+(fmt?2:0)+body.size());put32(b,4,7|(cipher<<16)|(2<<21)|(group1?MT_RXD1_NORMAL_GROUP_1:0));put32(b,12,MT_RXD3_NORMAL_U2M);put32(b,16,fmt);if(group1)for(unsigned i=0;i<6;++i)b[24+i]=pn>>(8*i);memcpy(b.data()+gap,h.data(),26);memcpy(b.data()+gap+26+(fmt?2:0),body.data(),body.size());return b;
 }
 static std::vector<uint8_t> body_expected(){auto a=subframe(17,0),b=subframe(18,1),c=subframe(19,2);std::vector<uint8_t>x=a;x.resize((x.size()+3)&~3,0);x.insert(x.end(),b.begin(),b.end());x.resize((x.size()+3)&~3,0);x.insert(x.end(),c.begin(),c.end());return x;}
-static void reset(mwx_softc&sc){for(auto d:deliveries)mbuf_freem(d.packet);deliveries.clear();IOLockLock(sc.sc_rx_amsdu_lock);mtkRxAmsduPurge(sc.sc_rx_amsdu_state);IOLockUnlock(sc.sc_rx_amsdu_lock);assert(live==0&&refs==0);sc={};key={};now_ms=1;fill_mode=0;fill_rssi=-33;fill_hook=nullptr;fill_calls=0;alloc_calls=0;alloc_mode=0;copy_calls=0;fail_copy=0;fail_alloc_at=0;}
+static void reset(mwx_softc&sc){for(auto d:deliveries)mbuf_freem(d.packet);deliveries.clear();mwx_rx_hwdec_nopn_cnt=0;prepend_calls=0;IOLockLock(sc.sc_rx_amsdu_lock);mtkRxAmsduPurge(sc.sc_rx_amsdu_state);IOLockUnlock(sc.sc_rx_amsdu_lock);assert(live==0&&refs==0);sc={};key={};now_ms=1;fill_mode=0;fill_rssi=-33;fill_hook=nullptr;fill_calls=0;alloc_calls=0;alloc_mode=0;copy_calls=0;fail_copy=0;fail_alloc_at=0;}
 '''
 main=r'''
 static void gated_rx(mwx_softc*sc,mbuf_t m,mbuf_list*ml,uint8_t q){TestGateScope gate;mwx_rx(sc,m,ml,q);}
 static void test_transition(mwx_softc*sc,int operation){TestGateScope gate;MwxRxAmsduBarrier b{sc,operation,false,false};assert(mwx_rx_amsdu_barrier_gated(nullptr,&b,nullptr,nullptr,nullptr)==0);assert(b.finished&&b.accepted);}
 static void change_epoch_and_seed(mwx_softc*sc){
  test_transition(sc,1);test_transition(sc,0);
- auto b=raw(3,17,0,4,true,0x090807060504ULL);auto*m=packet(b);MtkRxDescriptorMeta md;assert(mtkRxAmsduReadDescriptor(m,md)==1);ieee80211_rxinfo ri;assert(mt7921_mac_fill_rx(sc,m,&ri)==0);assert(mtkRxAmsduRemovePad(m,md));((uint8_t*)mbuf_data(m))[1]|=0x40;
+ auto b=raw(3,17,0,4,true,0x090807060504ULL);auto*m=packet(b);MtkRxDescriptorMeta md;assert(mtkRxAmsduReadDescriptor(m,md)==1);ieee80211_rxinfo ri;mwx_rx_sec sec;assert(mt7921_mac_fill_rx(sc,m,&ri,&sec)==0);assert(mtkRxAmsduRemovePad(m,md));
  MtkRxAmsduMeta meta{},first{};meta.epoch=mwx_rx_amsdu_epoch(sc);meta.queue=0;meta.wcid=md.wcid;meta.seqctl=md.seqctl;meta.tid=md.tid;meta.cipher=md.cipher;meta.key=md.key;meta.format=md.format;meta.hdrlen=md.hdrlen;meta.protected_frame=md.protected_frame;meta.hwdec=md.hwdec;meta.pn_valid=md.pn_valid;memcpy(meta.pn,md.pn,6);meta.rxi=ri;
  assert(!mwx_rx_amsdu_feed(sc,m,meta,now_ms,&first));assert(mwx_rx_amsdu_stats(sc).pending==1);
 }
@@ -119,10 +128,24 @@ int main(){mwx_softc sc{};mbuf_list ml;
  auto original=std::vector<uint8_t>(p,p+d.packet->pklen);assert(ieee80211_input_hwdecrypt(&sc.sc_ic,&node,d.packet,&d.rxi)==d.packet);assert(key.k_rsc[3]==0x060504030201ULL&&key.k_rsc[0]==0);p=(uint8_t*)mbuf_data(d.packet);assert(!(p[1]&0x40)&&d.packet->pklen==26+expected.size()&&!memcmp(p+26,expected.data(),expected.size()));
  auto replay=packet(original);auto ri=d.rxi;assert(!ieee80211_input_hwdecrypt(&sc.sc_ic,&node,replay,&ri));assert(sc.sc_ic.ic_stats.is_ccmp_replays==1&&live==1); /* failure consumed replay */
  auto newer=original;newer[26]++;auto n=packet(newer);assert(ieee80211_input_hwdecrypt(&sc.sc_ic,&node,n,&ri)==n);assert(key.k_rsc[3]==0x060504030202ULL);mbuf_freem(n);reset(sc);
- // Ordinary frame is passed once with only normal descriptor removal.
- auto normal=raw(0);gated_rx(&sc,packet(normal),&ml,0);assert(deliveries.size()==1&&deliveries[0].packet->pklen==normal.size()-40&&sc.sc_rx_amsdu_state.stats.started==0);assert(!(((uint8_t*)mbuf_data(deliveries[0].packet))[1]&0x40));reset(sc);
- // Opt-in off leaves the old path unchanged even for aggregate-shaped input.
- sc.sc_rx_amsdu_enabled=false;normal=raw(3);gated_rx(&sc,packet(normal),&ml,0);assert(deliveries.size()==1&&deliveries[0].packet->pklen==normal.size()-40&&sc.sc_rx_amsdu_state.stats.started==0);reset(sc);
+ // An ordinary decrypted CCMP frame gets its header back in place, from
+ // the descriptor's packet number, in the headroom the descriptor left:
+ // net80211's production check then accepts it once and rejects the copy.
+ auto normal=raw(0);gated_rx(&sc,packet(normal),&ml,0);assert(deliveries.size()==1&&deliveries[0].packet->pklen==normal.size()-40+8&&sc.sc_rx_amsdu_state.stats.started==0&&prepend_calls==0&&alloc_calls==0);
+ {auto d=deliveries[0];auto*p=(uint8_t*)mbuf_data(d.packet);uint8_t iv[]={1,2,0,0xa0,3,4,5,6};assert((p[1]&0x40)&&!memcmp(p,normal.data()+40,26)&&!memcmp(p+26,iv,8)&&!memcmp(p+34,normal.data()+66,normal.size()-66)&&d.rxi.rxi_flags==IEEE80211_RXI_HWDEC);
+  auto copy=std::vector<uint8_t>(p,p+d.packet->pklen);assert(ieee80211_input_hwdecrypt(&sc.sc_ic,&node,d.packet,&d.rxi)==d.packet);assert(key.k_rsc[3]==0x060504030201ULL);p=(uint8_t*)mbuf_data(d.packet);assert(!(p[1]&0x40)&&d.packet->pklen==normal.size()-40&&!memcmp(p+26,normal.data()+66,normal.size()-66));
+  auto replay=packet(copy);auto ri=d.rxi;assert(!ieee80211_input_hwdecrypt(&sc.sc_ic,&node,replay,&ri));assert(sc.sc_ic.ic_stats.is_ccmp_replays==1&&live==1);}
+ reset(sc);
+ // Opt-in off takes the ordinary path, with the header restored, even for
+ // aggregate-shaped input.
+ sc.sc_rx_amsdu_enabled=false;normal=raw(3);gated_rx(&sc,packet(normal),&ml,0);assert(deliveries.size()==1&&deliveries[0].packet->pklen==normal.size()-40+8&&sc.sc_rx_amsdu_state.stats.started==0);assert(((uint8_t*)mbuf_data(deliveries[0].packet))[1]&0x40);reset(sc);
+ // TKIP keeps the previous behaviour: header stripped, Protected cleared.
+ normal=raw(0,17,0,2);gated_rx(&sc,packet(normal),&ml,0);assert(deliveries.size()==1&&deliveries[0].packet->pklen==normal.size()-40&&deliveries[0].rxi.rxi_flags==IEEE80211_RXI_HWDEC);assert(!(((uint8_t*)mbuf_data(deliveries[0].packet))[1]&0x40)&&!memcmp((uint8_t*)mbuf_data(deliveries[0].packet)+26,normal.data()+66,normal.size()-66));reset(sc);
+ // A CCMP frame the hardware decrypted without reporting a packet number
+ // cannot be checked and is dropped, counted, never delivered.
+ normal=raw(0,17,0,4,false);gated_rx(&sc,packet(normal),&ml,0);assert(deliveries.empty()&&live==0&&refs==0&&sc.sc_ic.ic_if.if_ierrors==1&&mwx_rx_hwdec_nopn_cnt==1);reset(sc);
+ // An open-network frame is untouched.
+ normal=raw(0,17,0,0,false);gated_rx(&sc,packet(normal),&ml,0);assert(deliveries.size()==1&&deliveries[0].packet->pklen==normal.size()-24&&deliveries[0].rxi.rxi_flags==0&&!memcmp(mbuf_data(deliveries[0].packet),normal.data()+24,normal.size()-24));reset(sc);
  // Invalid metadata purges earlier held fragments before returning.
  gated_rx(&sc,packet(raw(3)),&ml,0);auto bad=raw(2);put32(bad,8,MT_RXD2_NORMAL_HDR_TRANS);gated_rx(&sc,packet(bad),&ml,0);assert(deliveries.empty()&&live==0&&sc.sc_rx_amsdu_state.stats.pending==0&&sc.sc_ic.ic_if.if_ierrors==1);reset(sc);
  // fill failure and post-fill short pad both purge state and consume inputs.
@@ -153,12 +176,13 @@ int main(){mwx_softc sc{};mbuf_list ml;
  std::thread rx([&]{while(!go.load())std::this_thread::yield();for(unsigned i=0;i<100;++i){now_ms=10+i;auto a=raw(3,17,0,4,true,1000+i),z=raw(1,18,1,4,true,1000+i);gated_rx(&sc,packet(a),&ml,0);std::this_thread::yield();gated_rx(&sc,packet(z),&ml,0);}});
  std::thread teardown([&]{go=true;for(unsigned i=0;i<100;++i){test_transition(&sc,1);std::this_thread::yield();test_transition(&sc,0);mwx_rx_amsdu_expire(&sc,10000+i);auto stats=mwx_rx_amsdu_stats(&sc);assert(stats.pending<=16);mwx_rx_amsdu_invalid(&sc);std::this_thread::yield();}});
  rx.join();teardown.join();assert(!held_lock);mwx_rx_amsdu_purge(&sc);auto stats=mwx_rx_amsdu_stats(&sc);assert(stats.pending==0&&sc.sc_rx_amsdu_epoch==101);assert(lock_calls==unlock_calls&&helper_calls>200);reset(sc);
- puts("PASS: locked actual mwx_rx with both production helpers; first/middle/last exactly-once handoff, first RX metadata, CCMP PN and production replay/8B strip, ordinary/off paths, invalid/fill/pad/restore failures, queue/epoch isolation, open+GROUP1, 100 gate-serialized concurrent RX/transition/expire rounds and ownership");
+ puts("PASS: locked actual mwx_rx with the production helpers; first/middle/last exactly-once handoff, first RX metadata, CCMP PN and production replay/8B strip, ordinary CCMP header restore in place with production replay rejection, off/TKIP/no-PN/open paths, invalid/fill/pad/restore failures, queue/epoch isolation, open+GROUP1, 100 gate-serialized concurrent RX/transition/expire rounds and ownership");
 }
 '''
 src=pre+'\n'+'\n'.join(defs)+'\n'+before+'\n#include "'+str(metadata)+'"\n#define mtkRxAmsduFeed mtkRxAmsduFeedImpl\n#define mtkRxAmsduPurge mtkRxAmsduPurgeImpl\n#define mtkRxAmsduExpire mtkRxAmsduExpireImpl\n#include "'+str(assembler)+'"\n#undef mtkRxAmsduFeed\n#undef mtkRxAmsduPurge\n#undef mtkRxAmsduExpire\n'+after
 for name in ['mwx_rx_amsdu_barrier_gated','mwx_rx_amsdu_purge','mwx_rx_amsdu_invalid','mwx_rx_amsdu_epoch','mwx_rx_amsdu_snapshot','mwx_rx_amsdu_feed','mwx_rx_amsdu_expire','mwx_rx_amsdu_stats']:
  src+='\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp',name)
+src+='\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp','mwx_rx_hwdec_restore')
 src+='\n'+extract(root/'mtk80211/openbsd/net80211/ieee80211_crypto_ccmp.c','ieee80211_ccmp_get_pn')+'\n'+extract(root/'mtk80211/openbsd/net80211/ieee80211_input.c','ieee80211_input_hwdecrypt')+'\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp','mwx_rx')+'\n'+main
 with tempfile.TemporaryDirectory() as d:
  p=Path(d);(p/'test.cpp').write_text(src)
