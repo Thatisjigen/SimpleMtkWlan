@@ -2810,6 +2810,14 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
         DPRINTF(("invalid supported rates element\n"));
         return;
     }
+    if (vhtcap != NULL && vhtcap[1] < sizeof(struct ieee80211_ie_vhtcap) - 2) {
+        DPRINTF(("vhtcap ie too short, got %d, expected %lu\n", vhtcap[1], sizeof(struct ieee80211_ie_vhtcap) - 2));
+        vhtcap = NULL;
+    }
+    if (vhtopmode != NULL && vhtopmode[1] < sizeof(struct ieee80211_ie_vht_operation) - 2) {
+        DPRINTF(("vhtopmode ie too short, got %d, expected %lu\n", vhtopmode[1], sizeof(struct ieee80211_ie_vht_operation) - 2));
+        vhtopmode = NULL;
+    }
     rate = ieee80211_setup_rates(ic, ni, rates, xrates,
                                  IEEE80211_F_DOSORT | IEEE80211_F_DOFRATE | IEEE80211_F_DONEGO |
                                  IEEE80211_F_DODEL);
