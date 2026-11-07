@@ -867,6 +867,7 @@ struct mt76_txwi {
 #define	MT_RXD1_NORMAL_SEC_MODE_MASK		0x001f0000
 #define	MT_RXD1_NORMAL_SEC_MODE_SHIFT		16
 #define	MT_RXD1_NORMAL_KEY_ID_MASK		0x00600000
+#define	MT_RXD1_NORMAL_KEY_ID_SHIFT		21
 #define	MT_RXD1_NORMAL_CM			(1U << 23)
 #define	MT_RXD1_NORMAL_CLM			(1U << 24)
 #define	MT_RXD1_NORMAL_ICV_ERR			(1U << 25)
@@ -932,6 +933,26 @@ struct mt76_txwi {
 #define	MT_RXD4_NORMAL_CLS_BITMAP		GENMASK(28, 19)
 #define	MT_RXD3_NORMAL_PF_MODE			(1U << 99)
 #define	MT_RXD3_NORMAL_PF_STS			GENMASK(31, 30)
+
+/*
+ * RXD DW1 SEC_MODE values (Linux enum mt76_cipher_type): the WTBL cipher
+ * numbering, not the MCU_CIPHER_* one of the STA_REC_KEY command.
+ */
+enum mt76_cipher_type {
+	MT_CIPHER_NONE,
+	MT_CIPHER_WEP40,
+	MT_CIPHER_TKIP,
+	MT_CIPHER_TKIP_NO_MIC,
+	MT_CIPHER_AES_CCMP,
+	MT_CIPHER_WEP104,
+	MT_CIPHER_BIP_CMAC_128,
+	MT_CIPHER_WEP128,
+	MT_CIPHER_WAPI,
+	MT_CIPHER_CCMP_CCX,
+	MT_CIPHER_CCMP_256,
+	MT_CIPHER_GCMP,
+	MT_CIPHER_GCMP_256,
+};
 
 #define	PKT_TYPE_TXS				0
 #define	PKT_TYPE_TXRXV				1

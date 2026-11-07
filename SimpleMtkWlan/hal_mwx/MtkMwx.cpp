@@ -144,7 +144,7 @@ mwx_rx_rate_account(uint32_t v0)
 extern uint32_t ieee80211_bar_rx_count;
 
 /* RX decrypt path counters, reported by MtkMwx::debugPoll(). */
-static uint32_t mwx_rx_hwdec_cnt, mwx_rx_swdec_cnt;
+static uint32_t mwx_rx_hwdec_cnt, mwx_rx_swdec_cnt, mwx_rx_hwdec_nopn_cnt;
 static uint32_t mwx_rx_ctl_cnt, mwx_rx_bar_cnt;	/* control frames reaching the driver */
 
 /* RX drop reason counters, reported by MtkMwx::debugPoll(). */
@@ -515,6 +515,18 @@ enum mwx_hw_type {
 struct mwx_setkey_task_arg {
 	struct ieee80211_node	*ni;
 	struct ieee80211_key	*k;
+};
+
+/*
+ * Security fields of a received frame, from RXD DW1 and GROUP_1. The
+ * firmware strips the CCMP header of the frames it decrypts and reports
+ * the packet number here instead.
+ */
+struct mwx_rx_sec {
+	uint8_t			sec_mode;	/* MT_RXD1_NORMAL_SEC_MODE, mt76_cipher_type */
+	uint8_t			key_id;		/* MT_RXD1_NORMAL_KEY_ID */
+	uint8_t			pn_valid;	/* pn[] was read from GROUP_1 */
+	uint8_t			pn[6];		/* PN0..PN5, the order of the CCMP header */
 };
 
 struct mwx_softc {
@@ -1136,7 +1148,7 @@ int		mt7921_mcu_set_beacon_filter(struct mwx_softc *, int);
 int		mt7921_mcu_set_bss_pm(struct mwx_softc *, int);
 int		mt7921_mcu_set_tx(struct mwx_softc *, struct mwx_vif *);
 int		mt7921_mac_fill_rx(struct mwx_softc *, struct mbuf *,
-		    struct ieee80211_rxinfo *);
+		    struct ieee80211_rxinfo *, struct mwx_rx_sec *);
 uint32_t	mt7921_mac_tx_rate_val(struct mwx_softc *);
 void		mt7921_mac_write_txwi_80211(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_node *, struct mt76_txwi *);
@@ -2168,6 +2180,7 @@ mwx_setkey_task(void *arg)
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
 	struct mwx_setkey_task_arg *a;
 	int s = splnet();
+	int rv;
 
 	while (sc->sc_setkey_tail != sc->sc_setkey_cur) {
 		MwxRxAmsduTransition transition(sc);
@@ -2176,7 +2189,17 @@ mwx_setkey_task(void *arg)
 			return;
 		}
 		a = &sc->sc_setkey_arg[sc->sc_setkey_tail];
-		mt7921_mcu_sta_key_update(sc, a->ni, a->k);
+		rv = mt7921_mcu_sta_key_update(sc, a->ni, a->k);
+		/*
+		 * From here on the firmware decrypts with this key and reports
+		 * its packet numbers, which start over. During a rekey, frames
+		 * decrypted with the previous pairwise key while this one was
+		 * queued have already raised the replay counters of the new
+		 * key: left there, every frame of the new key would look like
+		 * a replay to ieee80211_input_hwdecrypt().
+		 */
+		if (rv == 0 && !(a->k->k_flags & IEEE80211_KEY_GROUP))
+			memset(a->k->k_rsc, 0, sizeof(a->k->k_rsc));
 		a->ni = NULL;
 		a->k = NULL;
 
@@ -2316,6 +2339,84 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	return rv;
 }
 
+/*
+ * The firmware removes the CCMP header and MIC of the frames it decrypts
+ * and leaves the packet number in GROUP_1 of the RX descriptor. The frame
+ * reached net80211 without the header and with the Protected bit clear,
+ * so ieee80211_input_hwdecrypt() skipped its replay check and trusted the
+ * hardware; this hardware does not check packet numbers, and a captured
+ * unicast data frame sent again was accepted a second time.
+ *
+ * Put the CCMP header back from the descriptor, as mt76_insert_ccmp_hdr()
+ * does in Linux, and keep the Protected bit: net80211 then compares the
+ * packet number with the last one seen for that key and TID after Block
+ * Ack reordering, the only point where the comparison is valid, and strips
+ * the header again. The MIC is already gone. TKIP and WEP keep the old
+ * behaviour, header stripped and no check, as mt76 checks CCMP only. A
+ * CCMP frame without a packet number is dropped. Returns NULL when the
+ * frame was consumed.
+ */
+static struct mbuf *
+mwx_rx_hwdec_restore(struct mwx_softc *sc, struct mbuf *m,
+    struct ieee80211_rxinfo *rxi, const struct mwx_rx_sec *sec)
+{
+	struct ieee80211_frame *wh;
+	uint8_t *data, *iv;
+	size_t pktlen;
+	u_int hdrlen;
+
+	if (!(rxi->rxi_flags & IEEE80211_RXI_HWDEC))
+		return m;
+	wh = mtod(m, struct ieee80211_frame *);
+	if (sec->sec_mode != MT_CIPHER_AES_CCMP ||
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA) {
+		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
+		return m;
+	}
+	hdrlen = ieee80211_get_hdrlen(wh);
+	pktlen = mbuf_pkthdr_len(m);
+	if (!sec->pn_valid || pktlen < hdrlen) {
+		if (mwx_rx_hwdec_nopn_cnt < 8)
+			MWX_DEV_LOG(sc,
+			    "rx drop reason=hwdec-no-pn pn_valid=%u len=%zu hdrlen=%u\n",
+			    sec->pn_valid, pktlen, hdrlen);
+		mwx_rx_hwdec_nopn_cnt++;
+		m_freem(m);
+		return NULL;
+	}
+	if (mbuf_next(m) == NULL && mbuf_len(m) == pktlen &&
+	    !mbuf_mclhasreference(m) &&
+	    m_leadingspace(m) >= IEEE80211_CCMP_HDRLEN) {
+		/* The RX descriptor just removed in front leaves the room. */
+		data = (uint8_t *)wh - IEEE80211_CCMP_HDRLEN;
+		if (mbuf_setdata(m, data, pktlen + IEEE80211_CCMP_HDRLEN) != 0) {
+			m_freem(m);
+			return NULL;
+		}
+		mbuf_pkthdr_setlen(m, pktlen + IEEE80211_CCMP_HDRLEN);
+	} else {
+		m = m_prepend(m, IEEE80211_CCMP_HDRLEN, M_DONTWAIT);
+		if (m == NULL)
+			return NULL;
+		m = m_pullup(m, hdrlen + IEEE80211_CCMP_HDRLEN);
+		if (m == NULL)
+			return NULL;
+		data = mtod(m, uint8_t *);
+	}
+	memmove(data, data + IEEE80211_CCMP_HDRLEN, hdrlen);
+	iv = data + hdrlen;
+	iv[0] = sec->pn[0];
+	iv[1] = sec->pn[1];
+	iv[2] = 0;
+	iv[3] = IEEE80211_WEP_EXTIV | (sec->key_id << 6);
+	iv[4] = sec->pn[2];
+	iv[5] = sec->pn[3];
+	iv[6] = sec->pn[4];
+	iv[7] = sec->pn[5];
+	data[1] |= IEEE80211_FC1_PROTECTED;
+	return m;
+}
+
 void
 mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxqueue)
 {
@@ -2324,6 +2425,7 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 	struct ieee80211_node *ni;
 	struct ieee80211_frame *wh;
 	struct ieee80211_rxinfo rxi = { 0 };
+	struct mwx_rx_sec sec;
 	MtkRxDescriptorMeta descriptor = {};
 	int aggregate = 0, rv;
 	uint32_t rx_epoch = 0;
@@ -2352,7 +2454,7 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 			return;
 		}
 	}
-	rv = mt7921_mac_fill_rx(sc, m, &rxi);
+	rv = mt7921_mac_fill_rx(sc, m, &rxi, &sec);
 	if (rv != 0) {
 		if (aggregate)
 			mwx_rx_amsdu_purge(sc);
@@ -2374,10 +2476,6 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 			m_freem(m);
 			return;
 		}
-		/* fill_rx cleared Protected after hardware decryption. Retain the
-		 * authenticated crypto context while collecting hardware subframes. */
-		if (descriptor.protected_frame)
-			((uint8_t *)mbuf_data(m))[1] |= IEEE80211_FC1_PROTECTED;
 		MtkRxAmsduMeta meta = {}, first = {};
 		meta.epoch = rx_epoch;
 		meta.queue = rxqueue;
@@ -2419,6 +2517,12 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 		m = mtkRxAmsduRestoreCcmp(m, descriptor);
 		if (m == NULL) {
 			mwx_rx_amsdu_invalid(sc);
+			ifp->if_ierrors++;
+			return;
+		}
+	} else {
+		m = mwx_rx_hwdec_restore(sc, m, &rxi, &sec);
+		if (m == NULL) {
 			ifp->if_ierrors++;
 			return;
 		}
@@ -6895,7 +6999,7 @@ mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 
 int
 mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
-    struct ieee80211_rxinfo *rxi)
+    struct ieee80211_rxinfo *rxi, struct mwx_rx_sec *sec)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	uint32_t *rxd, *rxv = NULL;
@@ -6908,6 +7012,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	int i;
 //	bool insert_ccmp_hdr = false;
 
+	memset(sec, 0, sizeof(*sec));
 	if (mbuf_len(m) < num_rxd * sizeof(uint32_t)) {
 		if (sc->sc_rx_fill_fail < 64) {
 			MWX_DEV_LOG(sc,
@@ -7011,6 +7116,10 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	}
 #endif
 
+	sec->sec_mode = (rxd1 & MT_RXD1_NORMAL_SEC_MODE_MASK) >>
+	    MT_RXD1_NORMAL_SEC_MODE_SHIFT;
+	sec->key_id = (rxd1 & MT_RXD1_NORMAL_KEY_ID_MASK) >>
+	    MT_RXD1_NORMAL_KEY_ID_SHIFT;
 	if ((rxd1 & MT_RXD1_NORMAL_SEC_MODE_MASK) != 0 &&
 	    !(rxd1 & (MT_RXD1_NORMAL_CLM | MT_RXD1_NORMAL_CM))) {
 		rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
@@ -7047,6 +7156,14 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 		rxd += 4;
 	}
 	if (rxd1 & MT_RXD1_NORMAL_GROUP_1) {
+		/*
+		 * The first six bytes hold the packet number of a decrypted
+		 * frame, PN0 first, as Linux mt7921_mac_fill_rx() reads it.
+		 */
+		if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
+			memcpy(sec->pn, rxd, sizeof(sec->pn));
+			sec->pn_valid = 1;
+		}
 		num_rxd += 4;
 		rxd += 4;
 	}
@@ -7334,18 +7451,6 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 			    (rxd1 & MT_RXD1_NORMAL_GROUP_2) != 0, ampdu_timestamp,
 			    (rxd2 & MT_RXD2_NORMAL_NON_AMPDU) != 0,
 			    (rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT) != 0);
-	}
-
-	if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
-		/*
-		 * MT7921/MT7922 firmware decrypts and removes CCMP IV/MIC.
-		 * Leave the protected bit clear so net80211 does not try to
-		 * strip an IV which is no longer present.
-		 */
-		struct ieee80211_frame *wh;
-
-		wh = mtod(m, struct ieee80211_frame *);
-		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
 	}
 
 	return 0;
@@ -9285,8 +9390,8 @@ MtkMwx::debugPoll()
 			off += snprintf(drops + off, sizeof(drops) - off,
 			    "%s=%u ", mwx_rx_drop_name[i], mwx_rx_drop_cnt[i]);
 		MWX_DEV_LOG(sc,
-		    "stats rx_hwdec=%u rx_swdec=%u ipkts=%llu ierr=%llu opkts=%llu oerr=%llu hwdrop[%s] dup=%u wrongbss=%u wrongdir=%u notassoc=%u unenc=%u wepfail=%u decap=%u decryptcrc=%u ccmp_replay=%u ccmp_dec=%u tooshort=%u nombuf=%u ba_below=%u ba_above=%u\n",
-		    mwx_rx_hwdec_cnt, mwx_rx_swdec_cnt,
+		    "stats rx_hwdec=%u rx_swdec=%u hwdec_nopn=%u ipkts=%llu ierr=%llu opkts=%llu oerr=%llu hwdrop[%s] dup=%u wrongbss=%u wrongdir=%u notassoc=%u unenc=%u wepfail=%u decap=%u decryptcrc=%u ccmp_replay=%u ccmp_dec=%u tooshort=%u nombuf=%u ba_below=%u ba_above=%u\n",
+		    mwx_rx_hwdec_cnt, mwx_rx_swdec_cnt, mwx_rx_hwdec_nopn_cnt,
 		    (unsigned long long)(ifp->netStat ? ifp->netStat->inputPackets : 0),
 		    (unsigned long long)(ifp->netStat ? ifp->netStat->inputErrors : 0),
 		    (unsigned long long)(ifp->netStat ? ifp->netStat->outputPackets : 0),
