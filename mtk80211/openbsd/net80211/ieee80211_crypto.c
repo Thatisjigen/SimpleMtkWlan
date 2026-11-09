@@ -411,13 +411,13 @@ ieee80211_kdf(const u_int8_t *key, size_t key_len, const u_int8_t *label,
  * Derive Pairwise Transient Key (PTK) (see 8.5.1.2).
  */
 void
-ieee80211_derive_ptk(enum ieee80211_akm akm, const u_int8_t *pmk,
-    const u_int8_t *aa, const u_int8_t *spa, const u_int8_t *anonce,
-    const u_int8_t *snonce, struct ieee80211_ptk *ptk)
+ieee80211_derive_ptk(enum ieee80211_akm akm, enum ieee80211_cipher cipher,
+    const u_int8_t *pmk, const u_int8_t *aa, const u_int8_t *spa,
+    const u_int8_t *anonce, const u_int8_t *snonce, struct ieee80211_ptk *ptk)
 {
-	void (*kdf)(const u_int8_t *, size_t, const u_int8_t *, size_t,
-        const u_int8_t *, size_t, u_int8_t *, size_t);
+    static const u_int8_t label[] = "Pairwise key expansion";
     u_int8_t buf[2 * IEEE80211_ADDR_LEN + 2 * EAPOL_KEY_NONCE_LEN];
+    size_t len;
     int ret;
 
     /* Min(AA,SPA) || Max(AA,SPA) */
@@ -430,9 +430,25 @@ ieee80211_derive_ptk(enum ieee80211_akm akm, const u_int8_t *pmk,
     memcpy(&buf[12], ret ? anonce : snonce, EAPOL_KEY_NONCE_LEN);
     memcpy(&buf[44], ret ? snonce : anonce, EAPOL_KEY_NONCE_LEN);
 
-    kdf = ieee80211_is_sha256_akm(akm) ? ieee80211_kdf : ieee80211_prf;
-    (*kdf)(pmk, IEEE80211_PMK_LEN, (const u_int8_t *)"Pairwise key expansion", 23,
-        buf, sizeof buf, (u_int8_t *)ptk, sizeof(*ptk));
+    if (!ieee80211_is_sha256_akm(akm)) {
+        /* the PRF takes the label with its terminating zero */
+        ieee80211_prf(pmk, IEEE80211_PMK_LEN, label, sizeof(label),
+            buf, sizeof buf, (u_int8_t *)ptk, sizeof(*ptk));
+        return;
+    }
+    /*
+     * The SHA-256 KDF takes the label without a terminator and hashes
+     * the length of the key it is asked for (802.11-2012 11.6.1.7.2),
+     * so the PTK must be requested at the size the negotiated pairwise
+     * cipher gives it: 384 bits with CCMP. The PRF above returns the
+     * same leading bytes whatever length is asked, the KDF does not.
+     */
+    len = sizeof(ptk->kck) + sizeof(ptk->kek) + ieee80211_cipher_keylen(cipher);
+    if (len > sizeof(*ptk))
+        len = sizeof(*ptk);
+    memset(ptk, 0, sizeof(*ptk));
+    ieee80211_kdf(pmk, IEEE80211_PMK_LEN, label, sizeof(label) - 1,
+        buf, sizeof buf, (u_int8_t *)ptk, len);
 }
 
 static void

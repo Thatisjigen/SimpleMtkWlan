@@ -297,8 +297,9 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     arc4random_buf(ic->ic_nonce, EAPOL_KEY_NONCE_LEN);
     
     /* TPTK = CalcPTK(PMK, ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ni->ni_macaddr,
-                         ic->ic_myaddr, ni->ni_nonce, ic->ic_nonce, &tptk);
+    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_rsncipher,
+                         ni->ni_pmk, ni->ni_macaddr, ic->ic_myaddr,
+                         ni->ni_nonce, ic->ic_nonce, &tptk);
     
     /* We are now expecting a new pairwise key. */
     ni->ni_flags |= IEEE80211_NODE_RSN_NEW_PTK;
@@ -339,8 +340,9 @@ ieee80211_recv_4way_msg2(struct ieee80211com *ic,
     /* NB: replay counter has already been verified by caller */
     
     /* PTK = CalcPTK(ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ic->ic_myaddr,
-                         ni->ni_macaddr, ni->ni_nonce, key->nonce, &tptk);
+    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_rsncipher,
+                         ni->ni_pmk, ic->ic_myaddr, ni->ni_macaddr,
+                         ni->ni_nonce, key->nonce, &tptk);
     
     /* check Key MIC field using KCK */
     if (ieee80211_eapol_key_check_mic(key, tptk.kck) != 0) {
@@ -437,8 +439,9 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         return;
     }
     /* TPTK = CalcPTK(PMK, ANonce, SNonce) */
-    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ni->ni_macaddr,
-                         ic->ic_myaddr, key->nonce, ic->ic_nonce, &tptk);
+    ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_rsncipher,
+                         ni->ni_pmk, ni->ni_macaddr, ic->ic_myaddr,
+                         key->nonce, ic->ic_nonce, &tptk);
     
     info = BE_READ_2(key->info);
     
