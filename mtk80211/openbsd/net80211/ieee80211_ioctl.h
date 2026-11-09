@@ -133,6 +133,7 @@ struct ieee80211_stats {
 	u_int32_t	is_ht_tx_ba_timeout;
     u_int32_t   is_vht_nego_no_mandatory_mcs;
     u_int32_t   is_vht_nego_bad_crypto;
+    u_int32_t   is_ht_rx_ba_htp_ack;
 };
 
 #define	SIOCG80211STATS		_IOWR('i', 242, struct ifreq)

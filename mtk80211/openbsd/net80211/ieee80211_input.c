@@ -385,14 +385,23 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         }
         
         /*
-         * Check if we have an explicit or implicit
-         * Block Ack Request for a valid BA agreement.
+         * Every QoS data frame of a TID with a BA agreement goes
+         * through the reordering buffer unless it was sent with the
+         * No Ack policy, as in Linux mac80211. 802.11ax gives the
+         * value of No Explicit Ack a second meaning, HTP Ack: an AP
+         * uses it for the frames of an A-MPDU that are acknowledged
+         * in an HE TB PPDU. Handing such a frame on at once, around
+         * the buffer, put it ahead of older frames still waiting
+         * behind a gap: the buffer waited for a frame that had already
+         * been delivered, and the replay check, which runs after
+         * reordering, dropped the older frames when they came out.
          */
         if (ba_state == IEEE80211_BA_AGREED &&
-            ((qos & IEEE80211_QOS_ACK_POLICY_MASK) ==
-             IEEE80211_QOS_ACK_POLICY_BA ||
-             (qos & IEEE80211_QOS_ACK_POLICY_MASK) ==
-             IEEE80211_QOS_ACK_POLICY_NORMAL)) {
+            (qos & IEEE80211_QOS_ACK_POLICY_MASK) !=
+            IEEE80211_QOS_ACK_POLICY_NOACK) {
+            if ((qos & IEEE80211_QOS_ACK_POLICY_MASK) ==
+                IEEE80211_QOS_ACK_POLICY_NOEXPLACK)
+                ic->ic_stats.is_ht_rx_ba_htp_ack++;
             /* go through A-MPDU reordering */
             ieee80211_input_ba(ic, m, ni, tid, rxi, ml);
             return;    /* don't free m! */
