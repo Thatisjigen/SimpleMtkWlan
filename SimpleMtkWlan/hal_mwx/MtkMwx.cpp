@@ -265,12 +265,6 @@ tsleep_nsec(void *ident, int priority, const char *wmesg, uint64_t timo)
 	return gMwxHal->mwxSleepNsec(ident, priority, wmesg, timo);
 }
 
-static inline void
-config_mountroot(struct device *self, void (*fn)(struct device *))
-{
-	fn(self);
-}
-
 static inline void delay(int usec) {
     if (usec <= 0) return;
     if (usec < 1000) IODelay(usec);
@@ -3031,6 +3025,41 @@ mwx_hw_firmware(enum mwx_hw_type type, const char **rompatch, const char **fw)
 		*fw = MT7921_FIRMWARE_WM;
 		break;
 	}
+}
+
+struct mwx_mountroot_call {
+	void		(*fn)(struct device *);
+	struct device	*self;
+};
+
+static IOReturn
+mwx_mountroot_gated(OSObject *, void *arg, void *, void *, void *)
+{
+	struct mwx_mountroot_call *call = (struct mwx_mountroot_call *)arg;
+
+	call->fn(call->self);
+	return kIOReturnSuccess;
+}
+
+/*
+ * OpenBSD runs the mountroot hook under the kernel lock, which the interrupt
+ * handler takes as well. Here the hook ran on the thread that attaches the
+ * driver while the interrupt source was already live on the work loop, and
+ * the two walked the firmware download ring at the same time: each freed a
+ * chunk the other had just freed (MEXT_REF(m) != 0 in m_freem). Close the
+ * gate around the hook; tsleep_nsec() opens it whenever the hook waits for
+ * the firmware, so interrupts still get through.
+ */
+static inline void
+config_mountroot(struct device *self, void (*fn)(struct device *))
+{
+	struct mwx_softc *sc = (struct mwx_softc *)self;
+	struct mwx_mountroot_call call = { fn, self };
+	IOCommandGate *gate = sc->sc_rx_amsdu_gate;	/* the main command gate */
+
+	if (gate == NULL ||
+	    gate->runAction(mwx_mountroot_gated, &call) != kIOReturnSuccess)
+		fn(self);
 }
 
 bool
