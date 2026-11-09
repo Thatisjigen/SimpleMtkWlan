@@ -69,6 +69,8 @@ void	ieee80211_recv_4way_msg2(struct ieee80211com *,
                                  struct ieee80211_eapol_key *, struct ieee80211_node *,
                                  const u_int8_t *);
 #endif
+int	ieee80211_install_igtk(struct ieee80211com *, struct ieee80211_node *,
+	    const u_int8_t *);
 int	ieee80211_must_update_group_key(struct ieee80211_key *, const uint8_t *,
                                     int);
 void	ieee80211_recv_4way_msg3(struct ieee80211com *,
@@ -396,6 +398,58 @@ ieee80211_must_update_group_key(struct ieee80211_key *k, const uint8_t *gtk,
 }
 
 /*
+ * Install the integrity group key of an IGTK KDE (message 3 of the 4-way
+ * handshake, message 1 of the group key handshake):
+ *
+ *   [1] 0xdd  [1] length  [3] OUI  [1] data type
+ *   [2] key id (4 or 5)  [6] IPN  [16] IGTK
+ *
+ * The access point authenticates its group addressed management frames
+ * with this key; the IPN is the packet number of the last one it sent.
+ * Returns 0, EBUSY if the driver installs the key later, or another error
+ * when the KDE or the key is not acceptable.
+ */
+int
+ieee80211_install_igtk(struct ieee80211com *ic, struct ieee80211_node *ni,
+                       const u_int8_t *igtk)
+{
+    struct ieee80211_key *k;
+    u_int16_t kid;
+    int error = 0;
+    
+    /* check that the IGTK KDE is valid */
+    if (igtk[1] != 4 + 24)
+        return EINVAL;
+    kid = LE_READ_2(&igtk[6]);
+    if (kid != 4 && kid != 5) {
+        DPRINTF(("unsupported IGTK id %u\n", kid));
+        return EINVAL;
+    }
+    /* map IGTK to 802.11 key */
+    k = &ic->ic_nw_keys[kid];
+    if (ieee80211_must_update_group_key(k, &igtk[14], 16)) {
+        /* the key this one replaces owns a crypto context */
+        if (k->k_cipher != IEEE80211_CIPHER_NONE)
+            (*ic->ic_delete_key)(ic, ni, k);
+        memset(k, 0, sizeof(*k));
+        k->k_id = kid;    /* either 4 or 5 */
+        k->k_cipher = ni->ni_rsngroupmgmtcipher;
+        k->k_flags = IEEE80211_KEY_IGTK;
+        k->k_mgmt_rsc = LE_READ_6(&igtk[8]);    /* IPN */
+        k->k_len = 16;
+        memcpy(k->k_key, &igtk[14], k->k_len);
+        /* install the IGTK */
+        error = (*ic->ic_set_key)(ic, ni, k);
+        if (error != 0 && error != EBUSY) {
+            explicit_bzero(k, sizeof(*k));
+            return error;
+        }
+    }
+    ic->ic_igtk_kid = kid;
+    return error;
+}
+
+/*
  * Process Message 3 of the 4-Way Handshake (sent by Authenticator).
  */
 void
@@ -621,6 +675,14 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         ni->ni_flags &= ~IEEE80211_NODE_RSN_NEW_PTK;
         ni->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
         ni->ni_flags |= IEEE80211_NODE_RXPROT;
+        /*
+         * With the pairwise key in place the access point protects its
+         * robust management frames to us, and from here on only
+         * protected ones are accepted. Our own are protected once the
+         * driver reports the key installed (IEEE80211_NODE_TXMGMTPROT).
+         */
+        if (ni->ni_flags & IEEE80211_NODE_MFP)
+            ni->ni_flags |= IEEE80211_NODE_RXMGMTPROT;
     } else if (ni->ni_rsncipher != IEEE80211_CIPHER_USEGROUP)
         XYLog("%s: unexpected pairwise key update received from %s\n",
               ic->ic_if.if_xname, ether_sprintf(ni->ni_macaddr));
@@ -663,40 +725,15 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         }
     }
     if (igtk != NULL) {    /* implies MFP && gtk != NULL */
-        u_int16_t kid;
-        
-        /* check that the IGTK KDE is valid */
-        if (igtk[1] != 4 + 24) {
-            reason = IEEE80211_REASON_AUTH_LEAVE;
-            goto deauth;
-        }
-        kid = LE_READ_2(&igtk[6]);
-        if (kid != 4 && kid != 5) {
-            DPRINTF(("unsupported IGTK id %u\n", kid));
-            reason = IEEE80211_REASON_AUTH_LEAVE;
-            goto deauth;
-        }
-        /* map IGTK to 802.11 key */
-        k = &ic->ic_nw_keys[kid];
-        if (ieee80211_must_update_group_key(k, &igtk[14], 16)) {
-            memset(k, 0, sizeof(*k));
-            k->k_id = kid;    /* either 4 or 5 */
-            k->k_cipher = ni->ni_rsngroupmgmtcipher;
-            k->k_flags = IEEE80211_KEY_IGTK;
-            k->k_mgmt_rsc = LE_READ_6(&igtk[8]);    /* IPN */
-            k->k_len = 16;
-            memcpy(k->k_key, &igtk[14], k->k_len);
-            /* install the IGTK */
-            switch ((*ic->ic_set_key)(ic, ni, k)) {
-                case 0:
-                    break;
-                case EBUSY:
-                    deferlink = 1;
-                    break;
-                default:
-                    reason = IEEE80211_REASON_AUTH_LEAVE;
-                    goto deauth;
-            }
+        switch (ieee80211_install_igtk(ic, ni, igtk)) {
+            case 0:
+                break;
+            case EBUSY:
+                deferlink = 1;
+                break;
+            default:
+                reason = IEEE80211_REASON_AUTH_LEAVE;
+                goto deauth;
         }
     }
     if (info & EAPOL_KEY_INSTALL)
@@ -956,36 +993,13 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
         }
     }
     if (igtk != NULL) {    /* implies MFP */
-        /* check that the IGTK KDE is valid */
-        if (igtk[1] != 4 + 24) {
-            reason = IEEE80211_REASON_AUTH_LEAVE;
-            goto deauth;
-        }
-        kid = LE_READ_2(&igtk[6]);
-        if (kid != 4 && kid != 5) {
-            DPRINTF(("unsupported IGTK id %u\n", kid));
-            reason = IEEE80211_REASON_AUTH_LEAVE;
-            goto deauth;
-        }
-        /* map IGTK to 802.11 key */
-        k = &ic->ic_nw_keys[kid];
-        if (ieee80211_must_update_group_key(k, &igtk[14], 16)) {
-            memset(k, 0, sizeof(*k));
-            k->k_id = kid;    /* either 4 or 5 */
-            k->k_cipher = ni->ni_rsngroupmgmtcipher;
-            k->k_flags = IEEE80211_KEY_IGTK;
-            k->k_mgmt_rsc = LE_READ_6(&igtk[8]);    /* IPN */
-            k->k_len = 16;
-            memcpy(k->k_key, &igtk[14], k->k_len);
-            /* install the IGTK */
-            switch ((*ic->ic_set_key)(ic, ni, k)) {
-                case 0:
-                case EBUSY:
-                    break;
-                default:
-                    reason = IEEE80211_REASON_AUTH_LEAVE;
-                    goto deauth;
-            }
+        switch (ieee80211_install_igtk(ic, ni, igtk)) {
+            case 0:
+            case EBUSY:
+                break;
+            default:
+                reason = IEEE80211_REASON_AUTH_LEAVE;
+                goto deauth;
         }
     }
     if (info & EAPOL_KEY_SECURE) {

@@ -317,7 +317,8 @@ struct ieee80211_frame {u_int8_t i_fc[2],i_dur[2],i_addr1[6],i_addr2[6],i_addr3[
 struct ieee80211_key {u_int8_t k_id;enum ieee80211_cipher k_cipher;u_int k_flags,k_len;u_int64_t k_rsc[16],k_mgmt_rsc,k_tsc;u_int8_t k_key[32];void*k_priv;};
 struct ieee80211_rxinfo {u_int32_t rxi_flags=0;};
 struct ieee80211_stats {u_int32_t is_ccmp_replays=0,is_tkip_replays=0,is_cmac_replays=0,is_cmac_icv_errs=0,is_rx_deauth=0,is_tx_nombuf=0,
- is_rx_mgmt_prot=0,is_rx_mgmt_unprot=0,is_rx_mgmt_badprot=0,is_sa_query_started=0,is_sa_query_answered=0,is_sa_query_timeouts=0,is_sa_query_replies=0;};
+ is_rx_mgmt_prot=0,is_rx_mgmt_unprot=0,is_rx_mgmt_badprot=0,is_sa_query_started=0,is_sa_query_answered=0,is_sa_query_timeouts=0,is_sa_query_replies=0,
+ is_assoc_comeback=0,is_assoc_reauth=0;};
 struct ieee80211com;
 struct ieee80211_node {u_int8_t ni_macaddr[6]={},ni_bssid[6]={},ni_pmkid[16]={};u_int32_t ni_flags=0;u_int16_t ni_rsncaps=0;
  u_int ni_rsnprotos=0,ni_rsnakms=0,ni_rsnciphers=0;enum ieee80211_cipher ni_rsncipher=IEEE80211_CIPHER_NONE,ni_rsngroupcipher=IEEE80211_CIPHER_NONE,
@@ -331,6 +332,7 @@ struct ieee80211com {_ifnet ic_if;enum ieee80211_opmode ic_opmode=IEEE80211_M_ST
  ieee80211_key ic_nw_keys[IEEE80211_GROUP_NKID]={};int ic_def_txkey=0,ic_igtk_kid=0;ieee80211_stats ic_stats;u_int16_t ic_deauth_reason=0;
  enum ieee80211_cipher ic_rsngroupmgmtcipher=IEEE80211_CIPHER_BIP;
  CTimeout*ic_sa_query_to=nullptr;u_int16_t ic_sa_query_trid=0;u_int8_t ic_sa_query_state=0,ic_sa_query_count=0;void*ic_softc=nullptr;
+ CTimeout*ic_assoc_comeback_to=nullptr;u_int8_t ic_assoc_comeback=0,ic_assoc_comebacks=0,ic_assoc_reauths=0;int ic_mgt_timer=0;
  void(*ic_event_handler)(ieee80211com*,int,void*)=nullptr;int(*ic_set_key)(ieee80211com*,ieee80211_node*,ieee80211_key*)=nullptr;
  void(*ic_delete_key)(ieee80211com*,ieee80211_node*,ieee80211_key*)=nullptr;int(*ic_send_mgmt)(ieee80211com*,ieee80211_node*,int,int,int)=nullptr;};
 '''

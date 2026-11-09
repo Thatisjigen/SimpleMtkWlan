@@ -534,6 +534,17 @@ struct ieee80211com {
 	int			ic_def_txkey;	/* group data key index */
 #define ic_wep_txkey	ic_def_txkey
 	int			ic_igtk_kid;	/* IGTK key index */
+	CTimeout*		ic_sa_query_to;	/* STA: SA Query timer */
+	u_int16_t		ic_sa_query_trid;	/* STA: last transaction */
+	u_int8_t		ic_sa_query_state;
+#define IEEE80211_SA_QUERY_IDLE		0
+#define IEEE80211_SA_QUERY_ACTIVE	1	/* waiting for the response */
+#define IEEE80211_SA_QUERY_HOLDOFF	2	/* answered, not asking again */
+	u_int8_t		ic_sa_query_count;	/* requests sent */
+	CTimeout*		ic_assoc_comeback_to;	/* STA: refused for now */
+	u_int8_t		ic_assoc_comeback;	/* waiting to ask again */
+	u_int8_t		ic_assoc_comebacks;	/* refusals in this join */
+	u_int8_t		ic_assoc_reauths;	/* authentications again */
 	u_int32_t		ic_iv;		/* initial vector for wep */
 	struct ieee80211_stats	ic_stats;	/* statistics */
 	struct timeval		ic_last_merge_print;	/* for rate-limiting

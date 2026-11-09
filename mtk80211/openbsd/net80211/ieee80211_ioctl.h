@@ -134,6 +134,15 @@ struct ieee80211_stats {
     u_int32_t   is_vht_nego_no_mandatory_mcs;
     u_int32_t   is_vht_nego_bad_crypto;
     u_int32_t   is_ht_rx_ba_htp_ack;
+	u_int32_t	is_rx_mgmt_prot;	/* rx protected mgmt accepted */
+	u_int32_t	is_rx_mgmt_unprot;	/* rx robust mgmt w/o protection */
+	u_int32_t	is_rx_mgmt_badprot;	/* rx mgmt failing protection */
+	u_int32_t	is_sa_query_started;	/* SA Queries we started */
+	u_int32_t	is_sa_query_answered;	/* ...answered by the AP */
+	u_int32_t	is_sa_query_timeouts;	/* ...that the AP ignored */
+	u_int32_t	is_sa_query_replies;	/* SA Query requests answered */
+	u_int32_t	is_assoc_comeback;	/* associations refused for now */
+	u_int32_t	is_assoc_reauth;	/* authenticated again while associating */
 };
 
 #define	SIOCG80211STATS		_IOWR('i', 242, struct ifreq)

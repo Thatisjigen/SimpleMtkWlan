@@ -117,8 +117,9 @@ uint8_t *ieee80211_add_wme_info(uint8_t *, struct ieee80211com *);
 #ifndef IEEE80211_STA_ONLY
 uint8_t *ieee80211_add_wme_param(uint8_t *, struct ieee80211com *);
 #endif
+int	ieee80211_is_robust_mgmt(mbuf_t, int);
 mbuf_t ieee80211_get_sa_query(struct ieee80211com *,
-	    struct ieee80211_node *, u_int8_t);
+	    struct ieee80211_node *, u_int8_t, u_int16_t);
 mbuf_t ieee80211_get_action(struct ieee80211com *,
 	    struct ieee80211_node *, u_int8_t, u_int8_t, int);
 
@@ -190,6 +191,30 @@ ieee80211_action_name(struct ieee80211_frame *wh)
 }
 
 /*
+ * Tell whether a management frame of the given subtype, already built with
+ * its 802.11 header in front, is a robust one: Deauthentication,
+ * Disassociation and the Action frames of a robust category.
+ */
+int
+ieee80211_is_robust_mgmt(mbuf_t m, int type)
+{
+    u_int8_t category;
+
+    switch (type & IEEE80211_FC0_SUBTYPE_MASK) {
+    case IEEE80211_FC0_SUBTYPE_DISASSOC:
+    case IEEE80211_FC0_SUBTYPE_DEAUTH:
+        return 1;
+    case IEEE80211_FC0_SUBTYPE_ACTION:
+    case IEEE80211_FC0_SUBTYPE_ACTION_NOACK:
+        if (mbuf_copydata(m, sizeof(struct ieee80211_frame), 1,
+            &category) != 0)
+            return 0;
+        return ieee80211_is_robust_action(category);
+    }
+    return 0;
+}
+
+/*
  * Send a management frame to the specified node.  The node pointer
  * must have a reference as the pointer will be passed to the driver
  * and potentially held for a long time.  If the frame is successfully
@@ -232,9 +257,17 @@ ieee80211_mgmt_output(struct _ifnet *ifp, struct ieee80211_node *ni,
 
         /* check if protection is required for this mgmt frame */
         if ((ic->ic_caps & IEEE80211_C_MFP) &&
-            (type == IEEE80211_FC0_SUBTYPE_DISASSOC ||
-             type == IEEE80211_FC0_SUBTYPE_DEAUTH ||
-             type == IEEE80211_FC0_SUBTYPE_ACTION)) {
+            ieee80211_is_robust_mgmt(m, type)) {
+            /*
+             * The Protected bit tells the driver to encrypt the frame
+             * with the pairwise key. Only frames to a peer that
+             * negotiated management frame protection, once its keys
+             * are installed: until then nothing could decrypt them.
+             */
+            if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+                (ni->ni_flags & IEEE80211_NODE_TXMGMTPROT))
+                wh->i_fc[1] |= IEEE80211_FC1_PROTECTED;
+#ifndef IEEE80211_STA_ONLY
             /*
              * Hack: we should not set the Protected bit in outgoing
              * group management frames, however it is used as an
@@ -243,9 +276,10 @@ ieee80211_mgmt_output(struct _ifnet *ifp, struct ieee80211_node *ni,
              * management frames (software crypto code will do it).
              * XXX could use an mbuf flag..
              */
-            if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
-                (ni->ni_flags & IEEE80211_NODE_TXMGMTPROT))
+            if (ic->ic_opmode != IEEE80211_M_STA &&
+                IEEE80211_IS_MULTICAST(wh->i_addr1))
                 wh->i_fc[1] |= IEEE80211_FC1_PROTECTED;
+#endif
         }
 
         if (ifp->if_flags & IFF_DEBUG) {
@@ -1010,6 +1044,7 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
 	const u_int8_t *oui = wpa ? MICROSOFT_OUI : IEEE80211_OUI;
 	u_int8_t *pcount;
     u_int16_t count, rsncaps;
+    int mfp;
 
 	/* write Version field */
     LE_WRITE_2(frm, 1); frm += 2;
@@ -1084,10 +1119,21 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
     if (wpa)
         return frm;
 
+    /*
+     * A station offers management frame protection to the access points
+     * that advertise it, when ieee80211_choose_rsnparams() selected it.
+     * To the others it sends the element it always sent: some reject an
+     * association request that sets MFPC or carries a group management
+     * cipher they do not know.
+     */
+    mfp = (ic->ic_caps & IEEE80211_C_MFP) != 0;
+    if (ic->ic_opmode == IEEE80211_M_STA)
+        mfp = mfp && (ni->ni_flags & IEEE80211_NODE_MFP) != 0;
+
     /* write RSN Capabilities field */
     rsncaps = (ni->ni_rsncaps & (IEEE80211_RSNCAP_PTKSA_RCNT_MASK |
         IEEE80211_RSNCAP_GTKSA_RCNT_MASK));
-    if (ic->ic_caps & IEEE80211_C_MFP) {
+    if (mfp) {
         rsncaps |= IEEE80211_RSNCAP_MFPC;
         if (ic->ic_flags & IEEE80211_F_MFPR)
             rsncaps |= IEEE80211_RSNCAP_MFPR;
@@ -1104,7 +1150,7 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
         frm += IEEE80211_PMKID_LEN;
     }
 
-    if (!(ic->ic_caps & IEEE80211_C_MFP))
+    if (!mfp)
         return frm;
 
     if ((ni->ni_flags & IEEE80211_NODE_PMKID) == 0) {
@@ -1904,11 +1950,11 @@ ieee80211_get_delba(struct ieee80211com *ic, struct ieee80211_node *ni,
  * SA Query Request/Reponse frame format:
  * [1]  Category
  * [1]  Action
- * [16] Transaction Identifier
+ * [2]  Transaction Identifier
  */
 mbuf_t
 ieee80211_get_sa_query(struct ieee80211com *ic, struct ieee80211_node *ni,
-    u_int8_t action)
+    u_int8_t action, u_int16_t trid)
 {
 	mbuf_t m;
 	u_int8_t *frm;
@@ -1920,7 +1966,7 @@ ieee80211_get_sa_query(struct ieee80211com *ic, struct ieee80211_node *ni,
 	frm = mtod(m, u_int8_t *);
 	*frm++ = IEEE80211_CATEG_SA_QUERY;
 	*frm++ = action;	/* ACTION_SA_QUERY_REQ/RESP */
-	LE_WRITE_2(frm, ni->ni_sa_query_trid); frm += 2;
+	LE_WRITE_2(frm, trid); frm += 2;
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);
@@ -1953,11 +1999,10 @@ ieee80211_get_action(struct ieee80211com *ic, struct ieee80211_node *ni,
 		break;
 	case IEEE80211_CATEG_SA_QUERY:
 		switch (action) {
-#ifndef IEEE80211_STA_ONLY
 		case IEEE80211_ACTION_SA_QUERY_REQ:
-#endif
 		case IEEE80211_ACTION_SA_QUERY_RESP:
-			m = ieee80211_get_sa_query(ic, ni, action);
+			/* arg is the transaction identifier */
+			m = ieee80211_get_sa_query(ic, ni, action, arg & 0xffff);
 			break;
 		}
 		break;

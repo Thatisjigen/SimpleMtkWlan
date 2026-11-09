@@ -1151,6 +1151,19 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
             (ic->ic_flags & IEEE80211_F_MFPR) &&
             !(ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC))
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
+
+        /*
+         * MFP also needs RSN with CCMP as the pairwise cipher (see
+         * ieee80211_choose_rsnparams()). When either side requires MFP
+         * and it could not be negotiated, decline.
+         */
+        if ((ic->ic_caps & IEEE80211_C_MFP) &&
+            ((ni->ni_rsncaps & IEEE80211_RSNCAP_MFPR) ||
+             (ic->ic_flags & IEEE80211_F_MFPR)) &&
+            (!(ni->ni_rsnprotos & ic->ic_rsnprotos & IEEE80211_PROTO_RSN) ||
+             !(ni->ni_rsnciphers & ic->ic_rsnciphers &
+               IEEE80211_CIPHER_CCMP)))
+            fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
     }
     
     if (ic->ic_if.if_flags & IFF_DEBUG && ieee80211_debug) {
@@ -1678,9 +1691,18 @@ ieee80211_choose_rsnparams(struct ieee80211com *ic)
         ni->ni_rsnciphers = IEEE80211_CIPHER_TKIP;
     ni->ni_rsncipher = (enum ieee80211_cipher)ni->ni_rsnciphers;
     
-    /* use MFP if we both support it */
+    /*
+     * Use MFP if we both support it. It needs an RSNA with CCMP as the
+     * pairwise cipher (the standard forbids it with TKIP, and access
+     * points reject the association) and the group management cipher we
+     * implement.
+     */
+    ni->ni_flags &= ~IEEE80211_NODE_MFP;
     if ((ic->ic_caps & IEEE80211_C_MFP) &&
-        (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC))
+        (ni->ni_rsncaps & IEEE80211_RSNCAP_MFPC) &&
+        ni->ni_rsnprotos == IEEE80211_PROTO_RSN &&
+        ni->ni_rsncipher == IEEE80211_CIPHER_CCMP &&
+        ni->ni_rsngroupmgmtcipher == IEEE80211_CIPHER_BIP)
         ni->ni_flags |= IEEE80211_NODE_MFP;
 }
 

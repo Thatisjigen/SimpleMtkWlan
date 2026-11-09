@@ -125,6 +125,11 @@ ieee80211_proto_attach(struct _ifnet *ifp)
 	/* initialize management frame handlers */
 	ic->ic_recv_mgmt = ieee80211_recv_mgmt;
 	ic->ic_send_mgmt = ieee80211_send_mgmt;
+
+	/* a station has one peer to query, its access point */
+	timeout_set(&ic->ic_sa_query_to, ieee80211_sta_sa_query_timeout, ic);
+	timeout_set(&ic->ic_assoc_comeback_to,
+	    ieee80211_sta_assoc_comeback_timeout, ic);
 }
 
 void
@@ -133,6 +138,10 @@ ieee80211_proto_detach(struct _ifnet *ifp)
     XYLog("%s\n", __FUNCTION__);
 	struct ieee80211com *ic = (struct ieee80211com *)ifp;
 
+	timeout_del(&ic->ic_sa_query_to);
+	timeout_free(&ic->ic_sa_query_to);
+	timeout_del(&ic->ic_assoc_comeback_to);
+	timeout_free(&ic->ic_assoc_comeback_to);
 	mq_purge(&ic->ic_mgtq);
 	mq_purge(&ic->ic_pwrsaveq);
 }
@@ -575,10 +584,188 @@ ieee80211_sa_query_request(struct ieee80211com *ic, struct ieee80211_node *ni)
 
 	/* send SA Query Request */
 	IEEE80211_SEND_ACTION(ic, ni, IEEE80211_CATEG_SA_QUERY,
-	    IEEE80211_ACTION_SA_QUERY_REQ, 0);
+	    IEEE80211_ACTION_SA_QUERY_REQ, ni->ni_sa_query_trid);
 	timeout_add_msec(&ni->ni_sa_query_to, 10);
 }
 #endif	/* IEEE80211_STA_ONLY */
+
+/*
+ * SA Query started by a station (802.11-2020 11.13).
+ *
+ * With management frame protection an unprotected Deauthentication or
+ * Disassociation is not acted upon: anyone in range can forge one. But an
+ * access point that restarted, or dropped us while we could not hear it,
+ * has no keys left to protect the frame with, and answers our traffic with
+ * exactly such frames (reason 6 or 7). Ignoring them for good would leave
+ * the station attached to an access point that no longer knows it.
+ *
+ * So ask: an access point that still holds our security association
+ * answers a protected SA Query Request, and then the frame was forged or
+ * stale. One that stays silent for dot11AssociationSAQueryMaximumTimeout
+ * has lost the association, and we start over as if the frame had been
+ * accepted. After an answer no new query is started for a while, so that a
+ * stream of forged frames cannot keep us sending.
+ */
+#define IEEE80211_SA_QUERY_RETRY_MS	206	/* 201 TU between requests */
+#define IEEE80211_SA_QUERY_MAX_MS	1024	/* 1000 TU for the procedure */
+#define IEEE80211_SA_QUERY_MAX_TRIES	\
+	(IEEE80211_SA_QUERY_MAX_MS / IEEE80211_SA_QUERY_RETRY_MS + 1)
+#define IEEE80211_SA_QUERY_HOLDOFF_S	10
+
+static void
+ieee80211_sta_sa_query_send(struct ieee80211com *ic)
+{
+	/* every request of a procedure has its own transaction identifier */
+	ic->ic_sa_query_trid++;
+	ic->ic_sa_query_count++;
+	IEEE80211_SEND_ACTION(ic, ic->ic_bss, IEEE80211_CATEG_SA_QUERY,
+	    IEEE80211_ACTION_SA_QUERY_REQ, ic->ic_sa_query_trid);
+	timeout_add_msec(&ic->ic_sa_query_to, IEEE80211_SA_QUERY_RETRY_MS);
+}
+
+/*
+ * Verify the security association with our access point. Called for an
+ * unprotected frame that says the association is gone.
+ */
+void
+ieee80211_sta_sa_query_start(struct ieee80211com *ic)
+{
+	struct ieee80211_node *ni = ic->ic_bss;
+
+	if (ic->ic_opmode != IEEE80211_M_STA ||
+	    ic->ic_state != IEEE80211_S_RUN || ni == NULL ||
+	    ic->ic_sa_query_state != IEEE80211_SA_QUERY_IDLE)
+		return;
+	/* the request must leave protected, or the answer proves nothing */
+	if (!(ni->ni_flags & IEEE80211_NODE_TXMGMTPROT))
+		return;
+
+	ic->ic_sa_query_state = IEEE80211_SA_QUERY_ACTIVE;
+	ic->ic_sa_query_count = 0;
+	ic->ic_stats.is_sa_query_started++;
+	ieee80211_sta_sa_query_send(ic);
+}
+
+/*
+ * A protected SA Query Response arrived from our access point.
+ */
+void
+ieee80211_sta_sa_query_response(struct ieee80211com *ic, u_int16_t trid)
+{
+	if (ic->ic_sa_query_state != IEEE80211_SA_QUERY_ACTIVE)
+		return;
+	/* any request of this procedure may be the one answered */
+	if ((u_int16_t)(ic->ic_sa_query_trid - trid) >= ic->ic_sa_query_count)
+		return;
+
+	/* MLME-SAQuery.confirm: the association is intact */
+	ic->ic_stats.is_sa_query_answered++;
+	ic->ic_sa_query_state = IEEE80211_SA_QUERY_HOLDOFF;
+	timeout_add_sec(&ic->ic_sa_query_to, IEEE80211_SA_QUERY_HOLDOFF_S);
+}
+
+void
+ieee80211_sta_sa_query_stop(struct ieee80211com *ic)
+{
+	timeout_del(&ic->ic_sa_query_to);
+	ic->ic_sa_query_state = IEEE80211_SA_QUERY_IDLE;
+	ic->ic_sa_query_count = 0;
+}
+
+void
+ieee80211_sta_sa_query_timeout(void *arg)
+{
+	struct ieee80211com *ic = (struct ieee80211com *)arg;
+	int s;
+
+	s = splnet();
+	switch (ic->ic_sa_query_state) {
+	case IEEE80211_SA_QUERY_ACTIVE:
+		if (ic->ic_opmode != IEEE80211_M_STA ||
+		    ic->ic_state != IEEE80211_S_RUN) {
+			ic->ic_sa_query_state = IEEE80211_SA_QUERY_IDLE;
+			break;
+		}
+		if (ic->ic_sa_query_count < IEEE80211_SA_QUERY_MAX_TRIES) {
+			ieee80211_sta_sa_query_send(ic);
+			break;
+		}
+		/* the access point no longer holds our association */
+		ic->ic_sa_query_state = IEEE80211_SA_QUERY_IDLE;
+		ic->ic_stats.is_sa_query_timeouts++;
+		XYLog("%s: no answer to %u SA Query requests, the access "
+		    "point lost our association\n", ic->ic_if.if_xname,
+		    ic->ic_sa_query_count);
+		ieee80211_sta_deauthenticated(ic, IEEE80211_REASON_AUTH_EXPIRE);
+		break;
+	case IEEE80211_SA_QUERY_HOLDOFF:
+		ic->ic_sa_query_state = IEEE80211_SA_QUERY_IDLE;
+		break;
+	}
+	splx(s);
+}
+
+/*
+ * Association comeback (802.11-2020 11.3.5.4). An access point refuses an
+ * association request for now (status 30) while it holds a protected
+ * association with us, which it first checks with an SA Query. Such an
+ * association is one whose keys we do not have: the answer to an earlier
+ * request of ours got lost, or we restarted. A request sent before the
+ * comeback time of its Timeout Interval element is refused the same way,
+ * so ask again only once that time has passed, three times at most in a
+ * join; after that the join times out as before.
+ */
+#define IEEE80211_TIE_ASSOC_COMEBACK		3	/* interval type */
+#define IEEE80211_ASSOC_COMEBACK_DEFAULT_TU	1000	/* SA Query maximum */
+#define IEEE80211_ASSOC_COMEBACK_MAX_TU		10000
+#define IEEE80211_ASSOC_COMEBACK_MAX		3
+
+void
+ieee80211_sta_assoc_comeback(struct ieee80211com *ic, const u_int8_t *frm,
+    const u_int8_t *efrm)
+{
+	u_int32_t tu = IEEE80211_ASSOC_COMEBACK_DEFAULT_TU, ms;
+
+	if (ic->ic_opmode != IEEE80211_M_STA ||
+	    ic->ic_state != IEEE80211_S_ASSOC || ic->ic_assoc_comeback ||
+	    ic->ic_assoc_comebacks >= IEEE80211_ASSOC_COMEBACK_MAX)
+		return;
+	for (; frm + 2 <= efrm && frm + 2 + frm[1] <= efrm;
+	    frm += 2 + frm[1]) {
+		if (frm[0] == IEEE80211_ELEMID_TIE && frm[1] >= 5 &&
+		    frm[2] == IEEE80211_TIE_ASSOC_COMEBACK) {
+			tu = LE_READ_4(frm + 3);
+			break;
+		}
+	}
+	if (tu > IEEE80211_ASSOC_COMEBACK_MAX_TU)
+		tu = IEEE80211_ASSOC_COMEBACK_MAX_TU;
+	ms = tu * 1024 / 1000 + 1;
+	ic->ic_assoc_comebacks++;
+	ic->ic_assoc_comeback = 1;
+	ic->ic_stats.is_assoc_comeback++;
+	/* the join must not time out while we wait */
+	ic->ic_mgt_timer = ms / 1000 + 1 + IEEE80211_TRANS_WAIT;
+	ic->ic_if.if_timer = 1;
+	timeout_add_msec(&ic->ic_assoc_comeback_to, ms);
+	XYLog("%s: association refused for now, asking again in %u ms\n",
+	    ic->ic_if.if_xname, ms);
+}
+
+void
+ieee80211_sta_assoc_comeback_timeout(void *arg)
+{
+	struct ieee80211com *ic = (struct ieee80211com *)arg;
+	int s;
+
+	s = splnet();
+	if (ic->ic_assoc_comeback && ic->ic_opmode == IEEE80211_M_STA &&
+	    ic->ic_state == IEEE80211_S_ASSOC && ic->ic_bss != NULL)
+		IEEE80211_SEND_MGMT(ic, ic->ic_bss,
+		    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);
+	ic->ic_assoc_comeback = 0;
+	splx(s);
+}
 
 void
 ieee80211_ht_negotiate_chw(struct ieee80211com *ic, struct ieee80211_node *ni)
@@ -1337,6 +1524,8 @@ ieee80211_auth_open(struct ieee80211com *ic, const struct ieee80211_frame *wh,
 		if (ic->ic_flags & IEEE80211_F_RSNON) {
 			/* XXX not here! */
 			ic->ic_bss->ni_flags &= ~IEEE80211_NODE_TXRXPROT;
+			ic->ic_bss->ni_flags &= ~(IEEE80211_NODE_RXMGMTPROT |
+			    IEEE80211_NODE_TXMGMTPROT);
 			ic->ic_bss->ni_port_valid = 0;
 			ic->ic_bss->ni_replaycnt_ok = 0;
 			(*ic->ic_delete_key)(ic, ic->ic_bss,
@@ -1446,6 +1635,12 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 		    ieee80211_state_name[ostate], ieee80211_state_name[nstate]);
 	ic->ic_state = nstate;			/* state transition */
 	ni = ic->ic_bss;			/* NB: no reference held */
+	if (ic->ic_assoc_comeback) {
+		timeout_del(&ic->ic_assoc_comeback_to);
+		ic->ic_assoc_comeback = 0;
+	}
+	if (nstate == IEEE80211_S_AUTH && ostate == IEEE80211_S_SCAN)
+		ic->ic_assoc_comebacks = ic->ic_assoc_reauths = 0;
 	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 	ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
 	switch (nstate) {
@@ -1736,6 +1931,19 @@ justcleanup:
 			break;
 		}
 		break;
+	}
+	/*
+	 * The association is over: its keys go, and with them the protection
+	 * of management frames. The frames sent above still had it. From here
+	 * on the access point answers unprotected again, starting with the
+	 * authentication, and must be heard.
+	 */
+	if (ostate == IEEE80211_S_RUN && ic->ic_state != IEEE80211_S_RUN &&
+	    ic->ic_opmode == IEEE80211_M_STA) {
+		ieee80211_sta_sa_query_stop(ic);
+		if (ic->ic_bss != NULL)
+			ic->ic_bss->ni_flags &= ~(IEEE80211_NODE_RXMGMTPROT |
+			    IEEE80211_NODE_TXMGMTPROT);
 	}
 	return 0;
 }

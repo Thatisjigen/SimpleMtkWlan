@@ -191,6 +191,16 @@ extern	void ieee80211_setkeysdone(struct ieee80211com *);
 extern	void ieee80211_sa_query_timeout(void *);
 extern	void ieee80211_sa_query_request(struct ieee80211com *,
 	    struct ieee80211_node *);
+extern	void ieee80211_sta_sa_query_start(struct ieee80211com *);
+extern	void ieee80211_sta_sa_query_response(struct ieee80211com *,
+	    u_int16_t);
+extern	void ieee80211_sta_sa_query_stop(struct ieee80211com *);
+extern	void ieee80211_sta_sa_query_timeout(void *);
+extern	void ieee80211_sta_assoc_comeback(struct ieee80211com *,
+	    const u_int8_t *, const u_int8_t *);
+extern	void ieee80211_sta_assoc_comeback_timeout(void *);
+extern	void ieee80211_sta_deauthenticated(struct ieee80211com *,
+	    u_int16_t);
 extern  void ieee80211_ht_negotiate_chw(struct ieee80211com *,
     struct ieee80211_node *);
 extern	void ieee80211_ht_negotiate(struct ieee80211com *,

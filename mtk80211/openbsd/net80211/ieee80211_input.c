@@ -79,6 +79,9 @@
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
                                  struct ieee80211_node *, mbuf_t,
                                  struct ieee80211_rxinfo *rxi);
+mbuf_t ieee80211_input_mgmt_protect(struct ieee80211com *,
+                                    struct ieee80211_node *, mbuf_t,
+                                    struct ieee80211_rxinfo *rxi);
 mbuf_t ieee80211_defrag(struct ieee80211com *, mbuf_t, int);
 void    ieee80211_defrag_timeout(void *);
 void    ieee80211_input_ba(struct ieee80211com *, mbuf_t,
@@ -136,10 +139,8 @@ void    ieee80211_recv_delba(struct ieee80211com *, mbuf_t,
                              struct ieee80211_node *);
 void    ieee80211_recv_sa_query_req(struct ieee80211com *, mbuf_t,
                                     struct ieee80211_node *);
-#ifndef IEEE80211_STA_ONLY
 void    ieee80211_recv_sa_query_resp(struct ieee80211com *, mbuf_t,
                                      struct ieee80211_node *);
-#endif
 void    ieee80211_recv_action(struct ieee80211com *, mbuf_t,
                               struct ieee80211_node *);
 #ifndef IEEE80211_STA_ONLY
@@ -272,6 +273,144 @@ fail:
    /* The input caller replaces its sole reference with our return value. */
    mbuf_freem(m);
    return NULL;
+}
+
+/*
+ * An unprotected Deauthentication or Disassociation was dropped because the
+ * association protects management frames. If it claims to come from our
+ * access point and says that we are not authenticated or associated there
+ * (reason 6 or 7), the access point may really have lost our association:
+ * ask it with an SA Query, which only the real one can answer.
+ */
+static void
+ieee80211_mgmt_unprotected(struct ieee80211com *ic, struct ieee80211_node *ni,
+    mbuf_t m)
+{
+    const struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+    u_int8_t subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+    u_int16_t reason;
+
+    if (subtype != IEEE80211_FC0_SUBTYPE_DEAUTH &&
+        subtype != IEEE80211_FC0_SUBTYPE_DISASSOC)
+        return;
+    if (ic->ic_opmode != IEEE80211_M_STA || ni != ic->ic_bss ||
+        !IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_macaddr) ||
+        mbuf_len(m) < sizeof(*wh) + 2)
+        return;
+    reason = LE_READ_2((const u_int8_t *)&wh[1]);
+    if (reason == IEEE80211_REASON_NOT_AUTHED ||
+        reason == IEEE80211_REASON_NOT_ASSOCED)
+        ieee80211_sta_sa_query_start(ic);
+}
+
+/*
+ * Management frame protection on receive (802.11-2020 12.6.19).
+ *
+ * Once the peer's keys are installed (IEEE80211_NODE_RXMGMTPROT) a robust
+ * management frame is accepted only with the protection the standard gives
+ * it: individually addressed frames encrypted with the pairwise key, group
+ * addressed ones carrying a valid BIP MIC. A Deauthentication, a
+ * Disassociation or a Block Ack request that anyone in range could have
+ * sent is dropped here, before its handler sees it.
+ *
+ * Returns the frame, decrypted and without its MMIE, or NULL when the frame
+ * was consumed.
+ */
+mbuf_t
+ieee80211_input_mgmt_protect(struct ieee80211com *ic,
+    struct ieee80211_node *ni, mbuf_t m, struct ieee80211_rxinfo *rxi)
+{
+    static u_int32_t logged;
+    struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+    u_int8_t subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+    int prot = (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) != 0;
+    int mcast = IEEE80211_IS_MULTICAST(wh->i_addr1);
+    int robust = 0;
+    const u_int8_t *mmie;
+
+    switch (subtype) {
+    case IEEE80211_FC0_SUBTYPE_DISASSOC:
+    case IEEE80211_FC0_SUBTYPE_DEAUTH:
+        robust = 1;
+        break;
+    case IEEE80211_FC0_SUBTYPE_ACTION:
+    case IEEE80211_FC0_SUBTYPE_ACTION_NOACK:
+        /*
+         * The category of an encrypted frame cannot be read yet, and
+         * only robust frames are ever encrypted. Otherwise it is the
+         * octet ieee80211_recv_action() will dispatch on: judging any
+         * other one would let a frame through as one category and
+         * have it handled as another.
+         */
+        if (prot)
+            robust = 1;
+        else if (mbuf_len(m) > sizeof(*wh))
+            robust = ieee80211_is_robust_action(
+                *(const u_int8_t *)&wh[1]);
+        break;
+    }
+
+    if (!robust || !(ni->ni_flags & IEEE80211_NODE_RXMGMTPROT)) {
+        if ((ic->ic_flags & IEEE80211_F_RSNON) && prot) {
+            /* encrypted but MMPDU Rx protection off for TA */
+            goto drop;
+        }
+        return m;
+    }
+
+    /* The checks below, like the handlers, need the frame in one piece. */
+    if (mbuf_next(m) != NULL || mbuf_len(m) != mbuf_pkthdr_len(m))
+        goto bad;
+
+    if (mcast) {
+        /*
+         * Group addressed: never encrypted, authenticated by the MIC
+         * of a Management MIC element at the end of the frame (BIP).
+         * Without one the frame is as good as unprotected.
+         */
+        if (prot)
+            goto bad;
+        if (mbuf_len(m) < sizeof(*wh) + IEEE80211_MMIE_LEN)
+            goto unprotected;
+        mmie = mtod(m, u_int8_t *) + mbuf_len(m) - IEEE80211_MMIE_LEN;
+        if (mmie[0] != IEEE80211_ELEMID_MMIE ||
+            mmie[1] != IEEE80211_MMIE_LEN - 2)
+            goto unprotected;
+        /* verifies key id, packet number and MIC, removes the MMIE */
+        m = ieee80211_decrypt(ic, m, ni);
+    } else {
+        if (!prot)
+            goto unprotected;
+        /*
+         * A driver that decrypts in hardware leaves the CCMP header
+         * in place for the replay check, as for data frames.
+         */
+        if (rxi->rxi_flags & IEEE80211_RXI_HWDEC)
+            m = ieee80211_input_hwdecrypt(ic, ni, m, rxi);
+        else
+            m = ieee80211_decrypt(ic, m, ni);
+    }
+    if (m == NULL) {
+        ic->ic_stats.is_rx_mgmt_badprot++;
+        return NULL;
+    }
+    ic->ic_stats.is_rx_mgmt_prot++;
+    return m;
+
+unprotected:
+    ic->ic_stats.is_rx_mgmt_unprot++;
+    if (logged < 8) {
+        logged++;
+        XYLog("%s: dropped unprotected %s management frame, subtype 0x%02x\n",
+            ic->ic_if.if_xname, mcast ? "group" : "unicast", subtype);
+    }
+    ieee80211_mgmt_unprotected(ic, ni, m);
+    goto drop;
+bad:
+    ic->ic_stats.is_rx_mgmt_badprot++;
+drop:
+    mbuf_freem(m);
+    return NULL;
 }
 
 /*
@@ -693,29 +832,11 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                 }
             }
             
-            if (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT) {
-                /* MMPDU protection is on for Rx */
-                if (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
-                    subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
-                    subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
-                    if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-                        !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
-                        /* unicast mgmt not encrypted */
-                        goto out;
-                    }
-                    /* do software decryption */
-                    m = ieee80211_decrypt(ic, m, ni);
-                    if (m == NULL) {
-                        /* XXX stats */
-                        goto out;
-                    }
-                    wh = mtod(m, struct ieee80211_frame *);
-                }
-            } else if ((ic->ic_flags & IEEE80211_F_RSNON) &&
-                       (wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
-                /* encrypted but MMPDU Rx protection off for TA */
+            /* MMPDU protection: consumes what must not be acted upon */
+            m = ieee80211_input_mgmt_protect(ic, ni, m, rxi);
+            if (m == NULL)
                 goto out;
-            }
+            wh = mtod(m, struct ieee80211_frame *);
             
 #if NBPFILTER > 0
             if (bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_IN) != 0) {
@@ -2741,14 +2862,17 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     }
     
     if (status != IEEE80211_STATUS_SUCCESS) {
-        if (ifp->if_flags & IFF_DEBUG)
-            XYLog("%s: %sassociation failed (status %d)"
-                  " for %s\n", ifp->if_xname,
-                  reassoc ?  "re" : "",
-                  status, ether_sprintf((u_int8_t *)wh->i_addr3));
+        XYLog("%s: %sassociation failed (status %d)"
+              " for %s\n", ifp->if_xname,
+              reassoc ?  "re" : "",
+              status, ether_sprintf((u_int8_t *)wh->i_addr3));
         if (ni != ic->ic_bss)
             ni->ni_fails++;
         ic->ic_stats.is_rx_auth_fail++;
+        /* refused for now: ask again after the comeback time */
+        if (status == IEEE80211_STATUS_TRY_AGAIN_LATER &&
+            IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid))
+            ieee80211_sta_assoc_comeback(ic, frm + 2, efrm);
         return;
     }
     associd = LE_READ_2(frm); frm += 2;
@@ -2954,6 +3078,53 @@ ieee80211_mgmt_from_other_bss(struct ieee80211com *ic,
         !IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid);
 }
 
+/*
+ * Our access point ended the authentication, with a Deauthentication frame
+ * or by not answering an SA Query any more: tell the front end and
+ * authenticate again.
+ */
+void
+ieee80211_sta_deauthenticated(struct ieee80211com *ic, u_int16_t reason)
+{
+    int bgscan = ((ic->ic_flags & IEEE80211_F_BGSCAN) &&
+                  ic->ic_state == IEEE80211_S_RUN);
+    int roamscan = bgscan &&
+                (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
+    int stay_auth = ((ic->ic_userflags & IEEE80211_F_STAYAUTH) &&
+                     ic->ic_state >= IEEE80211_S_AUTH);
+
+    /*
+     * While we associate, "not authenticated" or "not associated" means
+     * the access point no longer knows us: typically it dropped a
+     * protected association of ours whose SA Query we could not answer
+     * (see ieee80211_sta_assoc_comeback()), and a new association needs a
+     * new authentication. Send it now, twice at most in a join, and keep
+     * the join going: the front end would report it failed, and the
+     * system start it over with a full scan.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA &&
+        ic->ic_state == IEEE80211_S_ASSOC &&
+        (reason == IEEE80211_REASON_NOT_AUTHED ||
+         reason == IEEE80211_REASON_NOT_ASSOCED) &&
+        ic->ic_assoc_reauths < 2) {
+        ic->ic_assoc_reauths++;
+        ic->ic_stats.is_assoc_reauth++;
+        XYLog("%s: access point dropped us while associating (reason %d),"
+              " authenticating again\n", ic->ic_if.if_xname, reason);
+        ieee80211_new_state(ic, IEEE80211_S_AUTH,
+                            IEEE80211_FC0_SUBTYPE_AUTH);
+        return;
+    }
+
+    ic->ic_deauth_reason = reason;
+    if (ic->ic_event_handler) {
+        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
+    }
+    if (!(roamscan || stay_auth))
+        ieee80211_new_state(ic, IEEE80211_S_AUTH,
+                            IEEE80211_FC0_SUBTYPE_DEAUTH);
+}
+
 /*-
  * Deauthentication frame format:
  * [2] Reason code
@@ -2987,25 +3158,17 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
         return;
     }
     XYLog("Deauth received, reason %d\n", reason);
+    ic->ic_stats.is_rx_deauth++;
+    if (ic->ic_opmode == IEEE80211_M_STA) {
+        ieee80211_sta_deauthenticated(ic, reason);
+        return;
+    }
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
     }
-    
-    ic->ic_stats.is_rx_deauth++;
+
     switch (ic->ic_opmode) {
-        case IEEE80211_M_STA: {
-            int bgscan = ((ic->ic_flags & IEEE80211_F_BGSCAN) &&
-                          ic->ic_state == IEEE80211_S_RUN);
-            int roamscan = bgscan &&
-                        (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
-            int stay_auth = ((ic->ic_userflags & IEEE80211_F_STAYAUTH) &&
-                             ic->ic_state >= IEEE80211_S_AUTH);
-            if (!(roamscan || stay_auth))
-                ieee80211_new_state(ic, IEEE80211_S_AUTH,
-                                    IEEE80211_FC0_SUBTYPE_DEAUTH);
-        }
-            break;
 #ifndef IEEE80211_STA_ONLY
         case IEEE80211_M_HOSTAP:
             if (ni != ic->ic_bss) {
@@ -3494,8 +3657,14 @@ ieee80211_recv_sa_query_req(struct ieee80211com *ic, mbuf_t m,
     const struct ieee80211_frame *wh;
     const u_int8_t *frm;
     
+    /*
+     * Only with the keys of the association installed: the request then
+     * came protected, and so does the answer. It is the proof the access
+     * point asks for before it lets someone else take our place.
+     */
     if (ic->ic_opmode != IEEE80211_M_STA ||
-        !(ni->ni_flags & IEEE80211_NODE_MFP)) {
+        !(ni->ni_flags & IEEE80211_NODE_MFP) ||
+        !(ni->ni_flags & IEEE80211_NODE_RXMGMTPROT)) {
         DPRINTF(("unexpected SA Query req from %s\n",
                  ether_sprintf(ni->ni_macaddr)));
         return;
@@ -3508,16 +3677,13 @@ ieee80211_recv_sa_query_req(struct ieee80211com *ic, mbuf_t m,
     frm = (const u_int8_t *)&wh[1];
     
     /* MLME-SAQuery.indication */
+    ic->ic_stats.is_sa_query_replies++;
     
-    /* save Transaction Identifier for SA Query Response */
-    ni->ni_sa_query_trid = LE_READ_2(&frm[2]);
-    
-    /* MLME-SAQuery.response */
+    /* MLME-SAQuery.response, with the Transaction Identifier received */
     IEEE80211_SEND_ACTION(ic, ni, IEEE80211_CATEG_SA_QUERY,
-                          IEEE80211_ACTION_SA_QUERY_RESP, 0);
+                          IEEE80211_ACTION_SA_QUERY_RESP, LE_READ_2(&frm[2]));
 }
 
-#ifndef IEEE80211_STA_ONLY
 /*-
  * SA Query Response frame format:
  * [1] Category
@@ -3531,19 +3697,31 @@ ieee80211_recv_sa_query_resp(struct ieee80211com *ic, mbuf_t m,
     const struct ieee80211_frame *wh;
     const u_int8_t *frm;
     
-    /* ignore if we're not engaged in an SA Query with that STA */
-    if (!(ni->ni_flags & IEEE80211_NODE_SA_QUERY)) {
-        DPRINTF(("unexpected SA Query resp from %s\n",
-                 ether_sprintf(ni->ni_macaddr)));
-        return;
-    }
     if (mbuf_len(m) < sizeof(*wh) + 4) {
         DPRINTF(("frame too short\n"));
         return;
     }
     wh = mtod(m, struct ieee80211_frame *);
     frm = (const u_int8_t *)&wh[1];
-    
+
+    if (ic->ic_opmode == IEEE80211_M_STA) {
+        /*
+         * Our access point answers the query we started; it counts
+         * only if it came protected, which is certain once the keys
+         * of the association are installed.
+         */
+        if (ni == ic->ic_bss &&
+            (ni->ni_flags & IEEE80211_NODE_RXMGMTPROT))
+            ieee80211_sta_sa_query_response(ic, LE_READ_2(&frm[2]));
+        return;
+    }
+#ifndef IEEE80211_STA_ONLY
+    /* ignore if we're not engaged in an SA Query with that STA */
+    if (!(ni->ni_flags & IEEE80211_NODE_SA_QUERY)) {
+        DPRINTF(("unexpected SA Query resp from %s\n",
+                 ether_sprintf(ni->ni_macaddr)));
+        return;
+    }
     /* check that Transaction Identifier matches */
     if (ni->ni_sa_query_trid != LE_READ_2(&frm[2])) {
         DPRINTF(("transaction identifier does not match\n"));
@@ -3552,8 +3730,8 @@ ieee80211_recv_sa_query_resp(struct ieee80211com *ic, mbuf_t m,
     /* MLME-SAQuery.confirm */
     timeout_del(&ni->ni_sa_query_to);
     ni->ni_flags &= ~IEEE80211_NODE_SA_QUERY;
-}
 #endif
+}
 
 /*-
  * Action frame format:
@@ -3593,11 +3771,9 @@ ieee80211_recv_action(struct ieee80211com *ic, mbuf_t m,
                 case IEEE80211_ACTION_SA_QUERY_REQ:
                     ieee80211_recv_sa_query_req(ic, m, ni);
                     break;
-#ifndef IEEE80211_STA_ONLY
                 case IEEE80211_ACTION_SA_QUERY_RESP:
                     ieee80211_recv_sa_query_resp(ic, m, ni);
                     break;
-#endif
             }
             break;
         default:

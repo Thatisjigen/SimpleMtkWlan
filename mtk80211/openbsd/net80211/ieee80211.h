@@ -682,11 +682,37 @@ enum {
 	IEEE80211_CATEG_MESH			= 13,
 	IEEE80211_CATEG_MULTIHOP		= 14,
 	IEEE80211_CATEG_SELF_PROT		= 15,
-	/* 16-125 reserved */
+	IEEE80211_CATEG_UNPROT_DMG		= 20,
+	IEEE80211_CATEG_VHT			= 21,	/* 11ac */
+	IEEE80211_CATEG_UNPROT_S1G		= 22,
+	IEEE80211_CATEG_HE			= 30,	/* 11ax */
 	IEEE80211_CATEG_PROT_VENDOR		= 126,
 	IEEE80211_CATEG_VENDOR			= 127
 	/* 128-255 error */
 };
+
+/*
+ * Robust Action frames are the ones management frame protection covers:
+ * every category but the ones a station must be able to exchange without
+ * keys (802.11-2020 Table 9-51).
+ */
+static __inline int
+ieee80211_is_robust_action(u_int8_t category)
+{
+	switch (category) {
+	case IEEE80211_CATEG_PUB:
+	case IEEE80211_CATEG_HT:
+	case IEEE80211_CATEG_UNPROT_WNM:
+	case IEEE80211_CATEG_SELF_PROT:
+	case IEEE80211_CATEG_UNPROT_DMG:
+	case IEEE80211_CATEG_VHT:
+	case IEEE80211_CATEG_UNPROT_S1G:
+	case IEEE80211_CATEG_HE:
+	case IEEE80211_CATEG_VENDOR:
+		return 0;
+	}
+	return 1;
+}
 
 /*
  * Block Ack Action field values (see 802.11-2012 8.5.5 Table 8-202).
