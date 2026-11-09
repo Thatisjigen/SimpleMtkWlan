@@ -561,7 +561,7 @@ struct mwx_softc {
 	int8_t			sc_tx_amsdu;	/* hardware TX A-MSDU (-mtknoamsdu: off) */
 	int8_t			sc_vht160;	/* experimental VHT160 (-mtk160: on) */
 	int8_t			sc_wtbl_ba;
-	int8_t			sc_he_enabled; /* experimental HE (-mtkhe: on) */
+	int8_t			sc_he_enabled; /* 802.11ax, on by default (-mtknohe: off) */
 	int8_t			sc_he_only; /* experimental HE-only (-mtkheonly) */	/* hardware BA programming (-mtknowtblba: off) */
 	volatile int8_t		sc_suspended;	/* system sleep: leave the hardware alone */
 	uint32_t		sc_tx_full_cnt;
@@ -2806,9 +2806,15 @@ mwx_preinit(struct mwx_softc *sc)
 	ic->ic_tx_mcs_set = IEEE80211_TX_MCS_SET_DEFINED;
 
 	{
-		int on = 0;
-		sc->sc_he_enabled = PE_parse_boot_argn("-mtkhe", &on,
-		    sizeof(on)) && sc->sc_hwtype == MWX_HW_MT7922;
+		int off = 0;
+		/*
+		 * MT7920 has the HE capabilities of the MT7921 in Linux
+		 * mt7921: HE80, no 160 MHz, which mwx_init_he_caps() keeps
+		 * for MT7922 through sc_vht160.
+		 */
+		sc->sc_he_enabled = !PE_parse_boot_argn("-mtknohe", &off,
+		    sizeof(off)) && (sc->sc_hwtype == MWX_HW_MT7922 ||
+		    sc->sc_hwtype == MWX_HW_MT7920);
 	}	{
 		int only = 0;
 		sc->sc_he_only = sc->sc_he_enabled &&
@@ -8987,13 +8993,24 @@ mwx_send_bss_he_info(struct mwx_softc *sc, struct ieee80211_node *ni)
 		struct bss_info_uni_he he;
 		struct bss_info_uni_bss_color color;
 	} __packed req = {};
+	/*
+	 * PE duration, RTS threshold and BSS color come from the AP's HE
+	 * Operation element, as mac80211 fills bss_conf for mt76; the
+	 * defaults apply when the AP leaves them at zero. The color goes into
+	 * every HE PPDU the station sends, trigger-based ones included: with
+	 * it off, the AP discards them as another BSS's.
+	 */
+	uint32_t op = ni->ni_he_oper_params;
+	uint8_t pe = op & IEEE80211_HE_OPERATION_DFLT_PE_DURATION_MASK;
+	uint16_t rts = (op & IEEE80211_HE_OPERATION_RTS_THRESHOLD_MASK) >>
+	    IEEE80211_HE_OPERATION_RTS_THRESHOLD_OFFSET;
 	int rv;
 
 	req.hdr.bss_idx = mvif->idx;
 	req.he.tag = htole16(UNI_BSS_INFO_HE_BASIC);
 	req.he.len = htole16(sizeof(req.he));
-	req.he.he_pe_duration = 4;
-	req.he.he_rts_thres = htole16(1023);
+	req.he.he_pe_duration = pe ? pe : 4;
+	req.he.he_rts_thres = htole16(rts ? rts : 1023);
 	req.he.max_nss_mcs[CMD_HE_MCS_BW80] =
 	    sc->sc_ic.ic_he_mcs_nss_supp.tx_mcs_80;
 	req.he.max_nss_mcs[CMD_HE_MCS_BW160] =
@@ -9002,13 +9019,15 @@ mwx_send_bss_he_info(struct mwx_softc *sc, struct ieee80211_node *ni)
 	    sc->sc_ic.ic_he_mcs_nss_supp.tx_mcs_80p80;
 	req.color.tag = htole16(UNI_BSS_INFO_BSS_COLOR);
 	req.color.len = htole16(sizeof(req.color));
-	req.color.enable = 0;
-	req.color.bss_color = 0;
+	req.color.enable = !(op & IEEE80211_HE_OPERATION_BSS_COLOR_DISABLED);
+	req.color.bss_color = (op & IEEE80211_HE_OPERATION_BSS_COLOR_MASK) >>
+	    IEEE80211_HE_OPERATION_BSS_COLOR_OFFSET;
 	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
 	    &req, sizeof(req));
 	MWX_DEV_LOG(sc,
-	    "BSS HE enable=%d pe=%u rts=%u mcs80=0x%04x mcs160=0x%04x rv=%d\n",
+	    "BSS HE enable=%d pe=%u rts=%u color=%u/%u mcs80=0x%04x mcs160=0x%04x rv=%d\n",
 	    1, req.he.he_pe_duration, le16toh(req.he.he_rts_thres),
+	    req.color.bss_color, req.color.enable,
 	    le16toh(req.he.max_nss_mcs[CMD_HE_MCS_BW80]),
 	    le16toh(req.he.max_nss_mcs[CMD_HE_MCS_BW160]), rv);
 	return rv;

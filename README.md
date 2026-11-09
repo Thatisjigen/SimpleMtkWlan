@@ -54,7 +54,7 @@ hardware layer:
 | Auto-recovery of a wedged chip (DMA stall watchdog, PCIe FLR at attach) | ✅ |
 | Native macOS Wi-Fi menu (IO80211Family / Skywalk), Tahoe | ✅ `AirportMtkWlan` |
 | Native Wi-Fi menu, Sequoia 15.2+ | ⚠️ builds, not tested on hardware with this HAL |
-| 802.11ax (HE, MT7922) | ⚠️ experimental (`-mtkhe`), opt-in |
+| 802.11ax (HE, MT7920 and MT7922) | ✅ on by default (`-mtknohe` turns it off) |
 | WPA3-only (SAE) networks | ❌ |
 | Sleep / wake (firmware reloaded on wake, reconnects by itself) | ✅ |
 | AirDrop / Handoff / Continuity (AWDL) | ❌ |
@@ -97,8 +97,8 @@ they match the same card.
 6. Make sure the card is not hidden (step 4 below), reboot and pick a network
    in the Wi-Fi menu.
 
-`-mtkhe` enables 802.11ax association and data paths on MT7922. It is
-experimental and disabled by default.
+802.11ax association and data paths are on by default on MT7920 and MT7922;
+`-mtknohe` falls back to 802.11ac.
 
 ### SimpleMtkWlan + SimpleMTK app
 
@@ -130,7 +130,7 @@ experimental and disabled by default.
 
 Optional boot-args:
 
-* `-mtkhe` — experimental 802.11ax on MT7922.
+* `-mtknohe` — turn 802.11ax off (on by default on MT7920 and MT7922).
 * `-mtk160` — experimental 160 MHz operation on MT7922.
 * `-mtkrxamsdu` — enable RX A-MSDU decapsulation.
 * `-mtknoamsdu` — disable hardware TX A-MSDU.
@@ -293,8 +293,8 @@ On top of upstream and [PR #5](https://github.com/laobamac/SimpleMtkWlan/pull/5)
   reset / PCIe FLR if needed) and reloads the firmware. Before, the first
   interrupt after wake read a stale DMA ring and panicked.
 * **MT7922 PCIe / 802.11ax:** recognize the RZ616 PCIe ID (`14c3:0616`),
-  select MT7922 firmware, negotiate HE80/HE160 behind `-mtkhe`, and retain
-  VHT160 as the fallback path behind `-mtk160`.
+  select MT7922 firmware, negotiate HE80/HE160 (on by default, `-mtknohe`
+  turns it off), and retain VHT160 as the fallback path behind `-mtk160`.
 * **RX path:** use a low-4 GiB DMA page pool so received frames land directly
   in mbufs, with the normal MCLGET path retained as fallback.
 * **Interrupt scheduling:** move dispatch to `IOFilterInterruptEventSource`
