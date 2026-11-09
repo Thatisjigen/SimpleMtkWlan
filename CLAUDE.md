@@ -303,6 +303,49 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   that carries it, and that frame goes ahead of the PSF. `awdl: sched` in the
   log counts all four.
 
+## Management frame protection (802.11w)
+
+- Negotiated with access points that advertise it (`IEEE80211_C_MFP`, only with
+  `-mtkpmf`, required with `-mtkpmfreq`). Towards the others the RSN element
+  is byte for byte the one sent without it. The capabilities reported to
+  macOS do not change: its association code reads 802.11w support from
+  capability byte 6 for the RSN element it builds itself, of which the front
+  end takes the group cipher alone. Capabilities 75 and 76 (byte 9) are
+  tested before SAE and before a GCMP group cipher, which the driver does
+  not implement: keep them clear.
+- The integrity group key stays in software (`mwx_set_key`). Never send it to
+  the firmware: a key record with BIP alone replaces the CCMP key of that
+  station, and its delete command removes the pairwise key. net80211 verifies
+  the MIC of group-addressed management frames itself (BIP).
+- Robust management frames to and from the access point use the pairwise key
+  in hardware like data: `MT_TXD3_PROTECT_FRAME` follows the Protected bit
+  net80211 sets once `IEEE80211_NODE_TXMGMTPROT` is on, and
+  `mwx_rx_hwdec_restore` puts the CCMP header back so that net80211 checks
+  the packet number (`k_mgmt_rsc`, restarted with every new pairwise key).
+- `IEEE80211_NODE_RXMGMTPROT` is set with the pairwise key of message 3,
+  `TXMGMTPROT` when the firmware has the keys. Both end in
+  `mwx_mgmt_prot_leave`, which also sends the Deauthentication while the
+  firmware can still encrypt it: a RUN -> SCAN transition does not go through
+  net80211's own exit from RUN.
+- An unprotected Deauthentication or Disassociation is dropped. With reason
+  6 or 7 it starts an SA Query (`ieee80211_sta_sa_query_start`): no answer
+  for 1000 TU means the access point really lost the association.
+- An access point that still holds a protected association of ours (its
+  answer to our first association request got lost, or we restarted) refuses
+  a new request for now (status 30) and checks the old association with an
+  SA Query. net80211 asks again once the comeback time of the Timeout
+  Interval element has passed (`ieee80211_sta_assoc_comeback`, three times a
+  join; `debugPoll()` does not retransmit meanwhile). A Deauthentication with
+  reason 6 or 7 while associating makes it authenticate again (twice a join)
+  without telling the front end.
+- The `pmf` debug line (with the `stats` line) shows what the access point
+  advertises (`ap`: 1 capable, 2 required), what was negotiated, and counts
+  accepted, unprotected and failing frames, the SA Queries, the associations
+  refused for now (`comeback=`) and the authentications sent again
+  (`reauth=`).
+  `tests/security/` runs the production code against references written from
+  the standard.
+
 ## Testing on hardware
 
 The kext is injected by OpenCore (`EFI/OC/Kexts` + `Kernel → Add`), so every

@@ -1134,6 +1134,12 @@ getCARD_CAPABILITIES(OSObject *object,
         cd->capabilities[3] |= 0x20;
     }
 #endif
+    // Management frame protection (802.11w) is negotiated by net80211 and
+    // needs nothing here. Tahoe's Apple80211Associate2 reads it from byte 6
+    // (mask 0x11) for the RSN element it builds itself, of which this front
+    // end takes the group cipher alone. Capabilities 75 and 76 (byte 9) are
+    // something else: it tests them before SAE and before a GCMP group
+    // cipher, neither of which this driver has, so they must stay clear.
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;

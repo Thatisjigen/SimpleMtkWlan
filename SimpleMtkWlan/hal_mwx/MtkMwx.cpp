@@ -145,6 +145,7 @@ extern uint32_t ieee80211_bar_rx_count;
 
 /* RX decrypt path counters, reported by MtkMwx::debugPoll(). */
 static uint32_t mwx_rx_hwdec_cnt, mwx_rx_swdec_cnt, mwx_rx_hwdec_nopn_cnt;
+static uint32_t mwx_rx_mgmt_hwdec_cnt;
 static uint32_t mwx_rx_ctl_cnt, mwx_rx_bar_cnt;	/* control frames reaching the driver */
 
 /* RX drop reason counters, reported by MtkMwx::debugPoll(). */
@@ -1949,6 +1950,41 @@ static void mwx_setkey_task_gated(void *a) { mwx_task_run_gated((struct mwx_soft
 static void mwx_reset_task_gated(void *a) { mwx_task_run_gated((struct mwx_softc *)a, mwx_reset_task, a); }
 static void mwx_end_scan_task_gated(void *a) { mwx_task_run_gated((struct mwx_softc *)a, mwx_end_scan_task, a); }
 
+/*
+ * The association protects management frames (802.11w) and we are leaving
+ * it. net80211 queues its Deauthentication only after the peer record, and
+ * the pairwise key with it, is gone from the firmware: that frame leaves
+ * unprotected and the access point, as it must, ignores it. It would keep
+ * our association, answer the next association request with "try again
+ * later" and spend a second on an SA Query nobody can answer any more.
+ * Send the Deauthentication now, while the firmware can still encrypt it,
+ * and give it the time to leave, as before a switch to another access
+ * point. Not when the access point itself ended the association.
+ *
+ * From here on management frames are unprotected again in both directions.
+ */
+static void
+mwx_mgmt_prot_leave(struct mwx_softc *sc, int arg)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+
+	if (ni == NULL)
+		return;
+	if ((ni->ni_flags & IEEE80211_NODE_TXMGMTPROT) &&
+	    arg != IEEE80211_FC0_SUBTYPE_DEAUTH &&
+	    arg != IEEE80211_FC0_SUBTYPE_DISASSOC) {
+		IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
+		    IEEE80211_REASON_AUTH_LEAVE);
+		mwx_start(&ic->ic_if);
+		delay(30 * 1000);
+		MWX_DEV_LOG(sc, "leave BSS: protected deauth sent\n");
+	}
+	ni->ni_flags &= ~(IEEE80211_NODE_TXMGMTPROT |
+	    IEEE80211_NODE_RXMGMTPROT);
+	ieee80211_sta_sa_query_stop(ic);
+}
+
 void
 mwx_newstate_task(void *ptr)
 {
@@ -1982,6 +2018,7 @@ mwx_newstate_task(void *ptr)
 		 */
 		if (nstate < IEEE80211_S_RUN &&
 		    ic->ic_opmode == IEEE80211_M_STA) {
+			mwx_mgmt_prot_leave(sc, arg);
 			int brv = mt7921_mcu_set_associated_bss(sc, 0);
 			int srv = mt7921_mac_sta_update(sc, ic->ic_bss, 0, 0);
 			MWX_DEV_LOG(sc, "leave BSS: bss_off=%d sta_remove=%d\n",
@@ -2265,6 +2302,26 @@ mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	    DEVNAME(sc), k->k_id, k->k_flags, k->k_cipher);
 
 	/*
+	 * The integrity group key (802.11w) stays in software. The firmware
+	 * hands group-addressed management frames over as received, MMIE
+	 * included, and net80211 checks their MIC (BIP). It must not go
+	 * through the key task: a key record with BIP alone replaces the
+	 * CCMP key of that station in the firmware (Linux sends both ciphers
+	 * in one record) and unicast traffic would stop being decrypted.
+	 */
+	if (k->k_flags & IEEE80211_KEY_IGTK) {
+		int err;
+
+		if (k->k_cipher != IEEE80211_CIPHER_BIP || k->k_len != 16 ||
+		    (k->k_id != 4 && k->k_id != 5))
+			return EINVAL;
+		err = (k->k_flags & IEEE80211_KEY_SWCRYPTO) ? 0 :
+		    ieee80211_set_key(ic, ni, k);
+		MWX_DEV_LOG(sc, "igtk id=%d sw crypto setup=%d\n", k->k_id, err);
+		return err;
+	}
+
+	/*
 	 * MT7921 does not reliably decrypt group-addressed frames with the
 	 * GTK installed in hardware; those arrive without RXI_HWDEC and were
 	 * dropped as wepfail (broadcast ARP / DHCP never reached the stack).
@@ -2313,6 +2370,15 @@ mwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 			ieee80211_delete_key(ic, ni, k);
 		return;
 	}
+	/*
+	 * The integrity group key was never given to the firmware (see
+	 * mwx_set_key()), and the delete command for its station would
+	 * remove the pairwise key instead.
+	 */
+	if (k->k_flags & IEEE80211_KEY_IGTK) {
+		ieee80211_delete_key(ic, ni, k);
+		return;
+	}
 	mt7921_mcu_sta_key_delete(sc, ni, k);
 	/* release the software crypto context set up in mwx_set_key() */
 	if (k->k_flags & IEEE80211_KEY_SWCRYPTO)
@@ -2343,8 +2409,11 @@ mwx_setkey_task(void *arg)
 		 * key: left there, every frame of the new key would look like
 		 * a replay to ieee80211_input_hwdecrypt().
 		 */
-		if (rv == 0 && !(a->k->k_flags & IEEE80211_KEY_GROUP))
+		if (rv == 0 && !(a->k->k_flags & IEEE80211_KEY_GROUP)) {
 			memset(a->k->k_rsc, 0, sizeof(a->k->k_rsc));
+			/* protected management frames count separately */
+			a->k->k_mgmt_rsc = 0;
+		}
 		a->ni = NULL;
 		a->k = NULL;
 
@@ -2489,6 +2558,36 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 }
 
 /*
+ * With management frame protection (802.11w) the access point encrypts the
+ * robust management frames it addresses to us with the pairwise key, and
+ * the firmware decrypts them like data. net80211 then needs the same proof
+ * as for data, the Protected bit and the packet number, or it has to treat
+ * the frame as one anybody could have sent. Only for frames that arrived
+ * marked Protected, to the address of this station, once the association
+ * protects management frames; group-addressed ones are not encrypted but
+ * authenticated by a MIC that net80211 checks itself.
+ */
+static bool
+mwx_rx_hwdec_mgmt(struct mwx_softc *sc, const struct ieee80211_frame *wh)
+{
+	struct ieee80211_node *bss = sc->sc_ic.ic_bss;
+
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_MGT ||
+	    !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED) ||
+	    IEEE80211_IS_MULTICAST(wh->i_addr1) || bss == NULL ||
+	    !(bss->ni_flags & IEEE80211_NODE_RXMGMTPROT))
+		return false;
+	switch (wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) {
+	case IEEE80211_FC0_SUBTYPE_DISASSOC:
+	case IEEE80211_FC0_SUBTYPE_DEAUTH:
+	case IEEE80211_FC0_SUBTYPE_ACTION:
+	case IEEE80211_FC0_SUBTYPE_ACTION_NOACK:
+		return true;
+	}
+	return false;
+}
+
+/*
  * The firmware removes the CCMP header and MIC of the frames it decrypts
  * and leaves the packet number in GROUP_1 of the RX descriptor. The frame
  * reached net80211 without the header and with the Protected bit clear,
@@ -2504,6 +2603,9 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
  * behaviour, header stripped and no check, as mt76 checks CCMP only. A
  * CCMP frame without a packet number is dropped. Returns NULL when the
  * frame was consumed.
+ *
+ * The protected management frames of mwx_rx_hwdec_mgmt() get the same
+ * header: net80211 keeps one more replay counter for them.
  */
 static struct mbuf *
 mwx_rx_hwdec_restore(struct mwx_softc *sc, struct mbuf *m,
@@ -2513,15 +2615,20 @@ mwx_rx_hwdec_restore(struct mwx_softc *sc, struct mbuf *m,
 	uint8_t *data, *iv;
 	size_t pktlen;
 	u_int hdrlen;
+	bool mgmt;
 
 	if (!(rxi->rxi_flags & IEEE80211_RXI_HWDEC))
 		return m;
 	wh = mtod(m, struct ieee80211_frame *);
+	mgmt = mwx_rx_hwdec_mgmt(sc, wh);
 	if (sec->sec_mode != MT_CIPHER_AES_CCMP ||
-	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA) {
+	    ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA &&
+	    !mgmt)) {
 		wh->i_fc[1] &= ~IEEE80211_FC1_PROTECTED;
 		return m;
 	}
+	if (mgmt)
+		mwx_rx_mgmt_hwdec_cnt++;
 	hdrlen = ieee80211_get_hdrlen(wh);
 	pktlen = mbuf_pkthdr_len(m);
 	if (!sec->pn_valid || pktlen < hdrlen) {
@@ -3434,6 +3541,33 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		    sizeof(off));
 		if (sc->sc_tx_amsdu)
 			ic->ic_caps |= IEEE80211_C_TX_AMSDU_IN_AMPDU;
+	}
+
+	/*
+	 * Management frame protection (802.11w), negotiated with the access
+	 * points that advertise it: without it anyone in range disconnects
+	 * the station with a forged Deauthentication or Disassociation.
+	 * Robust management frames to and from the access point use the
+	 * pairwise key in hardware, like data (MT_TXD3_PROTECT_FRAME on
+	 * transmit, mwx_rx_hwdec_restore() on receive); the group-addressed
+	 * ones the access point sends are verified in software (BIP, see
+	 * mwx_set_key()). Off by default: -mtkpmf offers it, -mtkpmfreq also
+	 * refuses access points that do not support it.
+	 */
+	{
+		int flag = 0;
+
+		if (PE_parse_boot_argn("-mtkpmf", &flag, sizeof(flag)) ||
+		    PE_parse_boot_argn("-mtkpmfreq", &flag, sizeof(flag))) {
+			ic->ic_caps |= IEEE80211_C_MFP;
+			if (PE_parse_boot_argn("-mtkpmfreq", &flag,
+			    sizeof(flag)))
+				ic->ic_flags |= IEEE80211_F_MFPR;
+		}
+		MWX_DEV_LOG(sc,
+		    "management frame protection offered=%d required=%d\n",
+		    !!(ic->ic_caps & IEEE80211_C_MFP),
+		    !!(ic->ic_flags & IEEE80211_F_MFPR));
 	}
 
 	/*
@@ -9980,6 +10114,12 @@ MtkMwx::debugPoll()
 			if (retry_state != ic->ic_state) {
 				retry_state = ic->ic_state;
 				retries = 0;
+			} else if (ic->ic_assoc_comeback) {
+				/*
+				 * Refused for now: net80211 asks again once
+				 * the comeback time has passed, and an earlier
+				 * request would be refused the same way.
+				 */
 			} else if (retries < 3) {
 				retries++;
 				MWX_DEV_LOG(sc, "%s retry %d to %s\n",
@@ -10055,6 +10195,35 @@ MtkMwx::debugPoll()
 		    ic->ic_stats.is_rx_tooshort, ic->ic_stats.is_rx_nombuf,
 		    ic->ic_stats.is_ht_rx_frame_below_ba_winstart,
 		    ic->ic_stats.is_ht_rx_frame_above_ba_winend);
+	}
+	if (verbose && (ic->ic_caps & IEEE80211_C_MFP)) {
+		struct ieee80211_node *bss = ic->ic_bss;
+		int run = bss != NULL && ic->ic_state == IEEE80211_S_RUN;
+		uint32_t nf = bss != NULL ? bss->ni_flags : 0;
+		/* What the access point advertises: 1 capable, 2 required. */
+		int ap = !run ? 0 :
+		    (bss->ni_rsncaps & IEEE80211_RSNCAP_MFPR) ? 2 :
+		    (bss->ni_rsncaps & IEEE80211_RSNCAP_MFPC) ? 1 : 0;
+
+		MWX_DEV_LOG(sc,
+		    "pmf assoc=%d ap=%d negotiated=%d rx=%d tx=%d igtk=%d mgmt_ok=%u mgmt_hwdec=%u unprot_drop=%u bad_drop=%u bip_replay=%u bip_mic=%u saq_start=%u saq_answer=%u saq_timeout=%u saq_reply=%u comeback=%u reauth=%u\n",
+		    run, ap,
+		    !!(nf & IEEE80211_NODE_MFP),
+		    !!(nf & IEEE80211_NODE_RXMGMTPROT),
+		    !!(nf & IEEE80211_NODE_TXMGMTPROT),
+		    (ic->ic_igtk_kid == 4 || ic->ic_igtk_kid == 5) &&
+		    (ic->ic_nw_keys[ic->ic_igtk_kid].k_flags &
+		    IEEE80211_KEY_IGTK) ? ic->ic_igtk_kid : 0,
+		    ic->ic_stats.is_rx_mgmt_prot, mwx_rx_mgmt_hwdec_cnt,
+		    ic->ic_stats.is_rx_mgmt_unprot,
+		    ic->ic_stats.is_rx_mgmt_badprot,
+		    ic->ic_stats.is_cmac_replays, ic->ic_stats.is_cmac_icv_errs,
+		    ic->ic_stats.is_sa_query_started,
+		    ic->ic_stats.is_sa_query_answered,
+		    ic->ic_stats.is_sa_query_timeouts,
+		    ic->ic_stats.is_sa_query_replies,
+		    ic->ic_stats.is_assoc_comeback,
+		    ic->ic_stats.is_assoc_reauth);
 	}
 	if (verbose)
 		MWX_DEV_LOG(sc,

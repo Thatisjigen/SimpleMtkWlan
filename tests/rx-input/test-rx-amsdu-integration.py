@@ -43,11 +43,18 @@ using u_int8_t=uint8_t;using u_int64_t=uint64_t;using u_int=unsigned;using caddr
 #define IEEE80211_TKIP_HDRLEN 8
 #define IEEE80211_WEP_EXTIV 0x20
 #define IEEE80211_QOS_TID 0x0f
+#define IEEE80211_FC0_TYPE_MGT 0x00
+#define IEEE80211_FC0_SUBTYPE_DISASSOC 0xa0
+#define IEEE80211_FC0_SUBTYPE_DEAUTH 0xc0
+#define IEEE80211_FC0_SUBTYPE_ACTION 0xd0
+#define IEEE80211_FC0_SUBTYPE_ACTION_NOACK 0xe0
+#define IEEE80211_NODE_RXMGMTPROT 0x0020
+#define IEEE80211_IS_MULTICAST(a) ((a)[0]&1)
 struct ieee80211_rxinfo {int rxi_flags=0,rxi_chan=0,rxi_rssi=0;};
 struct ieee80211_frame {uint8_t i_fc[2],duration[2],i_addr1[6],i_addr2[6],i_addr3[6],seqctl[2];};
-struct ieee80211_node{};struct mbuf_list{};
+struct ieee80211_node{unsigned ni_flags=0;};struct mbuf_list{};
 struct ifnet{unsigned if_ierrors=0;};
-struct ieee80211com {ifnet ic_if;int ic_state=4,ic_max_rssi=0;struct{unsigned is_ccmp_replays=0,is_tkip_replays=0;}ic_stats;};
+struct ieee80211com {ifnet ic_if;ieee80211_node*ic_bss=nullptr;int ic_state=4,ic_max_rssi=0;struct{unsigned is_ccmp_replays=0,is_tkip_replays=0;}ic_stats;};
 struct ieee80211_key{int k_cipher=IEEE80211_CIPHER_CCMP;uint64_t k_rsc[16]={},k_mgmt_rsc=0;};
 static ieee80211_key key;static ieee80211_node node;
 static ieee80211_key*ieee80211_get_rxkey(ieee80211com*,mbuf_t,ieee80211_node*){return &key;}
@@ -76,7 +83,7 @@ using IOReturn=int;struct OSObject{};constexpr int kIOReturnSuccess=0;
 struct MwxRxAmsduBarrier {mwx_softc*sc;int operation;bool finished,accepted;};
 static std::recursive_mutex main_gate;static thread_local unsigned gate_depth=0;
 struct TestGateScope {TestGateScope(){assert(!held_lock);main_gate.lock();++gate_depth;}~TestGateScope(){assert(gate_depth&&!held_lock);--gate_depth;main_gate.unlock();}};
-static unsigned mwx_rx_ctl_cnt=0,mwx_rx_bar_cnt=0,mwx_rx_hwdec_cnt=0,mwx_rx_swdec_cnt=0,fill_calls=0,refs=0;static uint32_t mwx_rx_hwdec_nopn_cnt=0;
+static unsigned mwx_rx_ctl_cnt=0,mwx_rx_bar_cnt=0,mwx_rx_hwdec_cnt=0,mwx_rx_swdec_cnt=0,fill_calls=0,refs=0;static uint32_t mwx_rx_hwdec_nopn_cnt=0,mwx_rx_mgmt_hwdec_cnt=0;
 static std::atomic<uint64_t> now_ms{1};
 static uint64_t mach_absolute_time(){return now_ms.load()*1000000;}
 static void absolutetime_to_nanoseconds(uint64_t t,uint64_t*p){*p=t;}
@@ -182,7 +189,7 @@ int main(){mwx_softc sc{};mbuf_list ml;
 src=pre+'\n'+'\n'.join(defs)+'\n'+before+'\n#include "'+str(metadata)+'"\n#define mtkRxAmsduFeed mtkRxAmsduFeedImpl\n#define mtkRxAmsduPurge mtkRxAmsduPurgeImpl\n#define mtkRxAmsduExpire mtkRxAmsduExpireImpl\n#include "'+str(assembler)+'"\n#undef mtkRxAmsduFeed\n#undef mtkRxAmsduPurge\n#undef mtkRxAmsduExpire\n'+after
 for name in ['mwx_rx_amsdu_barrier_gated','mwx_rx_amsdu_purge','mwx_rx_amsdu_invalid','mwx_rx_amsdu_epoch','mwx_rx_amsdu_snapshot','mwx_rx_amsdu_feed','mwx_rx_amsdu_expire','mwx_rx_amsdu_stats']:
  src+='\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp',name)
-src+='\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp','mwx_rx_hwdec_restore')
+src+='\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp','mwx_rx_hwdec_mgmt')+'\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp','mwx_rx_hwdec_restore')
 src+='\n'+extract(root/'mtk80211/openbsd/net80211/ieee80211_crypto_ccmp.c','ieee80211_ccmp_get_pn')+'\n'+extract(root/'mtk80211/openbsd/net80211/ieee80211_input.c','ieee80211_input_hwdecrypt')+'\n'+extract(root/'SimpleMtkWlan/hal_mwx/MtkMwx.cpp','mwx_rx')+'\n'+main
 with tempfile.TemporaryDirectory() as d:
  p=Path(d);(p/'test.cpp').write_text(src)

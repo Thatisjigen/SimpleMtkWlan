@@ -4,6 +4,8 @@
 The packet number of a hardware-decrypted frame travels from GROUP_1 of the
 RX descriptor into the restored CCMP header, and the production
 ieee80211_input_hwdecrypt() then accepts the frame once and rejects a replay.
+With management frame protection negotiated the same holds for the robust
+management frames the access point sends encrypted to the station.
 """
 from pathlib import Path
 import ast,re,subprocess,tempfile
@@ -18,11 +20,11 @@ cipher=re.search(r'enum mt76_cipher_type \{.*?\};',regs,re.S).group()
 sec=re.search(r'struct mwx_rx_sec \{.*?\n\};',hal,re.S).group()
 fill=hal[hal.index('int\nmt7921_mac_fill_rx('):hal.index('\nuint32_t\nmt7921_mac_tx_rate_val(')]
 def extract(s,name):
- m=re.search(r'(?m)^(?:static\s+)?(?:struct ieee80211_key \*|struct mbuf \*|mbuf_t|int)\n'+name+r'\(',s);assert m,name
+ m=re.search(r'(?m)^(?:static\s+)?(?:struct ieee80211_key \*|struct mbuf \*|mbuf_t|int|bool)\n'+name+r'\(',s);assert m,name
  a=s.index('{',m.start());pos=a+1;depth=1
  while depth:depth+=(s[pos]=='{')-(s[pos]=='}');pos+=1
  return s[m.start():pos]
-restore=extract(hal,'mwx_rx_hwdec_restore')
+restore=extract(hal,'mwx_rx_hwdec_mgmt')+'\n'+extract(hal,'mwx_rx_hwdec_restore')
 crypto='\n'.join([extract((net/'ieee80211_crypto.c').read_text(),'ieee80211_get_rxkey'),extract((net/'ieee80211_crypto_ccmp.c').read_text(),'ieee80211_ccmp_get_pn'),extract((net/'ieee80211_input.c').read_text(),'ieee80211_input_hwdecrypt')])
 stubs=r'''
 #include "RxAmpduStats.hpp"
@@ -43,6 +45,12 @@ using u_int8_t=uint8_t;using u_int16_t=uint16_t;using u_int64_t=uint64_t;using u
 #define IEEE80211_FC0_TYPE_DATA 0x08
 #define IEEE80211_FC0_TYPE_MGT 0x00
 #define IEEE80211_FC0_SUBTYPE_NODATA 0x40
+#define IEEE80211_FC0_SUBTYPE_MASK 0xf0
+#define IEEE80211_FC0_SUBTYPE_DISASSOC 0xa0
+#define IEEE80211_FC0_SUBTYPE_DEAUTH 0xc0
+#define IEEE80211_FC0_SUBTYPE_ACTION 0xd0
+#define IEEE80211_FC0_SUBTYPE_ACTION_NOACK 0xe0
+#define IEEE80211_NODE_RXMGMTPROT 0x0020
 #define IEEE80211_F_RSNON 1
 #define IEEE80211_CIPHER_USEGROUP 0
 #define IEEE80211_CIPHER_TKIP 2
@@ -58,9 +66,9 @@ using u_int8_t=uint8_t;using u_int16_t=uint16_t;using u_int64_t=uint64_t;using u
 struct ieee80211_frame_min {uint8_t data[16];};
 struct ieee80211_frame {uint8_t i_fc[2],dur[2],i_addr1[6],i_addr2[6],i_addr3[6],i_seq[2];};
 struct ieee80211_key {unsigned k_cipher=0;uint64_t k_rsc[16]={},k_mgmt_rsc=0;};
-struct ieee80211_node {unsigned ni_rsncipher=IEEE80211_CIPHER_CCMP;ieee80211_key ni_pairwise_key;};
+struct ieee80211_node {unsigned ni_rsncipher=IEEE80211_CIPHER_CCMP,ni_flags=0;ieee80211_key ni_pairwise_key;};
 struct ieee80211_rxinfo {unsigned rxi_flags=0;int rxi_rssi=0;unsigned rxi_chan=0;};
-struct ieee80211com {int ic_state=IEEE80211_S_RUN;unsigned ic_flags=IEEE80211_F_RSNON;ieee80211_key ic_nw_keys[6];struct{unsigned is_rx_decryptcrc=0,is_rx_locmicfail=0,is_ccmp_replays=0,is_tkip_replays=0;}ic_stats;};
+struct ieee80211com {ieee80211_node*ic_bss=nullptr;int ic_state=IEEE80211_S_RUN;unsigned ic_flags=IEEE80211_F_RSNON;ieee80211_key ic_nw_keys[6];struct{unsigned is_rx_decryptcrc=0,is_rx_locmicfail=0,is_ccmp_replays=0,is_tkip_replays=0;}ic_stats;};
 struct mwx_softc {ieee80211com sc_ic;MtkRxAmpduStats sc_rx_ampdu_stats={};unsigned sc_rx_fill_fail=0;struct{int num_streams=2;unsigned antenna_mask=3;}sc_capa;};
 static void ieee80211_michael_mic_failure(ieee80211com*,int){}
 static int rcpi_to_rssi(unsigned shift,uint32_t v){return int((v>>shift)&255)/2-110;}
@@ -74,7 +82,7 @@ static size_t m_leadingspace(mbuf_t m){return mbuf_leadingspace(m);}
 static unsigned prepend_calls=0;static bool fail_prepend=false;
 static mbuf_t m_prepend(mbuf_t m,size_t n,int){++prepend_calls;if(fail_prepend){mbuf_freem(m);return nullptr;}if(m->off>=n){m->off-=n;m->len+=n;m->pklen+=n;return m;}std::vector<uint8_t>s(m->storage.size()+n);std::copy(m->storage.begin(),m->storage.end(),s.begin()+n);m->storage.swap(s);m->len+=n;m->pklen+=n;return m;}
 static mbuf_t m_pullup(mbuf_t m,size_t n){if(m->len>=n)return m;if(n>m->pklen){mbuf_freem(m);return nullptr;}mbuf_t r=packet({},m->pklen);r->len=r->pklen=m->pklen;assert(mbuf_copydata(m,0,m->pklen,mbuf_data(r))==0);mbuf_freem(m);return r;}
-static uint32_t mwx_rx_hwdec_nopn_cnt=0;
+static uint32_t mwx_rx_hwdec_nopn_cnt=0,mwx_rx_mgmt_hwdec_cnt=0;
 '''
 main=r'''
 // QoS (or plain, or management) data frame as the hardware delivers it after
@@ -126,8 +134,33 @@ int main(){
  auto fo=mkframe(true,false);m=receive(r,descriptor(fo,0,0,false));assert(m==r.m&&r.rxi.rxi_flags==0&&flat(m)==fo);mbuf_freem(m);
  // A decrypted management frame gets no header, only Protected cleared.
  auto fm=mkframe(false,true,0,false,0x00);m=receive(r,descriptor(fm));{auto v=flat(m);assert(m==r.m&&v.size()==fm.size()&&!(v[1]&0x40)&&!memcmp(v.data()+2,fm.data()+2,fm.size()-2));}mbuf_freem(m);
+ // Nor does a Deauthentication while the association does not protect management
+ // frames: no node, or a node without the flag. This is the behaviour without 802.11w.
+ auto untouched=[&](const std::vector<uint8_t>&f,const std::vector<uint8_t>&d){m=receive(r,d);auto v=flat(m);assert(m==r.m&&v.size()==f.size()&&!(v[1]&0x40)&&!memcmp(v.data()+2,f.data()+2,f.size()-2));mbuf_freem(m);};
+ auto fd=mkframe(false,true,0,false,0xc0);untouched(fd,descriptor(fd));r.sc.sc_ic.ic_bss=&ni;untouched(fd,descriptor(fd));assert(mwx_rx_mgmt_hwdec_cnt==0);
+ // Once it does, the robust management frames the firmware decrypted get the CCMP
+ // header back like data, and net80211 checks their packet number against the
+ // counter of protected management frames, which no data frame touches.
+ ni.ni_flags=IEEE80211_NODE_RXMGMTPROT;const uint64_t rsc0=ni.ni_pairwise_key.k_rsc[0],rsc3=ni.ni_pairwise_key.k_rsc[3];uint64_t mp=0x1000;unsigned cnt=0;
+ for(unsigned st:{0xc0u,0xa0u,0xd0u,0xe0u}){auto f=mkframe(false,true,0,false,st);m=receive(r,descriptor(f,4,0,true,++mp));assert(m==r.m&&prepend_calls==0&&mwx_rx_mgmt_hwdec_cnt==++cnt);expect_iv(m,f,24,mp,0);
+  assert(ieee80211_input_hwdecrypt(&r.sc.sc_ic,&ni,m,&r.rxi)==m&&ni.ni_pairwise_key.k_mgmt_rsc==mp&&flat(m)==plain(f));mbuf_freem(m);}
+ assert(ni.ni_pairwise_key.k_rsc[0]==rsc0&&ni.ni_pairwise_key.k_rsc[3]==rsc3);
+ // A protected Deauthentication captured and sent again is a replay, an older one too.
+ {const unsigned rp=r.sc.sc_ic.ic_stats.is_ccmp_replays;m=receive(r,descriptor(fd,4,0,true,mp));expect_iv(m,fd,24,mp,0);assert(!ieee80211_input_hwdecrypt(&r.sc.sc_ic,&ni,m,&r.rxi));
+  m=receive(r,descriptor(fd,4,0,true,mp-2));assert(!ieee80211_input_hwdecrypt(&r.sc.sc_ic,&ni,m,&r.rxi)&&r.sc.sc_ic.ic_stats.is_ccmp_replays==rp+2&&ni.ni_pairwise_key.k_mgmt_rsc==mp&&live==0);}
+ // A data frame with a lower packet number than the management counter is still accepted.
+ m=receive(r,descriptor(f,4,0,true,pn+3));assert(ieee80211_input_hwdecrypt(&r.sc.sc_ic,&ni,m,&r.rxi)==m&&ni.ni_pairwise_key.k_rsc[3]==pn+3&&ni.ni_pairwise_key.k_mgmt_rsc==mp);mbuf_freem(m);
+ // Only what the access point really sent protected to this station: a frame that
+ // arrived without the Protected bit, a group-addressed one (authenticated by its
+ // MMIE instead) and the other management subtypes get no header.
+ cnt=mwx_rx_mgmt_hwdec_cnt;{auto fu=mkframe(false,false,0,false,0xc0);untouched(fu,descriptor(fu));auto fb=mkframe(false,true,0,true,0xc0);untouched(fb,descriptor(fb));
+  for(unsigned st:{0x00u,0x10u,0x50u,0x80u,0xb0u}){auto fo2=mkframe(false,true,0,false,st);untouched(fo2,descriptor(fo2));}}
+ // Neither does one decrypted with another cipher; one without a packet number is dropped.
+ untouched(fd,descriptor(fd,MT_CIPHER_TKIP));assert(mwx_rx_mgmt_hwdec_cnt==cnt);
+ {const unsigned np=mwx_rx_hwdec_nopn_cnt;m=receive(r,descriptor(fd,4,0,false));assert(m==nullptr&&live==0&&mwx_rx_hwdec_nopn_cnt==np+1&&mwx_rx_mgmt_hwdec_cnt==cnt+1);}
+ ni.ni_flags=0;r.sc.sc_ic.ic_bss=nullptr;
  // A decrypted frame shorter than its own header is dropped, not restored.
- auto fs=mkframe();fs.resize(20);m=receive(r,descriptor(fs));assert(m==nullptr&&live==0&&mwx_rx_hwdec_nopn_cnt==2);
+ {const unsigned np=mwx_rx_hwdec_nopn_cnt;auto fs=mkframe();fs.resize(20);m=receive(r,descriptor(fs));assert(m==nullptr&&live==0&&mwx_rx_hwdec_nopn_cnt==np+1);}
  // Without headroom, or with a chained buffer, the header is restored through
  // prepend and pullup; an allocation failure consumes the frame.
  {mwx_rx_sec s{};s.sec_mode=MT_CIPHER_AES_CCMP;s.pn_valid=1;for(unsigned i=0;i<6;++i)s.pn[i]=pn>>(8*i);ieee80211_rxinfo ri;ri.rxi_flags=IEEE80211_RXI_HWDEC;
@@ -136,7 +169,7 @@ int main(){
   o=mwx_rx_hwdec_restore(&r.sc,n,&ri,&s);assert(o&&prepend_calls==2);expect_iv(o,f,26,pn,0);mbuf_freem(o);
   n=packet(f);fail_prepend=true;assert(!mwx_rx_hwdec_restore(&r.sc,n,&ri,&s)&&live==0);fail_prepend=false;}
  assert(live==0);
- puts("PASS actual fill_rx + CCMP header restore + net80211 hwdecrypt: descriptor packet number to header in place, production accept/replay/lower/higher, per-TID and group-key counters, GROUP_4 offset and key id, TKIP/no-PN/not-decrypted/management/short paths, prepend+pullup fallback and its failure");
+ puts("PASS actual fill_rx + CCMP header restore + net80211 hwdecrypt: descriptor packet number to header in place, production accept/replay/lower/higher, per-TID and group-key counters, GROUP_4 offset and key id, TKIP/no-PN/not-decrypted/management/short paths, protected management frames restored only with 802.11w negotiated (own replay counter, replay rejected, unprotected/group/other subtypes untouched), prepend+pullup fallback and its failure");
 }
 '''
 src=pre+'\n'+defines+'\n'+cipher+'\n'+sec+'\n'+stubs+'\n'+fill+'\n'+restore+'\n'+crypto+'\n'+main

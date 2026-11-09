@@ -55,6 +55,7 @@ hardware layer:
 | Native macOS Wi-Fi menu (IO80211Family / Skywalk), Tahoe | ✅ `AirportMtkWlan` |
 | Native Wi-Fi menu, Sequoia 15.2+ | ⚠️ builds, not tested on hardware with this HAL |
 | 802.11ax (HE, MT7920 and MT7922) | ✅ on by default (`-mtknohe` turns it off) |
+| Management frame protection (802.11w / PMF) with WPA2 | ⚠️ new, off by default (`-mtkpmf` turns it on) |
 | WPA3-only (SAE) networks | ❌ |
 | Sleep / wake (firmware reloaded on wake, reconnects by itself) | ✅ |
 | AirDrop / Handoff / Continuity (AWDL) | ❌ |
@@ -138,6 +139,10 @@ Optional boot-args:
 * `-mtkallowaspm` — keep PCIe ASPM (L0s, L1) and the L1 substates on; by
   default attach turns them off on the card and the port above it, as Linux
   mt76 does.
+* `-mtkpmf` — negotiate management frame protection (802.11w) with the
+  access points that offer it. Without it a forged deauthentication frame
+  disconnects the station.
+* `-mtkpmfreq` — require it: access points without 802.11w are not joined.
 * `-mtkno160`, `-mtknopool`, `-mtknowtblba`, `-novht`, `-noht40` — targeted
   diagnostic fallbacks.
 
