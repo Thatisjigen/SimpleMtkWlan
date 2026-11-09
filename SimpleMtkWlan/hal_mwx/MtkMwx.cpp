@@ -1821,6 +1821,48 @@ mwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	return 0;
 }
 
+struct mwx_task_call {
+	void	(*fn)(void *);
+	void	*arg;
+};
+
+static IOReturn
+mwx_task_gated(OSObject *, void *a, void *, void *, void *)
+{
+	struct mwx_task_call *c = (struct mwx_task_call *)a;
+
+	c->fn(c->arg);
+	return kIOReturnSuccess;
+}
+
+/*
+ * The task queue runs on a thread_call, off the work loop. These tasks send
+ * MCU commands and free the firmware's replies, which the interrupt handler
+ * stores into sc_mcu_wait[]. When a task and the interrupt overlapped, a reply
+ * mbuf was freed while still referenced and the kernel page-faulted in
+ * m_freem(): mwx_reset_task() -> mwx_init() during a stop/wake. Run each task
+ * through the main command gate, the way enable() already runs mwx_init();
+ * tsleep_nsec() opens the gate while a task waits for the firmware, so the
+ * interrupt still delivers the replies.
+ */
+static void
+mwx_task_run_gated(struct mwx_softc *sc, void (*fn)(void *), void *arg)
+{
+	IOCommandGate *gate = sc->sc_rx_amsdu_gate;
+	struct mwx_task_call c = { fn, arg };
+
+	if (gate != NULL && !gate->getWorkLoop()->inGate() &&
+	    gate->runAction(mwx_task_gated, &c) == kIOReturnSuccess)
+		return;
+	fn(arg);
+}
+
+static void mwx_newstate_task_gated(void *a) { mwx_task_run_gated((struct mwx_softc *)a, mwx_newstate_task, a); }
+static void mwx_bgscan_done_task_gated(void *a) { mwx_task_run_gated((struct mwx_softc *)a, mwx_bgscan_done_task, a); }
+static void mwx_setkey_task_gated(void *a) { mwx_task_run_gated((struct mwx_softc *)a, mwx_setkey_task, a); }
+static void mwx_reset_task_gated(void *a) { mwx_task_run_gated((struct mwx_softc *)a, mwx_reset_task, a); }
+static void mwx_end_scan_task_gated(void *a) { mwx_task_run_gated((struct mwx_softc *)a, mwx_end_scan_task, a); }
+
 void
 mwx_newstate_task(void *ptr)
 {
@@ -3342,11 +3384,11 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		goto fail;
 	}
 
-	task_set(&sc->sc_newstate_task, mwx_newstate_task, sc, "mwx_newstate");
-	task_set(&sc->sc_bgscan_done_task, mwx_bgscan_done_task, sc, "mwx_bgscan");
-	task_set(&sc->sc_setkey_task, mwx_setkey_task, sc, "mwx_setkey");
-	task_set(&sc->sc_reset_task, mwx_reset_task, sc, "mwx_reset");
-	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
+	task_set(&sc->sc_newstate_task, mwx_newstate_task_gated, sc, "mwx_newstate");
+	task_set(&sc->sc_bgscan_done_task, mwx_bgscan_done_task_gated, sc, "mwx_bgscan");
+	task_set(&sc->sc_setkey_task, mwx_setkey_task_gated, sc, "mwx_setkey");
+	task_set(&sc->sc_reset_task, mwx_reset_task_gated, sc, "mwx_reset");
+	task_set(&sc->sc_scan_task, mwx_end_scan_task_gated, sc, "mwx_scan");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 
 	/*
