@@ -573,7 +573,7 @@ struct mwx_softc {
 	int8_t			sc_tx_amsdu;	/* hardware TX A-MSDU (-mtknoamsdu: off) */
 	int8_t			sc_vht160;	/* experimental VHT160 (-mtk160: on) */
 	int8_t			sc_wtbl_ba;
-	int8_t			sc_he_enabled; /* experimental HE (-mtkhe: on) */
+	int8_t			sc_he_enabled; /* 802.11ax, on by default (-mtknohe: off) */
 	int8_t			sc_he_only; /* experimental HE-only (-mtkheonly) */	/* hardware BA programming (-mtknowtblba: off) */
 	volatile int8_t		sc_suspended;	/* system sleep: leave the hardware alone */
 	int8_t			sc_stopping;	/* inside mwx_stop_internal() */
@@ -2914,14 +2914,14 @@ mwx_preinit(struct mwx_softc *sc)
 	ic->ic_tx_mcs_set = IEEE80211_TX_MCS_SET_DEFINED;
 
 	{
-		int on = 0;
+		int off = 0;
 		/*
 		 * MT7920 has the HE capabilities of the MT7921 in Linux
 		 * mt7921: HE80, no 160 MHz, which mwx_init_he_caps() keeps
 		 * for MT7922 through sc_vht160.
 		 */
-		sc->sc_he_enabled = PE_parse_boot_argn("-mtkhe", &on,
-		    sizeof(on)) && (sc->sc_hwtype == MWX_HW_MT7922 ||
+		sc->sc_he_enabled = !PE_parse_boot_argn("-mtknohe", &off,
+		    sizeof(off)) && (sc->sc_hwtype == MWX_HW_MT7922 ||
 		    sc->sc_hwtype == MWX_HW_MT7920);
 	}	{
 		int only = 0;
