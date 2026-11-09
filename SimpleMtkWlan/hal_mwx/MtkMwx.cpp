@@ -576,6 +576,8 @@ struct mwx_softc {
 	int8_t			sc_he_enabled; /* experimental HE (-mtkhe: on) */
 	int8_t			sc_he_only; /* experimental HE-only (-mtkheonly) */	/* hardware BA programming (-mtknowtblba: off) */
 	volatile int8_t		sc_suspended;	/* system sleep: leave the hardware alone */
+	int8_t			sc_stopping;	/* inside mwx_stop_internal() */
+	int8_t			sc_mcu_mute;	/* no answer during a stop: no commands until init */
 	uint32_t		sc_tx_full_cnt;
 	uint32_t		sc_tx_kick_cnt;
 	uint32_t		sc_output_start_cnt;
@@ -1311,6 +1313,7 @@ mwx_init_hw(struct ifnet *ifp)
 	const uint8_t *lladdr = ((struct arpcom *)ifp)->ac_enaddr;
 	int rv;
 
+	sc->sc_mcu_mute = 0;
 	if (!sc->sc_fw_loaded) {
 		rv = mwx_preinit(sc);
 		if (rv) {
@@ -1459,6 +1462,7 @@ mwx_stop_internal(struct ifnet *ifp, bool teardown_owner)
 		return;
 	}
 	DPRINTF("%s: stop\n", DEVNAME(sc));
+	sc->sc_stopping = 1;
 
 	/*
 	 * Tell the AP we are leaving (shutdown, interface down). Otherwise it
@@ -1522,6 +1526,7 @@ mwx_stop_internal(struct ifnet *ifp, bool teardown_owner)
 		ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_STOPPED, NULL);
 #endif
 
+	sc->sc_stopping = 0;
 	splx(s);
 }
 
@@ -4665,6 +4670,16 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 	size_t lead;
 	uint8_t seq = 0;
 
+	/*
+	 * The firmware left a command of this stop unanswered. Every further
+	 * one would wait its three seconds too, and the stop runs inside the
+	 * power-off the kernel times: three of them panicked a system sleep.
+	 */
+	if (sc->sc_mcu_mute) {
+		m_freem(m);
+		return ETIMEDOUT;
+	}
+
 	if (cmd == MCU_CMD_FW_SCATTER) {
 		q = &sc->sc_txfwdlq;
 		goto enqueue;
@@ -4971,6 +4986,11 @@ mwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,
 	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
 	if (rv != 0) {
 		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+		if (sc->sc_stopping) {
+			/* The card is going down: nothing to reset, and no more waits. */
+			sc->sc_mcu_mute = 1;
+			return rv;
+		}
 		mwx_reset(sc);
 		return rv;
 	}
@@ -4995,6 +5015,11 @@ mwx_mcu_wait_resp_msg(struct mwx_softc *sc, uint32_t cmd, int seq,
 	rv = tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait", SEC_TO_NSEC(3));
 	if (rv != 0) {
 		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+		if (sc->sc_stopping) {
+			/* The card is going down: nothing to reset, and no more waits. */
+			sc->sc_mcu_mute = 1;
+			return rv;
+		}
 		mwx_reset(sc);
 		return rv;
 	}
@@ -9265,6 +9290,7 @@ MtkMwx::resume()
 
 	if (sc == NULL || !sc->sc_suspended)
 		return;
+	sc->sc_mcu_mute = 0;	/* the card lost power: a new firmware will answer */
 	MWX_DEV_LOG(sc, "resume lpctl=0x%08x\n", mwx_read(sc, MT_CONN_ON_LPCTL));
 	if (mwx_mcu_fw_pmctrl(sc) != 0 || mwx_mcu_drv_pmctrl(sc) != 0) {
 		MWX_DEV_LOG(sc, "resume: driver own failed, trying WFSYS reset\n");
