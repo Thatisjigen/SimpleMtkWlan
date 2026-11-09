@@ -9407,7 +9407,7 @@ MtkMwx::debugPoll()
 	}
 	if (verbose)
 		MWX_DEV_LOG(sc,
-		    "ba gap_timeout=%u frame_lost=%u slide=%u jump=%u below=%u bar_rx=%u rx_agreements=%u drv_ctl=%u drv_bar=%u\n",
+		    "ba gap_timeout=%u frame_lost=%u slide=%u jump=%u below=%u bar_rx=%u rx_agreements=%u drv_ctl=%u drv_bar=%u htp_ack=%u\n",
 		    ic->ic_stats.is_ht_rx_ba_window_gap_timeout,
 		    ic->ic_stats.is_ht_rx_ba_frame_lost,
 		    ic->ic_stats.is_ht_rx_ba_window_slide,
@@ -9415,7 +9415,7 @@ MtkMwx::debugPoll()
 		    ic->ic_stats.is_ht_rx_frame_below_ba_winstart,
 		    ieee80211_bar_rx_count,
 		    ic->ic_stats.is_ht_rx_ba_agreements, mwx_rx_ctl_cnt,
-		    mwx_rx_bar_cnt);
+		    mwx_rx_bar_cnt, ic->ic_stats.is_ht_rx_ba_htp_ack);
 	if (verbose)
 		MWX_DEV_LOG(sc,
 		    "tx output_start=%u noqueue=%u active=%u capacity=%u dequeue_fail=%u post_active=%u other=%u kick=%u txwi_free=%u ring_free=%d full=%u oactive=%d tx_ba=%u amsdu=%d\n",
