@@ -101,7 +101,8 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - BAR frames are not delivered by the firmware (`bar_rx=0` in the `ba` debug
   line); reorder gaps rely on the 100 ms `IEEE80211_BA_GAP_TIMEOUT`.
 - A warm reboot keeps the M.2 card powered; attach recovers via WFSYS reset and
-  PCIe FLR.
+  PCIe FLR. When the patch semaphore answers `PATCH_IS_DL` the ROM patch is
+  skipped and only the WM firmware is loaded, as in Linux.
 - TX: data uses the LMAC queue of its AC (`mt7921_mac_write_txwi`), management
   stays on VO. No `MT_TXD5_TX_STATUS_HOST`; TXWIs are released only by the TX
   free event. `mwx_start` sets oactive when `mwx_tx_has_room` fails and

@@ -2874,6 +2874,9 @@ mwx_init_he_caps(struct mwx_softc *sc)
 	}
 }
 
+/* Linux tries ten times; three keep a dead card from holding up the boot. */
+#define	MWX_INIT_HARDWARE_TRIES	3
+
 int
 mwx_preinit(struct mwx_softc *sc)
 {
@@ -2884,9 +2887,17 @@ mwx_preinit(struct mwx_softc *sc)
 
 	MWX_DEV_LOG(sc, "preinit start fw_loaded=%d\n", sc->sc_fw_loaded);
 
-	if ((rv = mwx_init_hardware(sc)) != 0) {
-		MWX_DEV_LOG(sc, "preinit hardware init failed error=%d\n", rv);
-		return rv;
+	/*
+	 * A chip the previous driver session left running can miss the first
+	 * MCU handshake. A failed mwx_init_hardware() ends with a DMA and
+	 * WFSYS reset, so start again from there, as Linux
+	 * mt7921_init_hardware() does.
+	 */
+	for (i = 1; (rv = mwx_init_hardware(sc)) != 0; i++) {
+		MWX_DEV_LOG(sc, "preinit hardware init failed error=%d attempt=%d of %d\n",
+		    rv, i, MWX_INIT_HARDWARE_TRIES);
+		if (i >= MWX_INIT_HARDWARE_TRIES)
+			return rv;
 	}
 	MWX_DEV_LOG(sc, "preinit hardware init ok\n");
 
@@ -5536,6 +5547,18 @@ mwx_load_firmware(struct mwx_softc *sc)
 	    buflen, fwlen);
 
 	rv = mwx_mcu_patch_sem_ctrl(sc, 1);
+	if (rv == -1) {
+		/*
+		 * PATCH_IS_DL: the chip still holds a ROM patch, which happens
+		 * when the card kept power since another driver loaded one (a
+		 * warm reboot). Like Linux mt76_connac2_load_patch(), skip the
+		 * patch and download only the WM firmware: no semaphore was
+		 * taken, so there is none to release.
+		 */
+		MWX_DEV_LOG(sc, "patch already downloaded, loading the WM firmware only\n");
+		rv = 0;
+		goto wm;
+	}
 	if (rv != 0) {
 		MWX_DEV_LOG(sc, "patch semaphore acquire failed error=%d\n", rv);
 		goto fail;
@@ -5619,6 +5642,7 @@ out:
 	if (rv != 0)
 		goto fail;
 
+wm:
 	if (fwlen < sizeof(*fwhdr)) {
 		MWX_DEV_LOG(sc, "invalid WM firmware size=%zu min=%zu\n",
 		    fwlen, sizeof(*fwhdr));
@@ -5809,6 +5833,7 @@ mwx_mcu_patch_sem_ctrl(struct mwx_softc *sc, int semget)
 	if (semget) {
 		switch (sem) {
 		case PATCH_IS_DL:
+			/* Not an error: nothing to download, no semaphore held. */
 			return -1;
 		case PATCH_NOT_DL_SEM_SUCCESS:
 			return 0;
