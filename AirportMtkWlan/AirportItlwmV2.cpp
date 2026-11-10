@@ -1103,6 +1103,15 @@ getCARD_CAPABILITIES(OSObject *object,
         (1 << APPLE80211_CAP_AES_CCM) | (1 << APPLE80211_CAP_TKIP) : 0;
     cd->capabilities[1] &= ~(1 << (APPLE80211_CAP_WPA1 - 8));
     cd->capabilities[5] = 0x40; // Scan completion events.
+#if !defined(__IO80211_TARGET) || __IO80211_TARGET != __MAC_15_2
+    // Bit 40, ARP/NDP offload. Without it airportd on macOS 26 does not
+    // program the IPv4 address into the driver, so WCL never learns that
+    // DHCP completed and, on an 802.1X network, starts "EAP Mitigation" (a
+    // reassociation) ten seconds after connecting. With it airportd sends
+    // IPV4_PARAMS, which the family hands to WCL before calling us.
+    // OFFLOAD_ARP and OFFLOAD_NDP stay unsupported.
+    cd->capabilities[5] |= 0x01;
+#endif
     cd->capabilities[2] = (1 << (APPLE80211_CAP_WME - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_40MHZ - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_20MHZ - 16));
