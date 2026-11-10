@@ -72,7 +72,14 @@ public:
      */
     virtual void suspend() {}
     virtual void resume() {}
-    
+
+    /*
+     * System restart / power off, called on the main work loop after the
+     * interface was taken down. A restart does not cut power to an M.2
+     * card: leave it quiet for whatever system boots next.
+     */
+    virtual void shutdown() {}
+
     virtual void free() override;
 
 public:
