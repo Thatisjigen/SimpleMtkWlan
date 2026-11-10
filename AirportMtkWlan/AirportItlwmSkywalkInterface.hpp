@@ -448,6 +448,7 @@ private:
     IOReturn leaveWCLNetwork();
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
+    void notifyWCLSupplicantDone(const char *);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];

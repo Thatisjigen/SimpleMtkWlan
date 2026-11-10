@@ -65,8 +65,26 @@ enum Message : uint32_t {
     JoinAbortComplete = 214,
     LinkStatus = 216,
     LqmUpdate = 39,
+    // apple80211_message_supplicant_event. With status 0 IO80211Family marks
+    // the keys as installed and WCL drops the deadline it armed for the
+    // four-way handshake when the link came up. An 802.1X join carries no key,
+    // so without this event WCL leaves the network about 15 s after the
+    // association (reason 4wayHsTimeout) although data is flowing.
+    SupplicantEvent = 76,
     ScanDone = 237
 };
+
+// As read by IO80211Family on macOS 26: 0x28 bytes, status at +0x8 with 0
+// for success. A zeroed event means "keys installed".
+struct SupplicantEventData {
+    uint32_t version;
+    uint32_t event;
+    uint32_t status;
+    uint32_t flags;
+    uint8_t reserved[0x28 - 16];
+};
+static_assert(sizeof(SupplicantEventData) == 0x28, "supplicant event size");
+static_assert(offsetof(SupplicantEventData, status) == 8, "supplicant event status offset");
 
 struct SequoiaLqmUpdate {
     uint8_t rssiValid;

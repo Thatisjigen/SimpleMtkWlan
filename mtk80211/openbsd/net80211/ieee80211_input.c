@@ -1178,9 +1178,15 @@ ieee80211_enqueue_data(struct ieee80211com *ic, mbuf_t m,
 #endif
 #if defined(AIRPORT_WCL)
             if (ic->ic_wcl_enterprise) {
+                static int eapRxLogged;
                 mbuf_t eapCopy = NULL;
                 if (mbuf_dup(m, MBUF_DONTWAIT, &eapCopy) == 0 && eapCopy)
                     ml_enqueue(ml, eapCopy);
+                if (eapRxLogged < 64) {
+                    eapRxLogged++;
+                    XYLog("%s EAPOL rx to host len=%zu port_valid=%d copied=%d\n", __FUNCTION__,
+                          (size_t)mbuf_pkthdr_len(m), ni->ni_port_valid, eapCopy != NULL);
+                }
             }
             ieee80211_eapol_key_input(ic, m, ni);
 #elif defined(USE_APPLE_SUPPLICANT)

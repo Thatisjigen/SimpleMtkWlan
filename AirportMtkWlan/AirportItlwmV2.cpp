@@ -700,6 +700,9 @@ setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed,
     currentStatus = status;
     if (fNetIf) {
         if (status & kIONetworkLinkActive) {
+#ifdef AIRPORT_WCL
+            enterpriseDataPathOpen = false; // the real link owns the data path now
+#endif
 #ifdef __PRIVATE_SPI__
             bsdInterface->startOutputThread();
 #endif
@@ -717,6 +720,40 @@ setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed,
     }
     return ret;
 }
+
+#ifdef AIRPORT_WCL
+/*
+ * 802.1X: the EAP exchange runs in eapolclient, over the BSD interface, after
+ * the association and before the four-way handshake that brings the link up.
+ * Open the output path for it at association; net80211 still drops everything
+ * but EAPOL while the port is not valid. The real link state takes over once
+ * the handshake is done, and a failed or abandoned join closes the path again.
+ */
+void AirportItlwm::
+setEnterpriseDataPath(bool open)
+{
+    if (!bsdInterface || open == enterpriseDataPathOpen)
+        return;
+    if (!open && (currentStatus & kIONetworkLinkActive)) {
+        enterpriseDataPathOpen = false;
+        return;
+    }
+    XYLog("%s %s\n", __FUNCTION__, open ? "open (802.1X at association)" : "closed");
+    enterpriseDataPathOpen = open;
+    if (open) {
+#ifdef __PRIVATE_SPI__
+        bsdInterface->startOutputThread();
+#endif
+        bsdInterface->setLinkState(kIO80211NetworkLinkUp);
+    } else {
+#ifdef __PRIVATE_SPI__
+        bsdInterface->stopOutputThread();
+        bsdInterface->flushOutputQueue();
+#endif
+        bsdInterface->setLinkState(kIO80211NetworkLinkDown);
+    }
+}
+#endif
 
 IOReturn AirportItlwm::
 setLinkStateGated(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3)
@@ -836,6 +873,16 @@ UInt32 AirportItlwm::enqueuePacket(mbuf_t m)
 {
     auto ic = fHalService->get80211Controller();
     auto ifp = &ic->ic_ac.ac_if;
+    if (ic->ic_wcl_enterprise && m && mbuf_type(m) != MBUF_TYPE_FREE &&
+        mbuf_len(m) >= sizeof(ether_header_t) &&
+        ((ether_header_t *)mbuf_data(m))->ether_type == htons(ETHERTYPE_PAE)) {
+        static int eapTxLogged;
+        if (eapTxLogged < 64) {
+            eapTxLogged++;
+            XYLog("%s EAPOL tx from host len=%zu state=%d\n", __FUNCTION__,
+                  (size_t)mbuf_pkthdr_len(m), ic->ic_state);
+        }
+    }
     if (ic->ic_state == IEEE80211_S_RUN && ifp->if_snd.queue &&
         m && mbuf_type(m) != MBUF_TYPE_FREE && (mbuf_flags(m) & MBUF_PKTHDR) &&
         ifp->if_snd.queue->lockEnqueue(m))

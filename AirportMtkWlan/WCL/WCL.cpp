@@ -612,6 +612,7 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
     joinTimer->cancelTimeout();
     instance->postMessage(this, AirportWCL::ConnectComplete, &event, sizeof(event), true);
     if (status) {
+        instance->setEnterpriseDataPath(false);
         portAuthorized = false;
         updateWCLLinkQuality(true);
         ieee80211com *ic = fHalService->get80211Controller();
@@ -634,6 +635,7 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 {
     ieee80211com *ic = fHalService->get80211Controller();
+    instance->setEnterpriseDataPath(false);
     portAuthorized = false;
     updateWCLLinkQuality(true);
     joinPending = false;
@@ -665,6 +667,23 @@ IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
     return kIOReturnSuccess;
 }
 
+// net80211 ran the four-way and group key handshakes of an 802.1X join with
+// the PMK that eapolclient installed. Tell IO80211 and WCL, as a firmware
+// supplicant would: WCL otherwise leaves the network ("4wayHsTimeout") about
+// 15 s after the association.
+void AirportItlwmSkywalkInterface::notifyWCLSupplicantDone(const char *where)
+{
+#if !defined(__IO80211_TARGET) || __IO80211_TARGET != __MAC_15_2
+    ieee80211com *ic = fHalService->get80211Controller();
+    if (!ic->ic_wcl_enterprise || !portAuthorized || !wclLinkIndicated)
+        return;
+    AirportWCL::SupplicantEventData event = {};
+    XYLog("WCL 802.1X supplicant done (%s): posting supplicant event %u\n",
+          where, (unsigned)AirportWCL::SupplicantEvent);
+    instance->postMessage(this, AirportWCL::SupplicantEvent, &event, sizeof(event), true);
+#endif
+}
+
 void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping)
@@ -680,6 +699,8 @@ void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
     }
     if (up && joinPending && firstBeaconNotified)
         finishWCLJoin(0, 0, kIOReturnSuccess);
+    if (up)
+        notifyWCLSupplicantDone("link up");
     updateWCLLinkQuality(true);
 }
 
@@ -802,8 +823,12 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 wclLinkIndicated = true;
                 instance->postMessage(this, AirportWCL::LinkStatus, &link, sizeof(link), true);
                 instance->postMessage(this, AirportWCL::FirstBeacon, &event, sizeof(event), true);
-                if (portAuthorized)
+                if (portAuthorized) {
                     finishWCLJoin(0, 0, kIOReturnSuccess);
+                    // The handshake ended before the first beacon: WCL armed
+                    // its deadline with the LinkStatus above, clear it now.
+                    notifyWCLSupplicantDone("first beacon");
+                }
             }
             break;
         }
@@ -827,9 +852,12 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 instance->postMessage(this, AirportWCL::AssocComplete, &event, sizeof(event), true);
                 if (event.status)
                     finishWCLJoin(event.status, 0, kIOReturnError);
+                else if (ic->ic_wcl_enterprise)
+                    instance->setEnterpriseDataPath(true);
             }
             break;
         case IEEE80211_EVT_STA_DEAUTH: {
+            instance->setEnterpriseDataPath(false);
             portAuthorized = false;
             updateWCLLinkQuality(true);
             AirportWCL::DeauthEvent event = {};
