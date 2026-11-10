@@ -8734,10 +8734,37 @@ MtkMwx::getFirmwareVersion()
 	return mwx_hw_name(com->sc_hwtype);
 }
 
+/*
+ * Noise floor as a positive number of -dBm: both front ends negate it.
+ * The firmware reports no noise measurement, and the 0 returned here made
+ * macOS see 0 dBm of noise, so an SNR equal to the RSSI: negative on every
+ * real link. Report the thermal noise floor of the operating width instead:
+ * -174 dBm/Hz + 10*log10(bandwidth) plus a typical 7 dB receiver noise
+ * figure.
+ */
 int16_t
 MtkMwx::getBSSNoise()
 {
-	return 0;
+	struct ieee80211com *ic;
+	uint8_t bw = CMD_CBW_20MHZ, center;
+
+	if (com == NULL)
+		return 94;
+	ic = &com->sc_ic;
+	/* The width is the one negotiated with the AP: only known in RUN. */
+	if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bss != NULL &&
+	    ic->ic_bss->ni_chan != IEEE80211_CHAN_ANYC)
+		mwx_node_chan_width(ic->ic_bss, &bw, &center);
+	switch (bw) {
+	case CMD_CBW_160MHZ:
+		return 85;
+	case CMD_CBW_80MHZ:
+		return 88;
+	case CMD_CBW_40MHZ:
+		return 91;
+	default:
+		return 94;
+	}
 }
 
 bool
