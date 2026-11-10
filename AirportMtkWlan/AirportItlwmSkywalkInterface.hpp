@@ -53,7 +53,14 @@ public:
     IOReturn setINTERFACE_SETTING(apple80211_interface_setting*) override { return kIOReturnUnsupported; }
     IOReturn setBYPASS_TX_POWER_CAP(apple80211_bypass_tx_power_cap*) override { return kIOReturnUnsupported; }
     IOReturn setFACETIME_WIFICALLING_PARAMS(apple80211_facetime_wificalling_params*) override { return kIOReturnUnsupported; }
+#if __IO80211_TARGET != __MAC_15_2
+    // Sent after DHCP once the card advertises ARP/NDP offload (capability
+    // bit 40). The family has already handed them to WCL, which is how WCL
+    // learns the address; this hardware has nothing to program.
+    IOReturn setIPV4_PARAMS(apple80211_ipv4_params*) override { return kIOReturnSuccess; }
+#else
     IOReturn setIPV4_PARAMS(apple80211_ipv4_params*) override { return kIOReturnUnsupported; }
+#endif
     IOReturn setWCL_WNM_OPS(apple80211_wcl_wnm_config_t*) override { return kIOReturnUnsupported; }
     IOReturn setWCL_WNM_OFFLOAD(apple80211_wcl_wnm_offload_t*) override { return kIOReturnUnsupported; }
     IOReturn setWCL_LIMITED_AGGREGATION(apple80211_limited_aggregation_config*) override { return kIOReturnUnsupported; }
