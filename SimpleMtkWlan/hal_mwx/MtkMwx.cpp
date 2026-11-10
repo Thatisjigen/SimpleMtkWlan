@@ -6143,6 +6143,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	struct mbuf *m;
 	int n_ssids = 0;
 	int rv;
+	uint16_t dwell;
 	uint8_t nchan, n_2g = 0, n_5g = 0;
 
 	m = mwx_mcu_alloc_msg(sizeof(*req));
@@ -6238,9 +6239,17 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	}
 
 	req->channel_type = nchan ? 4 : 0;
-	req->timeout_value = htole16(nchan * 120);
-	req->channel_min_dwell_time = htole16(120);
-	req->channel_dwell_time = htole16(120);
+	/*
+	 * A background scan takes the radio off the BSS channel for the dwell
+	 * time of every channel it visits, and macOS may ask for one every
+	 * ten seconds while associated. Like Linux mt76 on these chips, pass
+	 * 0 there and let the firmware use its own channel time; a scan with
+	 * no association to keep alive still dwells 120 ms.
+	 */
+	dwell = bgscan ? 0 : 120;
+	req->timeout_value = htole16(nchan * dwell);
+	req->channel_min_dwell_time = htole16(dwell);
+	req->channel_dwell_time = htole16(dwell);
 
 
 #ifdef NOTYET

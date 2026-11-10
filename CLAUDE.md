@@ -128,6 +128,8 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - airportd asks for short scans of a few channels; `mt7921_mcu_hw_scan`
   honours `ic_wcl_scan_*` (channels, SSID, active). In RUN such restricted
   scans are allowed every 10 s, full sweeps every 120 s (`mwx_bgscan`).
+  Background scans pass a dwell time of 0, the firmware's own, as Linux mt76
+  does; scans without an association dwell 120 ms per channel.
   Outside RUN net80211 does not sweep on its own (`ic_wcl_scan_idle`).
 - `mwx_init` adopts the MAC address macOS sets (private Wi-Fi address) and
   registers the firmware vif with it, otherwise DHCP replies are filtered.
