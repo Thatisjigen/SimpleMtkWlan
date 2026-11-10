@@ -229,6 +229,9 @@ public:
     virtual IOReturn setWakeOnMagicPacket( bool active ) override;
     void setPowerStateOff(void);
     void setPowerStateOn(void);
+    virtual void systemWillShutdown(IOOptionBits specifier) override;
+    static IOReturn shutdownGated(OSObject *target, void *arg0, void *arg1,
+                                  void *arg2, void *arg3);
     void unregistPM();
     bool initPCIPowerManagment(IOPCIDevice *provider);
 

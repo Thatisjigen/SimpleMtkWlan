@@ -52,6 +52,7 @@ public:
     void debugPoll() override;
     void suspend() override;
     void resume() override;
+    void shutdown() override;
     IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
     void accountOutputStart(uint32_t reason) override;
 

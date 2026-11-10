@@ -103,6 +103,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - A warm reboot keeps the M.2 card powered; attach recovers via WFSYS reset and
   PCIe FLR. When the patch semaphore answers `PATCH_IS_DL` the ROM patch is
   skipped and only the WM firmware is loaded, as in Linux.
+- Restart / power off: `AirportItlwm::systemWillShutdown()` takes the
+  interface down like a system sleep, then `MtkMwx::shutdown()` parks the chip
+  (interrupts masked, DMA off, firmware own, bus mastering off). No MCU
+  command after the interface stop.
 - TX: data uses the LMAC queue of its AC (`mt7921_mac_write_txwi`), management
   stays on VO. No `MT_TXD5_TX_STATUS_HOST`; TXWIs are released only by the TX
   free event. `mwx_start` sets oactive when `mwx_tx_has_room` fails and

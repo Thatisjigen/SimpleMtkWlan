@@ -9,6 +9,7 @@
 #include "AirportItlwmV2.hpp"
 #include <sys/_netstat.h>
 #include <crypto/sha1.h>
+#include <IOKit/IOMessage.h>
 #include <net80211/ieee80211_priv.h>
 #include <net80211/ieee80211_var.h>
 
@@ -1446,6 +1447,35 @@ void AirportItlwm::setPowerStateOff()
     disableAdapter(bsdInterface);
     fHalService->suspend();
     pmPolicyMaker->acknowledgeSetPowerState();
+}
+
+/*
+ * Restart or power off. Nothing else stops the hardware on this path:
+ * disable() of the Skywalk interface leaves the card running. Take the
+ * interface down as a system sleep does, then let the HAL park the chip
+ * for whatever system boots next.
+ */
+IOReturn AirportItlwm::shutdownGated(OSObject *target, void *, void *, void *, void *)
+{
+    AirportItlwm *self = OSDynamicCast(AirportItlwm, target);
+
+    if (self && self->fHalService) {
+        if (self->watchdogTimer && self->bsdInterface)
+            self->disableAdapter(self->bsdInterface);
+        self->fHalService->shutdown();
+    }
+    return kIOReturnSuccess;
+}
+
+void AirportItlwm::systemWillShutdown(IOOptionBits specifier)
+{
+    XYLog("%s specifier=0x%x\n", __FUNCTION__, (unsigned int)specifier);
+    /* The family's own part first, while the card still answers. */
+    super::systemWillShutdown(specifier);
+    if ((specifier == kIOMessageSystemWillRestart ||
+         specifier == kIOMessageSystemWillPowerOff) &&
+        fHalService && _fCommandGate)
+        _fCommandGate->runAction(&AirportItlwm::shutdownGated);
 }
 
 void AirportItlwm::setPowerStateOn()

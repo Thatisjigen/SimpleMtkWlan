@@ -9446,6 +9446,48 @@ MtkMwx::resume()
 	MWX_DEV_LOG(sc, "resume: firmware reload scheduled\n");
 }
 
+/*
+ * System restart or power off. Nothing stopped the hardware on that path:
+ * the interrupts and the DMA stayed enabled, with the rings pointing at
+ * memory that belongs to the next system. A restart does not cut power to
+ * an M.2 card, so whatever boots next, this driver included, finds the
+ * chip as it is left here.
+ *
+ * Leave it the way Linux mt7921_pci_suspend() leaves a card that keeps
+ * power: interface stopped, interrupts masked, DMA off, the chip handed
+ * back to its firmware. Bus mastering goes off too, so the card cannot
+ * write to memory at all. The firmware keeps running; the next attach
+ * takes the chip back and resets it. Once the interface is stopped no MCU
+ * command is sent: nothing may wait for the firmware from there on.
+ */
+void
+MtkMwx::shutdown()
+{
+	struct mwx_softc *sc = com;
+
+	/* Asleep: the card has no power and its registers are off limits. */
+	if (sc == NULL || sc->sc_memh == 0 || sc->sc_suspended)
+		return;
+	MWX_DEV_LOG(sc, "shutdown lpctl=0x%08x\n", mwx_read(sc, MT_CONN_ON_LPCTL));
+	/* As before a system sleep: leave the network, mask the interrupts. */
+	suspend();
+	if (!sc->sc_suspended)
+		return;		/* a teardown already owns the card */
+	sc->sc_mcu_mute = 1;	/* a late command must not wait for an answer */
+	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
+	if (mwx_mcu_drv_pmctrl(sc) != 0)
+		MWX_DEV_LOG(sc, "shutdown: driver own failed\n");
+	if (mwx_dma_disable(sc, 0) != 0)
+		MWX_DEV_LOG(sc, "shutdown: DMA still busy\n");
+	if (mwx_mcu_fw_pmctrl(sc) != 0)
+		MWX_DEV_LOG(sc, "shutdown: firmware own failed\n");
+	if (pci != NULL && pci->pa_tag != NULL)
+		pci->pa_tag->setBusMasterEnable(false);
+	sc->sc_fw_loaded = 0;
+	MWX_DEV_LOG(sc, "shutdown done lpctl=0x%08x\n",
+	    mwx_read(sc, MT_CONN_ON_LPCTL));
+}
+
 void
 MtkMwx::debugPoll()
 {
