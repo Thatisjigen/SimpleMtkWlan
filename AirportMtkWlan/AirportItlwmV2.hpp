@@ -265,6 +265,11 @@ public:
     u_int32_t current_authtype_upper;
     UInt64 currentSpeed;
     UInt32 currentStatus;
+#ifdef AIRPORT_WCL
+    // 802.1X: BSD output path opened at association for the EAP exchange.
+    void setEnterpriseDataPath(bool open);
+    bool enterpriseDataPathOpen = false;
+#endif
     bool disassocIsVoluntary;
     char geo_location_cc[3];
     
