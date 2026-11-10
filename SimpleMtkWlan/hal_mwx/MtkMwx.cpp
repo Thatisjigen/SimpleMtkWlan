@@ -2874,6 +2874,9 @@ mwx_init_he_caps(struct mwx_softc *sc)
 	}
 }
 
+/* Linux tries ten times; three keep a dead card from holding up the boot. */
+#define	MWX_INIT_HARDWARE_TRIES	3
+
 int
 mwx_preinit(struct mwx_softc *sc)
 {
@@ -2884,9 +2887,17 @@ mwx_preinit(struct mwx_softc *sc)
 
 	MWX_DEV_LOG(sc, "preinit start fw_loaded=%d\n", sc->sc_fw_loaded);
 
-	if ((rv = mwx_init_hardware(sc)) != 0) {
-		MWX_DEV_LOG(sc, "preinit hardware init failed error=%d\n", rv);
-		return rv;
+	/*
+	 * A chip the previous driver session left running can miss the first
+	 * MCU handshake. A failed mwx_init_hardware() ends with a DMA and
+	 * WFSYS reset, so start again from there, as Linux
+	 * mt7921_init_hardware() does.
+	 */
+	for (i = 1; (rv = mwx_init_hardware(sc)) != 0; i++) {
+		MWX_DEV_LOG(sc, "preinit hardware init failed error=%d attempt=%d of %d\n",
+		    rv, i, MWX_INIT_HARDWARE_TRIES);
+		if (i >= MWX_INIT_HARDWARE_TRIES)
+			return rv;
 	}
 	MWX_DEV_LOG(sc, "preinit hardware init ok\n");
 
