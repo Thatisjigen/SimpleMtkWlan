@@ -120,7 +120,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   `MtkHalService::suspend()` / `resume()` from their power state handlers;
   resume does driver own (WFSYS reset fallback — needed in practice) and
   reloads the firmware through the hard reset task. While `sc_suspended`,
-  `mwx_intr` and `debugPoll` must not touch the hardware.
+  `mwx_intr` and `debugPoll` must not touch the hardware. AirportItlwm takes
+  its interface down for the sleep; `resume(true)` marks it up again when it
+  queues the reset task, so that the driver is available in the dark wake
+  instead of only after airportd powers the radio on at the user wake.
 - Host tests use ASan; on the hackintosh dev machine any ASan binary dies with
   SIGILL, so run them there with `-fsanitize=undefined` only (CI runs ASan).
 
