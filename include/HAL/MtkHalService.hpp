@@ -68,10 +68,12 @@ public:
     /*
      * System sleep / wake, called on the main work loop by the front end's
      * power state change. The card loses power in S3: suspend() quiets it,
-     * resume() takes it back and reloads the firmware.
+     * resume() takes it back and reloads the firmware. With up, the reload
+     * also brings up the interface that the front end took down for the
+     * sleep.
      */
     virtual void suspend() {}
-    virtual void resume() {}
+    virtual void resume(bool up) { (void)up; }
 
     /*
      * System restart / power off, called on the main work loop after the

@@ -144,6 +144,7 @@ void SimpleMtkWlan::setPowerStateOff()
 void SimpleMtkWlan::setPowerStateOn()
 {
     pmPowerState = kPowerStateOn;
-    fHalService->resume();
+    /* The interface stays up across the sleep: the reload brings it back. */
+    fHalService->resume(false);
     pmPolicyMaker->acknowledgeSetPowerState();
 }

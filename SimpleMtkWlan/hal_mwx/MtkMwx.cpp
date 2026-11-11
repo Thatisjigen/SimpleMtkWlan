@@ -9462,11 +9462,14 @@ MtkMwx::suspend()
  * System wake: take the chip back from the firmware (with the same WFSYS
  * reset / PCIe FLR fallback as attach), then reload the firmware through
  * the hard reset task (the DMA stall recovery path). An interface that was
- * up is brought up again by that task; one the front end took down (the
- * native Wi-Fi interface) is initialized when it is enabled again.
+ * up is brought up again by that task. The native Wi-Fi front end takes
+ * its interface down for the sleep: with up, it is marked up again here,
+ * only when this queues the reset task, so that the task initializes it
+ * and nothing else does (enable() skips an interface already up).
+ * Otherwise it is initialized when the front end enables it again.
  */
 void
-MtkMwx::resume()
+MtkMwx::resume(bool up)
 {
 	struct mwx_softc *sc = com;
 
@@ -9492,8 +9495,12 @@ MtkMwx::resume()
 	sc->sc_fw_loaded = 0;
 	sc->sc_suspended = 0;
 	sc->sc_hard_reset = 1;
+	/* mwx_reset() queues the task unless one is pending already. */
+	if (up && !sc->sc_resetting && !sc->sc_detaching)
+		sc->sc_ic.ic_if.if_flags |= IFF_UP;
 	mwx_reset(sc);
-	MWX_DEV_LOG(sc, "resume: firmware reload scheduled\n");
+	MWX_DEV_LOG(sc, "resume: firmware reload scheduled flags=0x%x\n",
+	    sc->sc_ic.ic_if.if_flags);
 }
 
 /*

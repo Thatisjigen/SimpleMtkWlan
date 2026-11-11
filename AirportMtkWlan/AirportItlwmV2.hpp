@@ -281,6 +281,7 @@ public:
     UInt8 pmPCICapPtr;
     bool magicPacketEnabled;
     bool magicPacketSupported;
+    bool wakeRestoreAdapter;    /* the adapter was up when the system slept */
     
     //AWDL
     uint8_t *syncFrameTemplate;

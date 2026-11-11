@@ -1500,6 +1500,13 @@ void AirportItlwm::setPowerStateOff()
 {
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOff;
+    /*
+     * Radio switched off by the user: setPOWER() took the adapter down
+     * before this runs. System sleep: it is still up; setPowerStateOn()
+     * brings it back.
+     */
+    wakeRestoreAdapter =
+        (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & IFF_UP) != 0;
     disableAdapter(bsdInterface);
     fHalService->suspend();
     pmPolicyMaker->acknowledgeSetPowerState();
@@ -1536,9 +1543,22 @@ void AirportItlwm::systemWillShutdown(IOOptionBits specifier)
 
 void AirportItlwm::setPowerStateOn()
 {
-    XYLog("%s\n", __FUNCTION__);
+    XYLog("%s restore=%d\n", __FUNCTION__, wakeRestoreAdapter);
     pmPowerState = kPowerStateOn;
-    /* The card was powered off: reload its firmware before it is enabled. */
-    fHalService->resume();
+    /*
+     * The card was powered off: resume() reloads its firmware. If the
+     * adapter was up before the sleep, the reload brings it up again as
+     * well. airportd powers the radio on only at the user wake, seconds
+     * later; until then every auto-join, the dark wake ones included,
+     * failed with "driver not available", and after such failures airportd
+     * tried Instant Hotspot and a scan of every channel before the known
+     * network.
+     */
+    fHalService->resume(wakeRestoreAdapter);
+    if (wakeRestoreAdapter) {
+        watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+        watchdogTimer->enable();
+    }
+    wakeRestoreAdapter = false;
     pmPolicyMaker->acknowledgeSetPowerState();
 }
