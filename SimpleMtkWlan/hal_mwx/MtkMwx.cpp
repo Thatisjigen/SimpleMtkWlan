@@ -1423,6 +1423,38 @@ mwx_init_hw(struct ifnet *ifp)
 		return 0;
 	}
 
+#ifdef AIRPORT_WCL
+	/*
+	 * macOS asks for every scan and every join (beginWCLScan(),
+	 * startWCLJoin()). A sweep started here kept the radio busy on all
+	 * 41 channels for 5.6 s, and the scan or join macOS asked for right
+	 * after the interface came up (power on, system wake, private address
+	 * change) waited for it. Enter the scan state idle instead, the way
+	 * ieee80211_end_scan() leaves it when nothing was asked for: the next
+	 * request starts its own hardware scan through ieee80211_next_scan().
+	 */
+	/*
+	 * mwx_preinit() fills the channel table only now, after
+	 * ieee80211_ifattach() found it empty: compute the active channel set
+	 * from it, as ieee80211_begin_scan() did. Without it
+	 * ieee80211_next_scan() finds no channel and ends every scan at once.
+	 */
+	if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) == IFM_AUTO)
+		ic->ic_curmode = IEEE80211_MODE_AUTO;
+	ieee80211_setmode(ic, (enum ieee80211_phymode)ic->ic_curmode);
+	ieee80211_reset_scan(ifp);
+	ic->ic_state = IEEE80211_S_SCAN;
+	sc->sc_ns_state = IEEE80211_S_SCAN;
+	ic->ic_wcl_scan_idle = true;
+	{
+		int active = 0;
+		for (int ch = 0; ch <= IEEE80211_CHAN_MAX; ch++)
+			if (isset(ic->ic_chan_active, ch))
+				active++;
+		MWX_DEV_LOG(sc, "init: scan state idle until macOS asks, %d channels\n",
+		    active);
+	}
+#else
 	MWX_DEV_LOG(sc, "init begin scan\n");
 	ieee80211_begin_scan(ifp);
 	MWX_DEV_LOG(sc, "init begin scan returned state=%d flags=0x%x sc_flags=0x%x\n",
@@ -1432,6 +1464,7 @@ mwx_init_hw(struct ifnet *ifp)
 	 * ieee80211_begin_scan() ends up scheduling mwx_newstate_task().
 	 * Wait until the transition to SCAN state has completed.
 	 */
+#endif
 
 	return 0;
 }

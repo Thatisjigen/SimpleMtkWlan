@@ -134,7 +134,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   scans are allowed every 10 s, full sweeps every 120 s (`mwx_bgscan`).
   Background scans pass a dwell time of 0, the firmware's own, as Linux mt76
   does; scans without an association dwell 120 ms per channel.
-  Outside RUN net80211 does not sweep on its own (`ic_wcl_scan_idle`).
+  Outside RUN net80211 does not sweep on its own (`ic_wcl_scan_idle`), and
+  `mwx_init` brings the interface up idle in the scan state: a sweep of its
+  own made the first scan or join after power on, wake or a private address
+  change wait 5.6 s for it.
 - `mwx_init` adopts the MAC address macOS sets (private Wi-Fi address) and
   registers the firmware vif with it, otherwise DHCP replies are filtered.
 - `IO80211InterfaceRole` must read `Infrastructure` or airportd ignores the
