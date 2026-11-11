@@ -1549,6 +1549,7 @@ mwx_stop_internal(struct ifnet *ifp, bool teardown_owner)
 	ic->ic_wcl_scan_active = false;
 	ic->ic_wcl_scan_ssid_length = 0;
 	ic->ic_wcl_scan_idle = false;
+	ic->ic_wcl_join_channel = 0;
 	if (ic->ic_event_handler)
 		ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_STOPPED, NULL);
 #endif
@@ -6178,6 +6179,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	int rv;
 	uint16_t dwell;
 	uint8_t nchan, n_2g = 0, n_5g = 0;
+	uint8_t join_channel = 0;
 
 	m = mwx_mcu_alloc_msg(sizeof(*req));
 	if (m == NULL)
@@ -6214,6 +6216,16 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 			n_ssids = 1;
 		}
 	}
+	/*
+	 * The first scan of a join (startWCLJoin()) listens only on the
+	 * channel macOS named, for two beacon intervals, instead of sweeping
+	 * every channel first. It is used once: if the network is not heard
+	 * there, the next scan of the join sweeps every channel.
+	 */
+	if (!bgscan && ic->ic_wcl_join_requested && ic->ic_wcl_join_channel) {
+		join_channel = ic->ic_wcl_join_channel;
+		ic->ic_wcl_join_channel = 0;
+	}
 #endif
 
 #ifdef NOTYET
@@ -6240,7 +6252,10 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		if (c->ic_flags == 0)
 			continue;
 #ifdef AIRPORT_WCL
-		if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
+		if (join_channel != 0) {
+			if (ieee80211_mhz2ieee(c->ic_freq, 0) != join_channel)
+				continue;
+		} else if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
 		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
 		    ieee80211_mhz2ieee(c->ic_freq, 0)))
 			continue;
@@ -6277,9 +6292,11 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	 * time of every channel it visits, and macOS may ask for one every
 	 * ten seconds while associated. Like Linux mt76 on these chips, pass
 	 * 0 there and let the firmware use its own channel time; a scan with
-	 * no association to keep alive still dwells 120 ms.
+	 * no association to keep alive still dwells 120 ms. The one channel of
+	 * a join dwells 220 ms, two beacon intervals of 102.4 ms: the scan is
+	 * passive, and a missed beacon costs a sweep of every channel.
 	 */
-	dwell = bgscan ? 0 : 120;
+	dwell = bgscan ? 0 : (join_channel != 0 && nchan == 1 ? 220 : 120);
 	req->timeout_value = htole16(nchan * dwell);
 	req->channel_min_dwell_time = htole16(dwell);
 	req->channel_dwell_time = htole16(dwell);
@@ -6305,12 +6322,12 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 #endif
 
 	MWX_DEV_LOG(sc,
-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x\n",
+	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x join_channel=%u\n",
 	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
 	    req->ext_channels_num, le16toh(req->timeout_value),
 	    le16toh(req->channel_dwell_time),
 	    le16toh(req->channel_min_dwell_time),
-	    le32toh(req->scan_func), req->ssid_type);
+	    le32toh(req->scan_func), req->ssid_type, join_channel);
 
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
 	if (rv != 0)

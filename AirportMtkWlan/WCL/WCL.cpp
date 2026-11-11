@@ -551,6 +551,14 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     memcpy(ic->ic_des_essid, join.ssid, sizeof(ic->ic_des_essid));
     memcpy(ic->ic_des_bssid, join.bssid, 6);
     memcpy(joinBSSID, join.bssid, 6);
+    // macOS picked the network from a scan moments ago and names its
+    // channel: look there first instead of sweeping all 41 channels (5.6 s)
+    // before every join. ieee80211_end_scan() sweeps if it is not heard.
+    unsigned joinChannel = AirportWCL::joinChannel(join.channelSpec);
+    if (!joinChannel || !ic->ic_channels[joinChannel].ic_flags ||
+        !isset(ic->ic_chan_active, joinChannel))
+        joinChannel = 0;
+    ic->ic_wcl_join_channel = uint8_t(joinChannel);
     ic->ic_flags |= IEEE80211_F_DESBSSID;
     ic->ic_wcl_join_requested = true;
     ic->ic_wcl_scan_requested = false;

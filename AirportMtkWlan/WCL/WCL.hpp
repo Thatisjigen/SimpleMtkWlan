@@ -434,6 +434,18 @@ inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsign
     return !restricted || (channel < 256 && (channels[channel / 8] & (1U << (channel % 8))));
 }
 
+// The channel a join request names, when its chanspec is one this driver
+// puts in scan results: 20 MHz, channel | 0x1000 on 2.4 GHz and
+// channel | 0xd000 on 5 GHz. Anything else gives 0: scan every channel.
+inline unsigned joinChannel(uint16_t channelSpec) {
+    unsigned channel = channelSpec & 0xff;
+    switch (channelSpec & 0xff00) {
+        case 0x1000: return channel >= 1 && channel <= 14 ? channel : 0;
+        case 0xd000: return channel >= 36 && channel <= 196 ? channel : 0;
+        default: return 0;
+    }
+}
+
 inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     if (!buffer || length < 0x58)
         return false;
