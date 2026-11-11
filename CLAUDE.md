@@ -128,7 +128,16 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - airportd asks for short scans of a few channels; `mt7921_mcu_hw_scan`
   honours `ic_wcl_scan_*` (channels, SSID, active). In RUN such restricted
   scans are allowed every 10 s, full sweeps every 120 s (`mwx_bgscan`).
-  Outside RUN net80211 does not sweep on its own (`ic_wcl_scan_idle`).
+  Background scans pass a dwell time of 0, the firmware's own, as Linux mt76
+  does; scans without an association dwell 120 ms per channel.
+  Outside RUN net80211 does not sweep on its own (`ic_wcl_scan_idle`), and
+  `mwx_init` brings the interface up idle in the scan state: a sweep of its
+  own made the first scan or join after power on, wake or a private address
+  change wait 5.6 s for it.
+- A join (`startWCLJoin`) first listens 220 ms on the channel of the
+  request's chanspec only (`ic_wcl_join_channel`, spent by the first
+  non-background scan); if the BSS is not heard there, net80211 sweeps every
+  channel. Before, every join swept 41 channels (5.6 s) first.
 - `mwx_init` adopts the MAC address macOS sets (private Wi-Fi address) and
   registers the firmware vif with it, otherwise DHCP replies are filtered.
 - `IO80211InterfaceRole` must read `Infrastructure` or airportd ignores the

@@ -1437,6 +1437,15 @@ ieee80211_end_scan(struct _ifnet *ifp)
     
     if (ic->ic_event_handler)
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_SCAN_DONE, NULL);
+#ifdef AIRPORT_WCL
+    /*
+     * The channel macOS named for a join is scanned once, by the first
+     * scan of the join (mt7921_mcu_hw_scan()). If that scan was already
+     * running when the join came, this one ends it: any further scan of
+     * the join sweeps every channel.
+     */
+    ic->ic_wcl_join_channel = 0;
+#endif
     
     if (ifp->if_flags & IFF_DEBUG)
         XYLog("%s: end %s scan\n", ifp->if_xname,
