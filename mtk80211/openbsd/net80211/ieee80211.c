@@ -93,7 +93,15 @@ int _start(struct kmod_info*, void*) {
 };
 ///
 
-int ieee80211_cache_size = IEEE80211_CACHE_SIZE;
+/*
+ * The node cache was capped at IEEE80211_CACHE_SIZE (200). A dense 2.4 GHz
+ * band can fill that alone, because the channel sweep walks 2.4 GHz first;
+ * once ieee80211_alloc_node_helper() runs out of slots, each later 5 GHz
+ * beacon folds into ic_bss instead of creating its own node, so no 5 GHz
+ * network reaches the scan list even though every channel was swept. Grow
+ * the node table to 512; the ESS cap in ieee80211_set_ess() keeps the macro.
+ */
+int ieee80211_cache_size = 512;
 
 void ieee80211_setbasicrates(struct ieee80211com *);
 int ieee80211_findrate(struct ieee80211com *, enum ieee80211_phymode, int);
