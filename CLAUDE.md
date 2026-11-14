@@ -156,10 +156,26 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   completes an MCU command needs that gate.
 - No AppleVTD support (needs `DisableIoMapper`), no WPA3-SAE.
 - AWDL (Tahoe only, `-mtkawdl`): `AirportMtkWlan/awdl/` creates `awdl0` as a subclass
-  of `IO80211AWDLProtocol` and answers the AWDL peer manager's configure
-  handshake. Nothing goes on the air yet, so no AirDrop. `-mtkawdl` also
-  publishes the driver log, as `-mtkdbglog` does, so it is the only switch an
-  AWDL test needs. That file is compiled
+  of `IO80211AWDLProtocol`, answers the AWDL peer manager's configure handshake
+  and runs AWDL on the radio; AirDrop works both ways with a Pixel's Quick Share.
+  The hardware layer (`MtkMwx.cpp`, under `MTK_AWDL`) takes remain-on-channel
+  windows, opens the sniffer and the RX filter for other devices (at 80 MHz on
+  44 and 149), sends on ALTX0 from OMAC 1, which holds awdl0's address, and
+  touches nothing until awdl0 starts it. The interface keeps the AWDL timeline,
+  posts the availability window events, builds the synchronization and master
+  indication frames, hands received action frames to the Family's peer manager
+  and carries awdl0's data, A-MSDUs included. Until a peer is heard the schedule
+  visits the social channels 6, 44 and 149; a device that names itself master is
+  followed. After 60 s with no peer, no data and nothing asked by the Family, the
+  timeline stops and the radio goes back to the station, as with awdl0 down; the
+  Family's next browse or advertisement (a denser channel sequence, a template of
+  a new length), a frame or traffic request, or a packet of awdl0 starts it
+  again from the next EAW. The driver writes awdl0's
+  `IO80211VirtualInterfaceRole` itself (the Family cannot store it on these
+  classes, and wifip2pd drops an interface
+  without it). `-mtkawdl` also publishes the driver log, as `-mtkdbglog` does, so
+  it is the only switch an AWDL test needs; `tools/mtklog.sh | grep awdl` shows
+  the radio, the windows by channel and the peers. The interface file is compiled
   on its own against the layouts in `awdl/io80211`; struct sizes come from the
   request lengths the Family's ioctl handlers check, never from a guess.
 

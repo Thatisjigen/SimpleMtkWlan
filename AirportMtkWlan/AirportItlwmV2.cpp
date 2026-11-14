@@ -1123,9 +1123,13 @@ getCARD_CAPABILITIES(OSObject *object,
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
 #ifdef MTK_AWDL
-    // wifip2pd reads capability 32 (AWDL) here and asks for awdl0 only if it is set.
-    if (mtkAwdlEnabled())
+    // wifip2pd reads capability 32 (AWDL) here and asks for awdl0 only if it is set. Capability 29 is dual band: without
+    // it the AWDL peer manager logs "Dual band not supported" and drops every 5 GHz AWDL channel
+    // (configureValidAWDLChannels; thanhnndev, mt7925-macos-wifi 45ac9bf). The MT7921 family is a 2.4/5 GHz radio.
+    if (mtkAwdlEnabled()) {
         cd->capabilities[4] |= 0x01;
+        cd->capabilities[3] |= 0x20;
+    }
 #endif
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?

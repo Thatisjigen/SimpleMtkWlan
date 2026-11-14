@@ -19,3 +19,51 @@ bool mtkAwdlEnabled();
 // requestedMac may be all zero, then the address is derived from primaryMac. bsdName receives awdl0, or the name in use.
 IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedMac, const uint8_t *primaryMac,
                                 char *bsdName, size_t bsdNameLen);
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The AWDL radio, implemented by the MediaTek hardware layer (SimpleMtkWlan/hal_mwx/MtkMwx.cpp) for the AWDL interface.
+//
+// The interface keeps the AWDL timeline and decides where the radio has to be; the hardware layer only executes it. A
+// window puts the radio on an AWDL channel from startUs for dwellMs: on the station's own channel nothing moves and only
+// the reception of other devices' frames is opened, anywhere else the firmware is asked for a remain-on-channel period.
+// While a window is open, the frames queued for its channel are sent and the AWDL frames heard are kept for the
+// interface. All times are host uptime in microseconds (mtkAwdlUptimeUs).
+// ---------------------------------------------------------------------------------------------------------------------
+struct MtkAwdlWindow {
+    uint8_t channel;        // primary channel; 20 MHz, unless it is the station's own channel
+    uint8_t reserved;
+    uint16_t dwellMs;       // how long the radio stays, from startUs
+    uint64_t startUs;       // when the window has to be open; 0 = as soon as possible
+};
+
+uint64_t mtkAwdlUptimeUs();
+// Allocates the radio's queues and its thread, and remembers awdl0's address. 0, or an errno.
+int mtkAwdlRadioStart(const uint8_t *address);
+// No more windows: the window in progress ends at its time and the radio goes back to the station's settings.
+void mtkAwdlRadioStop();
+// Replaces the next window. Called ahead of the window's start, at most one window ahead.
+int mtkAwdlRadioWindow(const MtkAwdlWindow *window);
+// Queues a complete 802.11 frame for the next window on `channel` (0: the next window, whatever its channel). A frame
+// not sent within maxAgeMs is dropped. ENOBUFS when the queue is full: the caller keeps the frame and asks again later.
+int mtkAwdlRadioQueue(const uint8_t *frame, uint32_t length, uint8_t channel, uint32_t maxAgeMs);
+// Free places in that queue.
+uint32_t mtkAwdlRadioRoom();
+// The station's channel while it is associated, else 0.
+uint8_t mtkAwdlRadioHomeChannel();
+// True when the radio may use `channel` (in the chip's channel list, not passive).
+bool mtkAwdlRadioChannelAllowed(uint8_t channel);
+// Counters for the driver log.
+void mtkAwdlRadioSummary(char *buffer, size_t length);
+// Windows, AWDL frames and other frames heard, by social channel (6, 44, 149, others).
+void mtkAwdlRadioChannels(char *buffer, size_t length);
+
+// Provided by the AWDL interface. Both are called on the main work loop with its command gate held, never with a lock
+// of the radio held, and must not wait.
+// Right before a frame leaves: stamps the fields that only hold at that moment (the synchronization parameters'
+// counters and the action header's transmit times).
+void mtkAwdlStampFrame(uint8_t *frame, uint32_t length, uint64_t nowUs);
+// One AWDL frame heard (an action frame or a data frame), 802.11 header first, no FCS. rssi is in dBm, 0 when the
+// hardware gave none. The bytes are only valid during the call.
+void mtkAwdlInput(const uint8_t *frame, uint32_t length, uint32_t channel, int32_t rssi, uint64_t timeUs);
+// Room was made in the frame queue after it had been full: the interface can hand over more.
+void mtkAwdlRadioRoomFreed();

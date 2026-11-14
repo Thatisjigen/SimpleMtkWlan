@@ -14,6 +14,7 @@
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
+#include <sys/errno.h>
 
 extern "C" void mtk_dbg_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -35,6 +36,18 @@ const size_t kAwdlElectionParamsLen = 0x38;
 const size_t kAwdlPeerTrafficRegLen = 0xb8;
 
 } // namespace
+
+class MtkAwdlInterface;
+// The AWDL engine, at the end of this file.
+static bool engineInit(MtkAwdlInterface *vif, const uint8_t *addr);
+static void engineEnable(bool on);
+static void engineSyncParams(const uint8_t *raw);
+static void engineChanSeq(const uint8_t *s);
+static void engineSyncState(uint32_t state, const uint8_t *master);
+static void engineTopMaster(const uint8_t *top);
+static void engineTemplate(const uint8_t *tlv, uint32_t len);
+static IOReturn engineOob(const uint8_t *r, bool autoReq);
+static void engineTraffic(bool active);
 
 // -----------------------------------------------------------------------------------------------------------------------
 // The virtual interface: IO80211VirtualInterface with the AWDL BSD name prefix.
@@ -112,7 +125,7 @@ public:
     /* 545 */ IOReturn setAWDL_ELECTION_RSSI_THRESHOLDS(apple80211_awdl_election_rssi_thresholds*a1) override { return awdlAccept("setAWDL_ELECTION_RSSI_THRESHOLDS"); }
     /* 546 */ IOReturn setAWDL_PRESENCE_MODE(apple80211_awdl_presence_mode*a1) override { return awdlAccept("setAWDL_PRESENCE_MODE"); }
     /* 547 */ IOReturn setPEER_CACHE_CONTROL(apple80211_peer_cache_control*a1) override { return awdlAccept("setPEER_CACHE_CONTROL"); }
-    /* 548 */ IOReturn setAWDL_OOB_REQUEST(apple80211_awdl_oob_request*a1) override { return awdlProto("setAWDL_OOB_REQUEST"); }
+    /* 548 */ IOReturn setAWDL_OOB_REQUEST(apple80211_awdl_oob_request*a1) override { awdlFirstCall("setAWDL_OOB_REQUEST"); return engineOob((const uint8_t *)a1, false); }
     /* 549 */ IOReturn setAWDL_SYNC_FRAME_TEMPLATE(apple80211_awdl_sync_frame_template*a1) override;
     /* 550 */ IOReturn setAWDL_ELECTION_PARAMS(apple80211_awdl_election_params*a1) override;
     /* 551 */ IOReturn setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_peer_traffic_registration*a1) override;
@@ -121,7 +134,7 @@ public:
     /* 554 */ IOReturn setAWDL_MIN_RATE(apple80211_awdl_min_rate*a1) override { return awdlAccept("setAWDL_MIN_RATE"); }
     /* 555 */ IOReturn setAWDL_ENCRYPTION_KEYS(apple80211_key*a1) override { return awdlAccept("setAWDL_ENCRYPTION_KEYS"); }
     /* 556 */ IOReturn setAWDL_ENCRYPTION_TYPE(apple80211_encrypt*a1) override { return awdlAccept("setAWDL_ENCRYPTION_TYPE"); }
-    /* 557 */ IOReturn setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request*a1) override { return awdlProto("setAWDL_OOB_AUTO_REQUEST"); }
+    /* 557 */ IOReturn setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request*a1) override { awdlFirstCall("setAWDL_OOB_AUTO_REQUEST"); return engineOob((const uint8_t *)a1, true); }
     /* 558 */ IOReturn setAWDL_TXCAL_PERIOD(apple80211_awdl_txcal_period*a1) override { return awdlAccept("setAWDL_TXCAL_PERIOD"); }
     /* 559 */ IOReturn setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add*a1) override { return awdlAccept("setAWDL_AWDL_ADVERTISERS"); }
     /* 560 */ IOReturn setAWDL_DFSP_CONFIG(apple80211_awdl_dfsp_config*a1) override { return awdlAccept("setAWDL_DFSP_CONFIG"); }
@@ -139,6 +152,12 @@ public:
     // AppleBCMWLANCore::createProxInterface fills it. Keeps the objects for the interface's lifetime.
     IOReturn registerAwdlInterface(const uint8_t *mac);
     void freeAwdlRegistration();
+    // The data path (end of this file).
+    uint32_t submitData(IOSkywalkPacket *const *packets, uint32_t count);
+    void serviceData();
+    void deliverData(const uint8_t *frame, uint32_t len);
+    void deliverMsdu(const uint8_t *da, const uint8_t *sa, const uint8_t *pl, uint32_t plen);
+    void enableData();
 
 private:
     bool awdlFirstCall(const char *name);      // true once per slot name: the first call of each slot is logged
@@ -166,11 +185,13 @@ private:
     bool awdlElectionParamsSet = false;
     IOSkywalkPacketBufferPool *awdlPool = nullptr;
     IOSkywalkPacketQueue *awdlQueues[3] = {};
+    bool awdlQueuesOnLoop = false;
 };
 
 #undef super
 #define super IO80211AWDLProtocol
 OSDefineMetaClassAndStructors(MtkAwdlInterface, IO80211AWDLProtocol)
+
 
 const char *MtkAwdlInterface::getBSDNamePrefix() { return "awdl"; }
 void MtkAwdlInterface::_unnamedPure490() {}
@@ -219,6 +240,8 @@ IOReturn MtkAwdlInterface::setAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *a1
     bool first = awdlFirstCall("setAWDL_SYNC_ENABLED");
     if ((first || enabled != awdlSyncEnabled) && awdlLogValue()) mtk_dbg_log("awdl: sync enabled %u\n", enabled);
     awdlSyncEnabled = enabled;
+    if (enabled) enableData();
+    engineEnable(enabled != 0);
     return kIOReturnSuccess;
 }
 
@@ -239,6 +262,7 @@ IOReturn MtkAwdlInterface::setAWDL_SYNC_PARAMS(apple80211_awdl_sync_params *a1)
     bool changed = !awdlSyncParamsSet || memcmp(awdlSyncParams, a1, kAwdlSyncParamsLen) != 0;
     memcpy(awdlSyncParams, a1, kAwdlSyncParamsLen);
     awdlSyncParamsSet = true;
+    engineSyncParams(awdlSyncParams);
     if (changed && awdlLogValue()) {
         const uint32_t *w = (const uint32_t *)awdlSyncParams;
         mtk_dbg_log("awdl: sync params %x %u %u %u %u %u\n", w[0], w[1], w[2], w[3], w[4], w[5]);
@@ -281,6 +305,7 @@ IOReturn MtkAwdlInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple80211_a
     bool changed = !awdlChanSeqSet || memcmp(awdlChanSeq, a1, kAwdlChanSeqLen) != 0;
     memcpy(awdlChanSeq, a1, kAwdlChanSeqLen);
     awdlChanSeqSet = true;
+    engineChanSeq(awdlChanSeq);
     if (changed && awdlLogValue()) {
         uint32_t n = awdlChanSeq[5] < 16 ? awdlChanSeq[5] : 16;
         char list[16 * 4 + 1];
@@ -350,6 +375,7 @@ IOReturn MtkAwdlInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state *a1)
     bool changed = !awdlSyncStateSet || memcmp(awdlSyncState, a1, kAwdlSyncStateLen) != 0;
     memcpy(awdlSyncState, a1, kAwdlSyncStateLen);
     awdlSyncStateSet = true;
+    engineSyncState(field<uint32_t>(awdlSyncState, 4), awdlSyncState + 8);
     if (changed && awdlLogValue()) {
         const uint8_t *m = awdlSyncState + 8;
         mtk_dbg_log("awdl: sync state %u master %02x:%02x:%02x:%02x:%02x:%02x\n", field<uint32_t>(awdlSyncState, 4),
@@ -376,6 +402,7 @@ IOReturn MtkAwdlInterface::setAWDL_ELECTION_PARAMS(apple80211_awdl_election_para
     bool changed = !awdlElectionParamsSet || memcmp(awdlElectionParams, a1, kAwdlElectionParamsLen) != 0;
     memcpy(awdlElectionParams, a1, kAwdlElectionParamsLen);
     awdlElectionParamsSet = true;
+    engineTopMaster(awdlElectionParams + 0x16);
     if (changed && awdlLogValue()) {
         const uint8_t *t = awdlElectionParams + 0x16;
         mtk_dbg_log("awdl: election top %02x:%02x:%02x:%02x:%02x:%02x metric %u self %u\n", t[0], t[1], t[2], t[3], t[4], t[5],
@@ -407,8 +434,10 @@ IOReturn MtkAwdlInterface::setAWDL_SYNC_FRAME_TEMPLATE(apple80211_awdl_sync_fram
 {
     if (!a1) return kIOReturnBadArgument;
     uint32_t len = field<uint32_t>(a1, 4);
+    const uint8_t *tlv = field<const uint8_t *>(a1, 8);
     if (len != awdlTemplateLen && awdlLogValue()) mtk_dbg_log("awdl: sync frame template %u bytes\n", len);
     awdlTemplateLen = len;
+    engineTemplate((uintptr_t)tlv >= 0xffffff8000000000ULL ? tlv : nullptr, len);
     return kIOReturnSuccess;
 }
 
@@ -427,6 +456,7 @@ IOReturn MtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_pee
         name[n] = 0;
         mtk_dbg_log("awdl: peer traffic %s active %u\n", name, field<uint32_t>(a1, 0xa8));
     }
+    engineTraffic(field<uint32_t>(a1, 0xa8) != 0);
     return kIOReturnSuccess;
 }
 
@@ -445,8 +475,12 @@ IOReturn MtkAwdlInterface::setCOMPANION_SKYWALK_IF_CREATE(apple80211_companion_s
 
 namespace {
 
-// The registration needs a queue set; the datapath arrives in phase 5, so the actions consume nothing yet.
-uint32_t awdlTxSubmissionAction(OSObject *, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *, uint32_t, void *) { return 0; }
+// awdl0's packets go to the radio (submitData); the completion queues are filled by the driver itself.
+uint32_t awdlTxSubmissionAction(OSObject *owner, IOSkywalkTxSubmissionQueue *, IOSkywalkPacket *const *packets, uint32_t count,
+                                void *)
+{
+    return owner ? ((MtkAwdlInterface *)owner)->submitData(packets, count) : 0;
+}
 uint32_t awdlTxCompletionAction(OSObject *, IOSkywalkTxCompletionQueue *, IOSkywalkPacket **, uint32_t, void *) { return 0; }
 uint32_t awdlRxCompletionAction(OSObject *, IOSkywalkRxCompletionQueue *, IOSkywalkPacket **, uint32_t, void *) { return 0; }
 
@@ -509,8 +543,18 @@ IOReturn MtkAwdlInterface::registerAwdlInterface(const uint8_t *mac)
 
     IOReturn rr = registerEthernetInterface((IOSkywalkEthernetInterface::RegistrationInfo *)info, awdlQueues, 3,
                                             awdlPool, awdlPool, 0);
-    if (rr != kIOReturnSuccess) freeAwdlRegistration();
-    return rr;
+    if (rr != kIOReturnSuccess) {
+        freeAwdlRegistration();
+        return rr;
+    }
+    // The queues are event sources: they run only on the interface's work queue (thanhnndev ca94db4).
+    IOWorkLoop *wq = (IOWorkLoop *)getWorkQueue();
+    uint32_t added = 0;
+    for (uint32_t i = 0; wq && i < 3; i++)
+        if (wq->addEventSource(awdlQueues[i]) == kIOReturnSuccess) added++;
+    awdlQueuesOnLoop = added == 3;
+    if (!engineInit(this, mac) || !awdlQueuesOnLoop) mtk_dbg_log("awdl: queues on the work queue %u/3\n", added);
+    return kIOReturnSuccess;
 }
 
 // -----------------------------------------------------------------------------------------------------------------------
@@ -573,6 +617,21 @@ extern void io80211SetAwdlInterface(IOService *controller, IO80211VirtualInterfa
 // One card, one interface. It lives as long as the controller: the Family holds it through setAwdlInterface.
 static MtkAwdlInterface *gAwdlVif;
 
+// wifip2pd takes an interface only when it can read its role from the registry: IO80211VirtualInterfaceRole for the
+// peer-to-peer ones, "AirLink" for AWDL (the key and the value IO80211SkywalkInterface::setInterfaceRole picks for role 6).
+// That function, which IO80211VirtualInterface::init calls, stores the property through IOService::SetProperties, which
+// ends in IORegistryEntry::setProperties: not implemented by this class, so the property never lands and wifip2pd drops
+// awdl0 ("Unable to find role for interface"). The infrastructure interface has the same gap (AirportItlwm puts its
+// IO80211InterfaceRole back after start). Written directly here, before the BSD interface is attached.
+static const char kAwdlRoleKey[] = "IO80211VirtualInterfaceRole";
+static const char kAwdlRoleValue[] = "AirLink";
+
+static bool awdlRoleSet(IOService *vif)
+{
+    OSString *role = OSDynamicCast(OSString, vif->getProperty(kAwdlRoleKey));
+    return role != nullptr && role->isEqualTo(kAwdlRoleValue);
+}
+
 IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedMac, const uint8_t *primaryMac,
                                 char *bsdName, size_t bsdNameLen)
 {
@@ -606,6 +665,8 @@ IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedM
         vif->release();
         return kIOReturnError;
     }
+    if (!awdlRoleSet(vif))
+        vif->setProperty(kAwdlRoleKey, kAwdlRoleValue);
     if (!vif->attach(controller)) {
         mtk_dbg_log("awdl: vif attach failed\n");
         vif->release();
@@ -629,9 +690,14 @@ IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedM
         return rr;
     }
 
+    if (!awdlRoleSet(vif)) {
+        vif->setProperty(kAwdlRoleKey, kAwdlRoleValue);
+        mtk_dbg_log("awdl: role property put back after start\n");
+    }
     vif->registerService(kIOServiceAsynchronous);
     vif->setRunningState(false);
     io80211SetAwdlInterface(controller, vif);
+    mtk_dbg_log("awdl: role %s=%s\n", kAwdlRoleKey, awdlRoleSet(vif) ? kAwdlRoleValue : "MISSING");
     gAwdlVif = vif;
     vif->deferBSDAttach(false);
 
@@ -640,5 +706,1248 @@ IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedM
     const char *n = vif->getBSDName();
     strlcpy(bsdName, (n && *n) ? n : "awdl0", bsdNameLen);
     mtk_dbg_log("awdl: vif up bsd=%s\n", bsdName);
+    return kIOReturnSuccess;
+}
+
+// -----------------------------------------------------------------------------------------------------------------------
+// The AWDL engine: the timeline, the presence schedule, the synchronization and master indication frames, the frames
+// heard, and the data path of awdl0. The Family runs the election and builds the TLVs; on Apple hardware the firmware
+// does the rest, and here this code does it, with the radio of the hardware layer (MtkAwdl.h).
+//
+// Time. An availability window (AW) is 16 TU, four AWs make an extended window (EAW, 64 TU), which takes one of the 16
+// entries of the channel sequence. AW number `tlBaseSeq` starts at host uptime `tlBaseUs`. As a master the clock runs
+// free; as a slave it follows the master's synchronization parameters TLV (type 4): +1 the TU to the sender's next EAW,
+// +29 the AW running when the frame was built (thanhnndev, mt7925-macos-wifi 45ac9bf, 62afa98).
+//
+// Events. At the start of every EAW the Family's own sequence names a channel for, the Family gets
+// APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START (0x29); its timeline monitor, election checks and frame cadence run off
+// them. Before the next one, the end of the previous one (0x2b), on which the Family runs its master election
+// (thanhnndev 45ac9bf, 67fe911; the layouts are read from the Family's own handlers).
+//
+// Presence. The radio is where the schedule in our frames says it is, and nowhere else: TLV 4 and TLV 18 advertise
+// exactly the EAWs the radio will spend on an AWDL channel, and 00 00 for the EAWs left to the access point. Off the
+// access point's channel a run is at most 2 EAWs, followed by at least 2 EAWs at home; with nobody heard for 30 s the
+// radio visits one EAW per sequence (about 6% of the time away; thanhnndev 95c9a84: 47% away killed the link).
+//
+// Stillness. The Family keeps AWDL enabled for the whole boot and at rest still asks for 3 EAWs per sequence on AWDL
+// channels (52 0 149 0 0 0 0 0 6 0 149 0 0 0 0 0 with the access point on 52). Apple's firmware makes those visits on its
+// own; here each one is firmware commands and interrupts, and the timer runs every EAW. After kStillUs with no peer, no
+// data and no request, the timeline stops posting windows and the radio goes back to the station (reception closed,
+// OMAC 1 off), as with awdl0 down. A sequence of the Family denser than its idle pattern (a browse or an advertisement:
+// AirDrop and AirPlay both start with one), a template of a new length (AirDrop's services), a frame or traffic request,
+// or a packet of awdl0 starts it again from the next EAW.
+//
+// Threads. The Family's setters, the timer (the controller's work loop), the radio's stamp (radio thread, main gate) and
+// the receive path (main work loop) share the state below under `lock`, a leaf: nothing is called with it held.
+// -----------------------------------------------------------------------------------------------------------------------
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOWorkLoop.h>
+#include <libkern/OSByteOrder.h>
+
+extern "C" IOReturn mtkAwdlFamilyPostMessage(IO80211Controller *, IO80211SkywalkInterface *, uint32_t, void *, unsigned long,
+                                            bool) __asm__("__ZN17IO80211Controller11postMessageEP23IO80211SkywalkInterfacejPvmb");
+extern "C" void *mtkAwdlFamilyMgmtPool(IO80211Controller *) __asm__("__ZN17IO80211Controller16getMgmtFramePoolEv");
+// Consumes the buffer on every path: the Family returns it to its pool, or hands it to the peer manager.
+extern "C" void mtkAwdlFamilyTapInput(IO80211VirtualInterface *, void *, unsigned int, void *, unsigned long)
+    __asm__("__ZN23IO80211VirtualInterface11bpfTapInputEP13IO80211BufferjPvm");
+
+namespace {
+
+const uint32_t kTuUs = 1024, kAwUs = 16 * kTuUs, kAwPerEaw = 4, kEawUs = kAwUs * kAwPerEaw;
+const uint32_t kTlvMax = 1400, kFrameMax = 1600, kPeers = 8;
+// A peer heard or a packet of awdl0 keeps the denser schedule this long: AirDrop's Bonjour traffic on awdl0 comes in
+// bursts several seconds apart while a sender is near.
+const uint64_t kActiveUs = 30000000, kPeerStaleUs = 8000000;
+// With nothing of that, and nothing the Family asks for, for this long the timeline stops and the radio stays with the
+// station, as with awdl0 down (see noteActivity()).
+const uint64_t kStillUs = 60000000;
+const uint8_t kBssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+// What ended a still period, for the driver log.
+enum : uint8_t { kWakeNone, kWakeSeq, kWakeTemplate, kWakeFrame, kWakeTraffic, kWakeData };
+const char *const kWakeWhy[] = { "", "the Family's channel sequence", "a new sync frame template", "a frame request",
+                                 "a traffic registration", "a packet of awdl0" };
+const uint32_t kMsgAwStart = 0x29, kMsgAwEnd = 0x2b, kTapActionFrame = 0xc;
+
+// apple80211_availability_window_start (0x24 bytes) and _end (0x28), as AppleBCMWLANProximityInterface builds them and
+// IO80211AWDLPeerManager reads them (thanhnndev 45ac9bf, 67fe911).
+struct AwStart {
+    uint32_t seq, role;
+    uint8_t master[6], topMaster[6];
+    uint32_t startUsBe, chVersion, channel, chFlags;
+};
+static_assert(sizeof(AwStart) == 0x24, "availability window start");
+struct AwEnd {
+    uint32_t channel, timeUs, b8, wc;
+    uint8_t stats[0x18];
+};
+static_assert(sizeof(AwEnd) == 0x28, "availability window end");
+
+// The receive descriptor bpfTapInput(buf, 0xc, &hdr, 0x48) wants beside an action frame: actionFrameInput takes exactly
+// 0x48 bytes (isValidAF refuses anything shorter). +0 the sender, +0xc an apple80211_channel, +0x2c the RSSI in dBm (a peer
+// is created only at or above the edge threshold, and 0 reads as unreachable), +0x30 the receive time.
+struct ActFrmHdr {
+    uint8_t sa[6], rsvd0[6];
+    uint32_t chVersion, channel, chFlags;
+    uint8_t rsvd1[0x10];
+    uint32_t rate;
+    int32_t rssi;
+    uint32_t rxTime;
+    uint8_t rsvd2[0x14];
+};
+static_assert(sizeof(ActFrmHdr) == 0x48, "action frame receive descriptor");
+
+struct Peer {
+    uint8_t addr[6];
+    bool valid;
+    uint8_t n;               // entries in its channel sequence
+    uint8_t ch[16];          // primary channel of each entry, 0 = absent
+    uint64_t baseUs;         // start of an EAW of its timeline
+    uint16_t baseSeq;        // and its AW number
+    uint64_t lastUs;
+    uint8_t masterIs;        // the master its synchronization parameters name: 1 itself, 2 us, 3 another device
+    uint32_t heard, logged;  // frames heard from it, and when it was last logged
+};
+
+struct RxDup { uint8_t sa[6]; uint16_t sc; bool valid; };
+
+struct Engine {
+    IOLock *lock;
+    MtkAwdlInterface *vif;
+    IOTimerEventSource *tlTimer, *dpTimer;
+    IOWorkLoop *wl;
+    uint8_t addr[6];
+    bool enabled, radioOn;
+    // timeline
+    bool tlRunning;
+    uint64_t tlBaseUs;
+    uint16_t tlBaseSeq;
+    int32_t lastPostedAw;
+    bool endPending;
+    uint8_t endCh;
+    uint64_t endUs, plannedUntilUs;
+    // the election's result
+    uint32_t familyState, role;
+    uint8_t master[6], topMaster[6];
+    uint64_t masterHeardUs;
+    // the Family's channel sequence, and the channel chosen from it
+    uint8_t famCh[16];
+    bool famSet;
+    uint8_t awdlCh, pres[16];
+    uint32_t discoIdx;              // the social channel a discovery schedule starts from, moved every sequence
+    uint8_t peerCh;                 // where the last AWDL frame of another device was heard
+    uint8_t follow[6];              // a device that names itself master while the Family keeps us master
+    int32_t lastRssi;               // of the last AWDL frame heard, as handed to the Family
+    uint64_t followUs;
+    uint32_t afPeriodTu;
+    // the Family's TLVs
+    uint8_t psf[kTlvMax], mi[kTlvMax], once[kTlvMax];
+    uint32_t psfLen, miLen, onceLen;
+    uint8_t onceDa[6];
+    uint16_t seqNo, dataSeq;
+    Peer peers[kPeers];
+    uint64_t peerHeardUs, dataUs;
+    RxDup dup[8];
+    uint32_t dupNext;
+    // data path
+    bool dpOn, txBlocked;
+    IOSkywalkPacket *txDone[64];
+    uint32_t txDoneN;
+    // nothing uses AWDL: the timeline posts nothing and the radio stays with the station until wakeReq is set
+    bool still, famBusy;
+    uint8_t wakeReq;
+    uint64_t actUs, stillUs;        // the last request of the Family or the stack; when the still period began
+    // counters
+    uint32_t eaws, posted, postFail, ended, late, syncs, frames, framesFail, windows;
+    uint32_t rxAf, rxAfFail, rxNoRssi, rxData, rxDataUp, rxDataFail, rxDup, rxNotUs;
+    uint32_t txIn, txQueued, txFull, txBad, txEarly, rxAmsdu, rxSub, stills, stillS;
+    uint64_t logUs;
+};
+Engine gE;
+uint8_t gTxScratch[kFrameMax];       // timer thread only
+uint8_t gTxScratch2[kFrameMax];
+uint8_t gDataTx[kFrameMax];          // data submission (work loop) only
+
+inline uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+inline void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+inline void wr32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+inline bool isZero6(const uint8_t *a) { return !(a[0] | a[1] | a[2] | a[3] | a[4] | a[5]); }
+
+// A 20 MHz channel without radar duty, as the radio accepts it (mwx_awdl_channel_ok).
+bool usableCh(uint32_t ch)
+{
+    return (ch >= 1 && ch <= 13) || (ch >= 36 && ch <= 48 && !(ch % 4)) || (ch >= 149 && ch <= 165 && (ch % 4) == 1);
+}
+
+uint8_t opClass(uint8_t ch)
+{
+    if (ch >= 1 && ch <= 13) return 81;
+    if (ch >= 36 && ch <= 48) return 115;
+    if (ch >= 149 && ch <= 161) return 124;
+    if (ch == 165) return 125;
+    return 0;
+}
+
+uint32_t chFlags(uint32_t ch) { return (ch <= 14 ? 0x8u : 0x10u) | 0x2u; }   // band | 20 MHz
+
+// Where AW number `aw` starts on the current timeline. Lock held.
+uint64_t awStartUs(uint16_t aw)
+{
+    return gE.tlBaseUs + (uint64_t)((int64_t)(int16_t)(uint16_t)(aw - gE.tlBaseSeq) * (int64_t)kAwUs);
+}
+
+// The AW running at `now` and its start. Lock held.
+uint16_t awAt(uint64_t now, uint64_t *start)
+{
+    int64_t el = (int64_t)(now - gE.tlBaseUs);
+    int64_t n = el >= 0 ? el / kAwUs : -((-el + kAwUs - 1) / kAwUs);
+    if (start) *start = gE.tlBaseUs + (uint64_t)(n * (int64_t)kAwUs);
+    return (uint16_t)(gE.tlBaseSeq + n);
+}
+
+// The AWDL channel: the one filling most of the Family's sequence among those the radio can use; 44, then 6, otherwise.
+// Lock held.
+void chooseChannel()
+{
+    uint8_t best = 0;
+    uint32_t bestN = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        uint8_t c = gE.famCh[i];
+        if (!usableCh(c) || !mtkAwdlRadioChannelAllowed(c)) continue;
+        uint32_t n = 0;
+        for (uint32_t j = 0; j < 16; j++) n += gE.famCh[j] == c;
+        if (n > bestN || (n == bestN && c > 14 && best <= 14)) { best = c; bestN = n; }
+    }
+    if (!best) best = mtkAwdlRadioChannelAllowed(44) ? 44 : 6;
+    if (best != gE.awdlCh) {
+        mtk_dbg_log("awdl: channel %u (from the Family's sequence: %u of 16 slots)\n", best, bestN);
+        gE.awdlCh = best;
+    }
+}
+
+// AWDL's social channels, where devices look for each other until they synchronize: 6, and 149 in the US or 44 in
+// Europe and most other countries. The Family picks its 5 GHz channel from the country the driver reports, which is the
+// world domain until the access point's Country element has been read, so the channel it picked may not be the one the
+// devices around use. Until a peer is heard the schedule visits all of them in turn: the Family's channel first, then 44,
+// 6 and 149, those the radio accepts. Lock held.
+uint32_t socialChannels(uint8_t *out)
+{
+    const uint8_t cand[4] = { gE.awdlCh, 44, 6, 149 };
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        uint8_t c = cand[i];
+        bool dup = false;
+        for (uint32_t j = 0; j < n; j++) dup = dup || out[j] == c;
+        if (c && !dup && usableCh(c) && mtkAwdlRadioChannelAllowed(c)) out[n++] = c;
+    }
+    return n;
+}
+
+const Peer *findPeer(const uint8_t *a)
+{
+    for (const Peer &p : gE.peers)
+        if (p.valid && !memcmp(p.addr, a, 6)) return &p;
+    return nullptr;
+}
+
+// The Family or the stack asked for AWDL: the timeline keeps running, or runs again from the next EAW. Lock held; true
+// when the caller has to kick the timeline (kickTimeline(), outside the lock) to end a still period.
+bool noteActivity(uint64_t now, uint8_t why)
+{
+    gE.actUs = now;
+    if (!gE.still || gE.wakeReq) return false;
+    gE.wakeReq = why;
+    return true;
+}
+
+void kickTimeline()
+{
+    if (gE.tlTimer) gE.tlTimer->setTimeoutUS(1);
+}
+
+// Nothing used AWDL for kStillUs: no peer heard, no data either way, no request of the Family or the stack, the Family's
+// sequence back to its idle pattern and no frame waiting to go out. Lock held.
+bool quietFor(uint64_t now)
+{
+    uint64_t last = gE.actUs;
+    if (gE.peerHeardUs > last) last = gE.peerHeardUs;
+    if (gE.dataUs > last) last = gE.dataUs;
+    return !gE.famBusy && !gE.onceLen && last < now && now - last > kStillUs;
+}
+
+// The schedule for the next 16 EAWs (see the top). Lock held.
+void buildPresence(uint64_t now)
+{
+    uint8_t ch = gE.awdlCh, home = mtkAwdlRadioHomeChannel();
+    uint8_t cand[16] = {};
+    bool active = (gE.peerHeardUs && now - gE.peerHeardUs < kActiveUs) || (gE.dataUs && now - gE.dataUs < kActiveUs) ||
+                  (gE.actUs && now - gE.actUs < kActiveUs) || gE.famBusy;
+    bzero(gE.pres, sizeof(gE.pres));
+    if (!ch) return;
+    if (home && home == ch) {
+        // The access point is on the AWDL channel: being there costs nothing, as long as the Family's sequence uses it.
+        for (uint32_t i = 0; i < 16; i++) gE.pres[i] = (!gE.famSet || gE.famCh[i] == ch) ? ch : 0;
+        return;
+    }
+    uint8_t soc[4];
+    uint32_t nsoc = socialChannels(soc);
+    if (!active) {
+        // Nobody around: one EAW in 16, on each social channel in turn.
+        gE.pres[0] = nsoc ? soc[gE.discoIdx++ % nsoc] : ch;
+        return;
+    }
+    const Peer *m = gE.role == 2 ? findPeer(gE.master) : nullptr;
+    if (!m && gE.followUs && now - gE.followUs < kPeerStaleUs) m = findPeer(gE.follow);
+    if (m && m->n && now - m->lastUs < kPeerStaleUs) {
+        // Synchronized to the master: its present EAWs are ours, its empty ones are our time at home.
+        for (uint32_t i = 0; i < 16; i++) {
+            uint8_t c = m->ch[i % m->n];
+            cand[i] = (usableCh(c) && mtkAwdlRadioChannelAllowed(c)) ? c : 0;
+        }
+    } else if (gE.peerCh && gE.peerHeardUs && now - gE.peerHeardUs < kActiveUs && mtkAwdlRadioChannelAllowed(gE.peerCh)) {
+        // A device was heard: stay on its channel in every EAW the time away from home allows, and stop turning, so the
+        // schedule we advertise holds still and the device finds us there (rotating left it 2 EAWs in 16 on its
+        // channel: the peer came and went every second and unicast frames went unanswered).
+        for (uint32_t i = 0; i < 16; i++) cand[i] = gE.peerCh;
+    } else {
+        // Looking for peers: two EAWs on each social channel in turn, two at home in between.
+        for (uint32_t i = 0; i < 16; i++)
+            cand[i] = ((i / 2) % 2) == 0 ? (nsoc ? soc[(gE.discoIdx + i / 4) % nsoc] : ch) : 0;
+        gE.discoIdx++;
+    }
+    // At most 2 EAWs away in a row, then at least 2 at home; never two different AWDL channels back to back. While data
+    // flows with a device we follow (a transfer), 3 away and 1 at home: the transfer gets three quarters of the time
+    // and the access point still hears us every 4 EAWs; back to half as soon as the data stops for 2 s.
+    bool bulk = m && m->n && now - m->lastUs < kPeerStaleUs && gE.dataUs && now - gE.dataUs < 2000000;
+    uint32_t maxRun = bulk ? 3 : 2, minRest = bulk ? 1 : 2;
+    uint32_t run = 0, rest = minRest;
+    uint8_t prev = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        uint8_t c = cand[i];
+        if (c && c == home) { gE.pres[i] = c; run = 0; rest = minRest; prev = 0; continue; }
+        if (c && run > 0 && run < maxRun && c == prev) { gE.pres[i] = c; run++; continue; }
+        if (c && run == 0 && rest >= minRest) { gE.pres[i] = c; run = 1; rest = 0; prev = c; continue; }
+        run = 0;
+        prev = 0;
+        rest++;
+    }
+    // The sequence repeats: after a run at its end, slots 0 and 1 stay at home.
+    if (gE.pres[15] && gE.pres[15] != home) {
+        if (gE.pres[0] != home) gE.pres[0] = 0;
+        if (gE.pres[1] != home) gE.pres[1] = 0;
+    }
+}
+
+// TLV 4, the synchronization parameters (73 value bytes; thanhnndev d4b9008, seemoo-lab owl's layout). The counters at
+// +1, +15 and +29 are written again by stampFrame() right before the frame leaves. Lock held.
+uint32_t buildSyncTlv(uint8_t *out, uint8_t txCh)
+{
+    const uint32_t vlen = 39 + 16 * 2 + 2;
+    uint8_t *v = out + 3;
+    bzero(out, 3 + vlen);
+    out[0] = 4;
+    wr16(out + 1, (uint16_t)vlen);
+    v[0] = txCh;
+    v[3] = gE.awdlCh;
+    wr16(v + 5, 16);                                    // AW period (TU)
+    wr16(v + 7, (uint16_t)(gE.afPeriodTu ? gE.afPeriodTu : 110));   // action frame period (TU)
+    wr16(v + 9, 0x1800);                                // AWDL flags
+    wr16(v + 11, 16);                                   // AW extension length
+    wr16(v + 13, 16);                                   // AW common length
+    v[17] = 3; v[18] = 3; v[19] = 3; v[20] = 3;         // extension counts
+    memcpy(v + 21, gE.role == 2 && !isZero6(gE.master) ? gE.master : gE.addr, 6);
+    v[27] = (uint8_t)kAwPerEaw;                         // presence mode
+    v[33] = 15;                                         // 16 entries
+    v[34] = 3;                                          // encoding: channel, operating class
+    v[36] = 3;                                          // step count: an entry lasts 4 AWs
+    v[37] = 0xff; v[38] = 0xff;                         // no fill channel
+    for (uint32_t i = 0; i < 16; i++) {
+        v[39 + 2 * i] = gE.pres[i];
+        v[40 + 2 * i] = gE.pres[i] ? opClass(gE.pres[i]) : 0;
+    }
+    return 3 + vlen;
+}
+
+// TLV 18, the channel sequence, the same 16 entries (41 value bytes, as peers send it). Lock held.
+uint32_t buildSeqTlv(uint8_t *out)
+{
+    const uint32_t vlen = 6 + 32 + 3;
+    bzero(out, 3 + vlen);
+    out[0] = 18;
+    wr16(out + 1, (uint16_t)vlen);
+    uint8_t *v = out + 3;
+    v[0] = 15; v[1] = 3; v[2] = 0; v[3] = 3; v[4] = 0xff; v[5] = 0xff;
+    for (uint32_t i = 0; i < 16; i++) {
+        v[6 + 2 * i] = gE.pres[i];
+        v[7 + 2 * i] = gE.pres[i] ? opClass(gE.pres[i]) : 0;
+    }
+    return 3 + vlen;
+}
+
+// One action frame: the 802.11 header, the 16-byte AWDL action header (category 0x7f, Apple's OUI, type 8, version
+// 1.0, the subtype: 0 PSF, 3 master indication), our TLV 4 and TLV 18, then the Family's TLVs without theirs. 0 when it
+// does not fit. Lock held.
+uint32_t buildFrame(uint8_t *out, uint32_t cap, uint8_t subtype, const uint8_t *da, const uint8_t *tlv, uint32_t tlvLen,
+                    uint8_t txCh)
+{
+    uint8_t t4[3 + 73], t18[3 + 41];
+    uint32_t l4 = buildSyncTlv(t4, txCh), l18 = buildSeqTlv(t18), pos = 40;
+    if (pos + l4 + l18 > cap) return 0;
+    bzero(out, 40);
+    out[0] = 0xd0;
+    memcpy(out + 4, da, 6);
+    memcpy(out + 10, gE.addr, 6);
+    memcpy(out + 16, kBssid, 6);
+    wr16(out + 22, (uint16_t)((gE.seqNo++ & 0xfff) << 4));
+    out[24] = 0x7f; out[25] = 0x00; out[26] = 0x17; out[27] = 0xf2; out[28] = 0x08; out[29] = 0x10; out[30] = subtype;
+    memcpy(out + pos, t4, l4); pos += l4;
+    memcpy(out + pos, t18, l18); pos += l18;
+    for (uint32_t off = 0; off + 3 <= tlvLen;) {
+        uint32_t l = rd16(tlv + off + 1);
+        if (off + 3 + l > tlvLen) break;
+        if (tlv[off] != 4 && tlv[off] != 18) {
+            if (pos + 3 + l > cap) return 0;
+            memcpy(out + pos, tlv + off, 3 + l);
+            pos += 3 + l;
+        }
+        off += 3 + l;
+    }
+    return pos;
+}
+
+void armTimer(uint64_t now)
+{
+    if (!gE.tlTimer) return;
+    uint64_t at;
+    IOLockLock(gE.lock);
+    bool run = gE.enabled && gE.tlRunning && !gE.still;
+    uint64_t s = 0;
+    uint16_t aw = awAt(now, &s);
+    uint32_t k = 1;
+    while (((uint16_t)(aw + k) % kAwPerEaw) != 0) k++;
+    at = s + (uint64_t)k * kAwUs;
+    IOLockUnlock(gE.lock);
+    if (!run) return;
+    uint64_t d = at > now ? at - now : 200;
+    if (d < 200) d = 200;
+    gE.tlTimer->setTimeoutUS((uint32_t)d + 100);       // just inside the EAW
+}
+
+void postEvents(bool end, const AwEnd &ee, bool start, AwStart &ev)
+{
+    MtkAwdlInterface *vif = gE.vif;
+    IO80211Controller *ctl = vif ? vif->getController() : nullptr;
+    if (!ctl) return;
+    if (end) {
+        AwEnd e = ee;
+        if (mtkAwdlFamilyPostMessage(ctl, vif, kMsgAwEnd, &e, sizeof(e), true) == kIOReturnSuccess) gE.ended++;
+    }
+    if (start) {
+        IOReturn r = mtkAwdlFamilyPostMessage(ctl, vif, kMsgAwStart, &ev, sizeof(ev), true);
+        if (r == kIOReturnSuccess) gE.posted++;
+        else if (++gE.postFail <= 4) mtk_dbg_log("awdl: AW start event refused 0x%x\n", r);
+    }
+}
+
+void logState(uint64_t now)
+{
+    if (gE.logUs && now - gE.logUs < 30000000ULL) return;
+    gE.logUs = now;
+    char radio[480];
+    char pres[17];
+    for (uint32_t i = 0; i < 16; i++) {
+        uint8_t c = gE.pres[i];
+        pres[i] = !c ? '.' : c == 6 ? 'a' : c == 44 ? 'b' : c == 149 ? 'c' : c == mtkAwdlRadioHomeChannel() ? 'h' : 'x';
+    }
+    pres[16] = 0;
+    mtkAwdlRadioSummary(radio, sizeof(radio));
+    // pres: one character per EAW, a = 6, b = 44, c = 149, h = the access point's channel, x = another, . = at home
+    mtk_dbg_log("awdl: tl role=%u ch=%u pres=%s eaws=%u posted=%u/%u end=%u late=%u syncs=%u "
+                "frames=%u/%u rx af=%u/%u norssi=%u data=%u/%u/%u amsdu=%u/%u dup=%u notus=%u tx in=%u q=%u full=%u bad=%u "
+                "early=%u still=%u/%us\n",
+                gE.role, gE.awdlCh, pres, gE.eaws, gE.posted, gE.postFail, gE.ended, gE.late, gE.syncs,
+                gE.frames, gE.framesFail, gE.rxAf, gE.rxAfFail, gE.rxNoRssi, gE.rxData, gE.rxDataUp, gE.rxDataFail,
+                gE.rxAmsdu, gE.rxSub, gE.rxDup,
+                gE.rxNotUs, gE.txIn, gE.txQueued, gE.txFull, gE.txBad, gE.txEarly, gE.stills, gE.stillS);
+    mtk_dbg_log("awdl: radio %s\n", radio);
+    mtkAwdlRadioChannels(radio, sizeof(radio));
+    mtk_dbg_log("awdl: radio %s\n", radio);
+}
+
+// One EAW boundary of the timeline. Controller work loop.
+void tlTick()
+{
+    uint64_t now = mtkAwdlUptimeUs();
+    AwStart ev;
+    AwEnd ee;
+    MtkAwdlWindow w;
+    bool doEnd = false, doStart = false, doWin = false;
+    uint32_t l1 = 0, l2 = 0;
+    uint8_t curCh = 0;
+
+    bzero(&ev, sizeof(ev));
+    bzero(&ee, sizeof(ee));
+    bzero(&w, sizeof(w));
+    IOLockLock(gE.lock);
+    if (!gE.enabled || !gE.tlRunning) {
+        IOLockUnlock(gE.lock);
+        return;
+    }
+    if (gE.still) {
+        // Only a request ends a still period (noteActivity() kicks the timer); a stray firing changes nothing. The
+        // schedule is planned again for what woke it, and the next EAW boundary carries on as usual.
+        uint8_t why = gE.wakeReq;
+        if (why == kWakeNone) {
+            IOLockUnlock(gE.lock);
+            return;
+        }
+        uint32_t secs = (uint32_t)((now - gE.stillUs) / 1000000);
+        gE.still = false;
+        gE.wakeReq = kWakeNone;
+        gE.stillS += secs;
+        gE.endPending = false;
+        gE.plannedUntilUs = 0;
+        chooseChannel();
+        buildPresence(now);
+        IOLockUnlock(gE.lock);
+        int rv = mtkAwdlRadioStart(gE.addr);
+        gE.radioOn = rv == 0;
+        if (gE.txBlocked && gE.dpTimer) gE.dpTimer->setTimeoutMS(5);     // the packets that woke it
+        mtk_dbg_log("awdl: awake after %u s still: %s%s\n", secs, why < sizeof(kWakeWhy) / sizeof(kWakeWhy[0]) ?
+                    kWakeWhy[why] : "?", rv ? ", but the radio did not start" : "");
+        armTimer(now);
+        return;
+    }
+    uint64_t awS = 0;
+    uint16_t aw = awAt(now, &awS);
+    if ((aw % kAwPerEaw) != 0 || now - awS > kAwUs / 2 || gE.lastPostedAw == (int32_t)aw) {
+        if ((aw % kAwPerEaw) != 0 || now - awS > kAwUs / 2) gE.late++;
+        IOLockUnlock(gE.lock);
+        armTimer(now);
+        return;
+    }
+    gE.lastPostedAw = aw;
+    gE.eaws++;
+    uint32_t slot = ((uint32_t)aw / kAwPerEaw) & 15;
+    uint8_t fam = gE.famSet ? gE.famCh[slot] : gE.awdlCh;
+    curCh = gE.pres[slot];                      // this EAW, as its window was planned
+    if (slot == 15) {                           // the schedule changes only from one sequence to the next
+        chooseChannel();
+        buildPresence(now);
+    }
+    if (gE.famBusy) gE.actUs = now;             // the Family asks for more than its idle presence
+    if (quietFor(now)) {
+        // Close the window the Family was told about, post no new one, give the radio back to the station and leave
+        // the timer off until a request comes.
+        if (gE.endPending) {
+            doEnd = true;
+            ee.channel = gE.endCh;
+            ee.timeUs = (uint32_t)gE.endUs;
+        }
+        gE.endPending = false;
+        gE.still = true;
+        gE.wakeReq = kWakeNone;
+        gE.stillUs = now;
+        gE.stills++;
+        IOLockUnlock(gE.lock);
+        postEvents(doEnd, ee, false, ev);
+        mtkAwdlRadioStop();
+        gE.radioOn = false;
+        mtk_dbg_log("awdl: still: no AWDL use for %u s\n", (uint32_t)(kStillUs / 1000000));
+        gE.logUs = 0;
+        logState(now);
+        return;
+    }
+    if (fam && gE.endPending) {
+        doEnd = true;
+        gE.endPending = false;
+        ee.channel = gE.endCh;
+        ee.timeUs = (uint32_t)gE.endUs;
+    }
+    if (fam) {
+        doStart = true;
+        gE.endPending = true;
+        gE.endCh = fam;
+        gE.endUs = awS + kAwUs;
+        ev.seq = aw;
+        ev.role = gE.familyState;
+        memcpy(ev.master, gE.role == 2 && !isZero6(gE.master) ? gE.master : gE.addr, 6);
+        memcpy(ev.topMaster, !isZero6(gE.topMaster) ? gE.topMaster : ev.master, 6);
+        ev.startUsBe = OSSwapHostToBigInt32((uint32_t)awS);
+        ev.chVersion = 1;
+        ev.channel = fam;
+        ev.chFlags = chFlags(fam);
+    }
+    // The radio's next window, one EAW ahead, covering a run of present EAWs on one channel.
+    uint32_t ns = (slot + 1) & 15;
+    uint64_t nextStart = awS + kEawUs;
+    uint8_t nch = gE.pres[ns];
+    if (nch && nextStart >= gE.plannedUntilUs) {
+        uint32_t run = 1;
+        while (run < 3 && gE.pres[(ns + run) & 15] == nch) run++;
+        w.channel = nch;
+        w.dwellMs = (uint16_t)(run * kEawUs / 1000 - 2);
+        w.startUs = nextStart;
+        gE.plannedUntilUs = nextStart + (uint64_t)run * kEawUs;
+        doWin = true;
+    }
+    // In a present EAW, our frames go out at its start: the PSF, then the master indication, or a one-shot request.
+    if (curCh) {
+        static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+        if (gE.psfLen) l1 = buildFrame(gTxScratch, sizeof(gTxScratch), 0, bcast, gE.psf, gE.psfLen, curCh);
+        if (gE.onceLen) {
+            l2 = buildFrame(gTxScratch2, sizeof(gTxScratch2), 3, gE.onceDa, gE.once, gE.onceLen, curCh);
+            gE.onceLen = 0;
+        } else if (gE.miLen) {
+            l2 = buildFrame(gTxScratch2, sizeof(gTxScratch2), 3, bcast, gE.mi, gE.miLen, curCh);
+        }
+    }
+    IOLockUnlock(gE.lock);
+
+    postEvents(doEnd, ee, doStart, ev);
+    if (doWin && mtkAwdlRadioWindow(&w) == 0) gE.windows++;
+    if (l1) { if (mtkAwdlRadioQueue(gTxScratch, l1, curCh, 40) == 0) gE.frames++; else gE.framesFail++; }
+    if (l2) { if (mtkAwdlRadioQueue(gTxScratch2, l2, curCh, 40) == 0) gE.frames++; else gE.framesFail++; }
+    if (gE.eaws <= 2 || (gE.eaws % 64) == 0) logState(now);
+    armTimer(mtkAwdlUptimeUs());
+}
+
+void tlTimerFired(OSObject *, IOTimerEventSource *) { tlTick(); }
+
+// The master's TLV 4 gives its timeline: re-align ours as its slave (thanhnndev 62afa98, 44d5bd2). Lock held.
+void trackPeer(const uint8_t *sa, const uint8_t *body, uint32_t bodyLen, uint64_t rxUs)
+{
+    const uint8_t *v = nullptr;
+    uint32_t vl = 0;
+    for (uint32_t pos = 16; pos + 3 <= bodyLen;) {
+        uint32_t l = rd16(body + pos + 1);
+        if (pos + 3 + l > bodyLen) return;
+        if (body[pos] == 4 && l >= 40) { v = body + pos + 3; vl = l; break; }
+        pos += 3 + l;
+    }
+    if (!v) return;
+    uint32_t pm = (v[27] >= 1 && v[27] <= 16) ? v[27] : kAwPerEaw;
+    uint32_t phyTx = (uint32_t)body[8] | ((uint32_t)body[9] << 8) | ((uint32_t)body[10] << 16) | ((uint32_t)body[11] << 24);
+    uint32_t tgtTx = (uint32_t)body[12] | ((uint32_t)body[13] << 8) | ((uint32_t)body[14] << 16) | ((uint32_t)body[15] << 24);
+    uint32_t late = phyTx - tgtTx;
+    if (late > 50000) late = 0;
+    uint32_t dc = rd16(v + 1);
+    uint16_t sn = rd16(v + 29);
+    if (dc > 16 * pm + 16 || pm != kAwPerEaw) return;
+    uint64_t base = rxUs + (uint64_t)dc * kTuUs - late;
+    uint16_t seq = (uint16_t)(sn - (sn % pm) + pm);
+    // its channel sequence: +33 count - 1, +34 encoding, +39 the entries
+    uint32_t n = (uint32_t)v[33] + 1, enc = v[34], esz = enc == 0 ? 1 : 2;
+    Peer *p = nullptr;
+    for (Peer &q : gE.peers) if (q.valid && !memcmp(q.addr, sa, 6)) { p = &q; break; }
+    if (!p) {
+        p = &gE.peers[0];
+        for (Peer &q : gE.peers) {
+            if (!q.valid) { p = &q; break; }
+            if (q.lastUs < p->lastUs) p = &q;
+        }
+        bzero(p, sizeof(*p));
+        memcpy(p->addr, sa, 6);
+    }
+    p->valid = true;
+    p->baseUs = base;
+    p->baseSeq = seq;
+    p->lastUs = rxUs;
+    if (n <= 16 && 39 + n * esz <= vl) {
+        p->n = (uint8_t)n;
+        for (uint32_t i = 0; i < 16; i++) {
+            uint8_t c = 0;
+            if (i < n) {
+                const uint8_t *e = v + 39 + i * esz;
+                if (enc == 1) {                 // legacy: flags, center channel; 40 MHz entries name the primary by bits 0-1
+                    c = e[1];
+                    if (c > 14 && (e[0] & 3) == 1) c = (uint8_t)(c - 2);
+                    else if (c > 14 && (e[0] & 3) == 2) c = (uint8_t)(c + 2);
+                } else {
+                    c = e[0];
+                }
+            }
+            p->ch[i] = usableCh(c) ? c : 0;
+        }
+    }
+    // Who it says the master is (+21 of the synchronization parameters): itself, us, or another device.
+    uint8_t claim = !memcmp(v + 21, sa, 6) ? 1 : !memcmp(v + 21, gE.addr, 6) ? 2 : 3;
+    bool claimChanged = claim != p->masterIs;
+    p->masterIs = claim;
+    p->heard++;
+    if (claimChanged || p->heard - p->logged >= 200 || p->heard == 1) {
+        p->logged = p->heard;
+        // where its EAWs start within ours, 0 to 65535 us (0: aligned); -1 before our timeline runs
+        int64_t off = -1;
+        if (gE.tlRunning) {
+            int64_t d = (int64_t)(base - gE.tlBaseUs) % (int64_t)kEawUs;
+            off = d < 0 ? d + (int64_t)kEawUs : d;
+        }
+        char seqs[17];
+        for (uint32_t i = 0; i < 16; i++) {
+            uint8_t c = p->ch[i];
+            seqs[i] = !c ? '.' : c == 6 ? 'a' : c == 44 ? 'b' : c == 149 ? 'c' : 'x';
+        }
+        seqs[16] = 0;
+        // rssi: the Family's peer manager takes a new peer only at -70 dBm or above (thanhnndev, mt7925-macos-wifi
+        // roadmap 10.86: below it the peer never got a neighbour entry and every unicast to it timed out)
+        mtk_dbg_log("awdl: peer ..:%02x:%02x names %s as master, seq=%s n=%u off=%lld us aw=%u heard=%u role=%u rssi=%d\n",
+                    sa[4], sa[5], claim == 1 ? "itself" : claim == 2 ? "us" : "another device", seqs, p->n, (long long)off,
+                    (unsigned)seq, p->heard, gE.role, (int)gE.lastRssi);
+    }
+    // The Family elects the master from the election parameters; when it keeps us master while this device declares
+    // itself master, neither follows the other and the two meet only by chance (the Pixel: present 1-3 s at a time,
+    // unicast unanswered). Then this device's timeline and sequence are taken as a slave's would be; one that names us
+    // stays on ours.
+    if (gE.role != 2 && gE.tlRunning && claim == 1) {
+        if (gE.followUs == 0 || memcmp(gE.follow, sa, 6)) {
+            memcpy(gE.follow, sa, 6);
+            mtk_dbg_log("awdl: following ..:%02x:%02x, which names itself master\n", sa[4], sa[5]);
+        }
+        gE.followUs = rxUs;
+        gE.tlBaseUs = base;
+        gE.tlBaseSeq = seq;
+        gE.syncs++;
+        return;
+    }
+    if (gE.role != 2 || !gE.tlRunning) return;
+    bool direct = !memcmp(sa, gE.master, 6);
+    bool tree = !memcmp(v + 21, gE.master, 6);
+    if (!direct && !(tree && (!gE.masterHeardUs || rxUs - gE.masterHeardUs > 1000000))) return;
+    if (direct) gE.masterHeardUs = rxUs;
+    gE.tlBaseUs = base;
+    gE.tlBaseSeq = seq;
+    gE.syncs++;
+}
+
+void dpTimerFired(OSObject *, IOTimerEventSource *);
+
+} // namespace
+
+// -----------------------------------------------------------------------------------------------------------------------
+// Called by the radio (MtkAwdl.h).
+// -----------------------------------------------------------------------------------------------------------------------
+void mtkAwdlStampFrame(uint8_t *f, uint32_t len, uint64_t nowUs)
+{
+    if (!f || len < 40 || f[0] != 0xd0 || f[24] != 0x7f || f[26] != 0x17 || f[27] != 0xf2 || f[28] != 0x08 || !gE.lock) return;
+    wr32(f + 32, (uint32_t)nowUs);                      // PHY TX time and target TX time: the frame leaves now
+    wr32(f + 36, (uint32_t)nowUs);
+    for (uint32_t pos = 40; pos + 3 <= len;) {
+        uint32_t l = rd16(f + pos + 1);
+        if (pos + 3 + l > len) return;
+        if (f[pos] == 4 && l >= 31) {
+            uint8_t *v = f + pos + 3;
+            uint64_t s = 0;
+            IOLockLock(gE.lock);
+            uint16_t aw = awAt(nowUs, &s);
+            uint32_t k = 1;
+            while (((uint16_t)(aw + k) % kAwPerEaw) != 0) k++;
+            uint64_t next = s + (uint64_t)k * kAwUs;
+            uint64_t eawStart = awStartUs((uint16_t)(aw - (aw % kAwPerEaw)));
+            IOLockUnlock(gE.lock);
+            uint32_t dc = (uint32_t)((next > nowUs ? next - nowUs : 0) + kTuUs - 1) / kTuUs;
+            wr16(v + 1, (uint16_t)dc);
+            uint64_t into = nowUs - eawStart;
+            wr16(v + 15, (uint16_t)(into < kAwUs ? (kAwUs - into) / kTuUs : 0));
+            wr16(v + 29, aw);
+            return;
+        }
+        pos += 3 + l;
+    }
+}
+
+void mtkAwdlRadioRoomFreed()
+{
+    if (gE.dpTimer && gE.txBlocked) gE.dpTimer->setTimeoutUS(1);
+}
+
+void mtkAwdlInput(const uint8_t *frame, uint32_t len, uint32_t channel, int32_t rssi, uint64_t timeUs)
+{
+    MtkAwdlInterface *vif = gE.vif;
+    if (!vif || !gE.lock || !frame || len < 24) return;
+    IOLockLock(gE.lock);
+    bool on = gE.enabled;
+    IOLockUnlock(gE.lock);
+    if (!on) return;
+    if ((frame[0] & 0x0c) == 0x08) {
+        vif->deliverData(frame, len);
+        return;
+    }
+    if (frame[0] != 0xd0 || len < 40) return;
+    const uint8_t *body = frame + 24;
+    uint32_t bodyLen = len - 24, pos = 16;
+    // The sniffer can leave the FCS behind the last TLV: the TLVs say where the frame ends.
+    while (pos + 3 <= bodyLen) {
+        uint32_t l = rd16(body + pos + 1);
+        if (pos + 3 + l > bodyLen) break;
+        pos += 3 + l;
+    }
+    if (pos != bodyLen) {
+        if (bodyLen - pos > 4) { gE.rxAfFail++; return; }
+        bodyLen = pos;
+    }
+    if (rssi >= 0 || rssi < -110) {
+        gE.rxNoRssi++;
+        rssi = -70;            // the frame was decoded, so the link is at least the peer manager's edge (thanhnndev)
+    }
+    IOLockLock(gE.lock);
+    gE.peerHeardUs = timeUs;
+    gE.lastRssi = rssi;
+    if (usableCh(channel)) gE.peerCh = (uint8_t)channel;
+    trackPeer(frame + 10, body, bodyLen, timeUs);
+    IOLockUnlock(gE.lock);
+
+    IO80211Controller *ctl = vif->getController();
+    void *pool = ctl ? mtkAwdlFamilyMgmtPool(ctl) : nullptr;
+    if (!pool) { gE.rxAfFail++; return; }
+    // IO80211BufferPool::getBuffer, IO80211Buffer::getCapacity, getBytesNoCopy, setLength, returnBuffer: virtual
+    // methods at these offsets from the vtable pointer in this kernel's IO80211Family.
+    typedef void *(*GetBuffer)(void *);
+    typedef size_t (*GetCapacity)(void *);
+    typedef void *(*GetBytes)(void *);
+    typedef void (*SetLength)(void *, size_t);
+    typedef void (*ReturnBuffer)(void *);
+    void *buf = ((GetBuffer)(*(void ***)pool)[0x118 / 8])(pool);
+    if (!buf) { gE.rxAfFail++; return; }
+    uint8_t *bytes = (uint8_t *)((GetBytes)(*(void ***)buf)[0x158 / 8])(buf);
+    if (!bytes || bodyLen > ((GetCapacity)(*(void ***)buf)[0x140 / 8])(buf)) {
+        ((ReturnBuffer)(*(void ***)buf)[0x118 / 8])(buf);
+        gE.rxAfFail++;
+        return;
+    }
+    memcpy(bytes, body, bodyLen);
+    ((SetLength)(*(void ***)buf)[0x138 / 8])(buf, bodyLen);
+    ActFrmHdr hdr;
+    bzero(&hdr, sizeof(hdr));
+    memcpy(hdr.sa, frame + 10, 6);
+    hdr.chVersion = 1;
+    hdr.channel = channel;
+    hdr.chFlags = chFlags(channel);
+    hdr.rssi = rssi;
+    hdr.rxTime = (uint32_t)timeUs;
+    gE.rxAf++;
+    mtkAwdlFamilyTapInput(vif, buf, kTapActionFrame, &hdr, sizeof(hdr));
+}
+
+// -----------------------------------------------------------------------------------------------------------------------
+// The engine's entry points for the interface.
+// -----------------------------------------------------------------------------------------------------------------------
+static bool engineInit(MtkAwdlInterface *vif, const uint8_t *addr)
+{
+    if (gE.lock) return true;
+    gE.lock = IOLockAlloc();
+    if (!gE.lock) return false;
+    gE.vif = vif;
+    memcpy(gE.addr, addr, 6);
+    gE.lastPostedAw = -1;
+    gE.familyState = 1;
+    gE.role = 1;
+    gE.awdlCh = 0;
+    // The queues' work loop: the data timer completes their packets, the timeline posts to the same Family.
+    IOWorkLoop *wl = (IOWorkLoop *)vif->getWorkQueue();
+    if (!wl) wl = vif->getWorkLoop();
+    if (wl) {
+        gE.tlTimer = IOTimerEventSource::timerEventSource(vif, tlTimerFired);
+        gE.dpTimer = IOTimerEventSource::timerEventSource(vif, dpTimerFired);
+        if (gE.tlTimer && wl->addEventSource(gE.tlTimer) != kIOReturnSuccess) OSSafeReleaseNULL(gE.tlTimer);
+        if (gE.dpTimer && wl->addEventSource(gE.dpTimer) != kIOReturnSuccess) OSSafeReleaseNULL(gE.dpTimer);
+        gE.wl = wl;
+    }
+    mtk_dbg_log("awdl: engine ready timers=%d/%d\n", gE.tlTimer != nullptr, gE.dpTimer != nullptr);
+    return true;
+}
+
+static void engineEnable(bool on)
+{
+    if (!gE.lock) return;
+    uint64_t now = mtkAwdlUptimeUs();
+    IOLockLock(gE.lock);
+    bool was = gE.enabled;
+    gE.enabled = on;
+    if (on && !gE.tlRunning) {
+        gE.tlRunning = true;              // our own master until the Family elects another: AW 0 starts now
+        gE.tlBaseUs = now;
+        gE.tlBaseSeq = 0;
+        gE.lastPostedAw = -1;
+        gE.plannedUntilUs = 0;
+        chooseChannel();
+        buildPresence(now);
+    }
+    if (on && !was) gE.actUs = now;       // just turned on: the timeline runs at least kStillUs
+    if (!on) {
+        gE.tlRunning = false;
+        gE.endPending = false;
+        gE.onceLen = 0;
+    }
+    if (on != was) {
+        gE.still = false;
+        gE.wakeReq = kWakeNone;
+    }
+    IOLockUnlock(gE.lock);
+    if (on && !was) {
+        int rv = mtkAwdlRadioStart(gE.addr);
+        gE.radioOn = rv == 0;
+        if (rv) mtk_dbg_log("awdl: the radio did not start (%d)\n", rv);
+        armTimer(now);
+    } else if (!on && was) {
+        if (gE.tlTimer) gE.tlTimer->cancelTimeout();
+        mtkAwdlRadioStop();
+        gE.radioOn = false;
+    }
+}
+
+// -----------------------------------------------------------------------------------------------------------------------
+// The data path of awdl0 (thanhnndev ca94db4, bd5f763; seemoo-lab owl's framing). On the air an AWDL data frame has no DS
+// bits, addr3 the AWDL BSSID, LLC/SNAP with Apple's OUI and protocol 0x0800, then 03 04, a sequence number, two pad bytes
+// and the ethertype. Packets the radio cannot take stay in awdl0's queue: the submission action takes no more, and the
+// queue is asked again once the radio made room.
+// -----------------------------------------------------------------------------------------------------------------------
+namespace {
+
+void dpTimerFired(OSObject *owner, IOTimerEventSource *)
+{
+    if (owner) ((MtkAwdlInterface *)owner)->serviceData();
+}
+
+} // namespace
+
+uint32_t MtkAwdlInterface::submitData(IOSkywalkPacket *const *packets, uint32_t count)
+{
+    static const uint8_t snap[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00 };
+    uint32_t used = 0;
+    if (!packets) return 0;
+    if (!gE.dpOn) {
+        // Offered before the path was on: they stay in awdl0's queue, which is asked again once it is. Without
+        // this the queue waited for a dequeue request nobody sent, and awdl0 sent nothing for the whole boot.
+        gE.txEarly++;
+        gE.txBlocked = true;
+        if (gE.dpTimer) gE.dpTimer->setTimeoutMS(5);
+        return 0;
+    }
+    if (gE.still && gE.lock) {
+        // A still timeline runs again at the first packet, which waits in awdl0's queue until the radio is back.
+        IOLockLock(gE.lock);
+        bool kick = noteActivity(mtkAwdlUptimeUs(), kWakeData);
+        bool still = gE.still;
+        IOLockUnlock(gE.lock);
+        if (kick) kickTimeline();
+        if (still) {
+            gE.txBlocked = true;
+            if (gE.dpTimer) gE.dpTimer->setTimeoutMS(20);
+            return 0;
+        }
+    }
+    for (; used < count; used++) {
+        IOSkywalkPacket *p = packets[used];
+        if (!p) break;
+        if (gE.txDoneN >= sizeof(gE.txDone) / sizeof(gE.txDone[0])) { gE.txBlocked = true; break; }
+        bool single = p->getPacketBufferCount() == 1;
+        uint32_t len = p->getDataLength(), size = single ? p->getBufferSize() : 0;
+        uint16_t off = single ? p->getDataOffset() : 0;
+        const uint8_t *e = single ? (const uint8_t *)p->getDataVirtualAddress() : nullptr;
+        if (e && len >= 14 && off <= size && len <= size - off && 40 + (len - 14) <= sizeof(gDataTx)) {
+            e += off;
+            uint8_t *f = gDataTx;
+            bzero(f, 24);
+            f[0] = 0x08;
+            memcpy(f + 4, e, 6);
+            memcpy(f + 10, gE.addr, 6);
+            memcpy(f + 16, kBssid, 6);
+            wr16(f + 22, (uint16_t)((gE.dataSeq & 0xfff) << 4));
+            memcpy(f + 24, snap, 8);
+            f[32] = 0x03; f[33] = 0x04;
+            wr16(f + 34, gE.dataSeq);
+            f[36] = 0; f[37] = 0;
+            f[38] = e[12]; f[39] = e[13];
+            memcpy(f + 40, e + 14, len - 14);
+            int rv = mtkAwdlRadioQueue(f, 40 + (len - 14), 0, 500);
+            if (rv == ENOBUFS) {
+                gE.txFull++;
+                gE.txBlocked = true;
+                break;                         // this packet stays in the queue
+            }
+            gE.txIn++;
+            gE.dataSeq++;
+            if (rv == 0) { gE.txQueued++; gE.dataUs = mtkAwdlUptimeUs(); }
+            else gE.txBad++;
+        } else {
+            gE.txBad++;
+        }
+        gE.txDone[gE.txDoneN++] = p;
+    }
+    if (gE.txDoneN && gE.dpTimer) gE.dpTimer->setTimeoutUS(1);
+    return used;
+}
+
+// Completes the packets the radio copied, and asks awdl0's queue for more once there is room. Controller work loop.
+void MtkAwdlInterface::serviceData()
+{
+    while (gE.txDoneN && awdlQueues[1]) {
+        uint32_t n = gE.txDoneN < 32 ? gE.txDoneN : 32;
+        if (((IOSkywalkTxCompletionQueue *)awdlQueues[1])->enqueuePackets(gE.txDone, n, 0) != kIOReturnSuccess) break;
+        gE.txDoneN -= n;
+        memmove(gE.txDone, gE.txDone + n, gE.txDoneN * sizeof(gE.txDone[0]));
+    }
+    if (gE.txDoneN && gE.dpTimer) gE.dpTimer->setTimeoutMS(2);
+    if (gE.txBlocked && gE.dpOn && mtkAwdlRadioRoom() > 0 && gE.txDoneN < 32 && awdlQueues[0]) {
+        gE.txBlocked = false;
+        ((IOSkywalkTxSubmissionQueue *)awdlQueues[0])->requestDequeue(nullptr, 1);
+    } else if (gE.txBlocked && gE.dpTimer && !gE.still) {
+        // a full radio queue drains within a window; a radio not started yet may take seconds; a still timeline asks
+        // again when it wakes
+        gE.dpTimer->setTimeoutMS(gE.radioOn ? 5 : 100);
+    }
+}
+
+// Air -> stack, from the receive tap: the 802.11 data frame becomes an Ethernet frame on awdl0.
+void MtkAwdlInterface::deliverData(const uint8_t *f, uint32_t len)
+{
+    gE.rxData++;
+    if (!gE.dpOn || !awdlPool || !awdlQueues[2] || len < 24) { gE.rxDataFail++; return; }
+    bool qos = (f[0] & 0x80) != 0;                          // a QoS data subtype: QoS control follows
+    uint32_t hl = qos ? 26 : 24;
+    if (qos && (f[1] & 0x80)) hl += 4;                     // QoS with HT control
+    if ((f[1] & 0x47) || len < hl + 8) { gE.rxDataFail++; return; }   // no DS bits, no fragments, not protected
+    const uint8_t *da = f + 4, *sa = f + 10;
+    if (!(da[0] & 1) && memcmp(da, gE.addr, 6)) { gE.rxNotUs++; return; }
+    if (!memcmp(sa, gE.addr, 6) || (sa[0] & 1)) { gE.rxNotUs++; return; }
+    uint16_t sc = rd16(f + 22);
+    RxDup *d = nullptr;
+    for (RxDup &x : gE.dup) if (x.valid && !memcmp(x.sa, sa, 6)) { d = &x; break; }
+    if (d && d->sc == sc && (f[1] & 0x08)) { gE.rxDup++; return; }          // a retry of a frame already delivered
+    if (!d) { d = &gE.dup[gE.dupNext++ % 8]; memcpy(d->sa, sa, 6); d->valid = true; }
+    d->sc = sc;
+    const uint8_t *pl = f + hl;
+    uint32_t plen = len - hl;
+    gE.dataUs = mtkAwdlUptimeUs();
+    if (!(qos && (f[24] & 0x80))) {
+        deliverMsdu(da, sa, pl, plen);
+        return;
+    }
+    // An A-MSDU (QoS control bit 7): subframes of destination, source, big-endian length and an MSDU, each but the last
+    // padded to 4 bytes; every MSDU carries its own LLC/SNAP and AWDL header (seemoo-lab owl, awdl_rx_data_amsdu). The
+    // Pixel sends its bulk data this way: dropped whole, a transfer to the Mac stopped half way.
+    gE.rxAmsdu++;
+    while (plen >= 14) {
+        const uint8_t *sda = pl, *ssa = pl + 6;
+        uint32_t sl = ((uint32_t)pl[12] << 8) | pl[13];
+        if (14 + sl > plen) { gE.rxDataFail++; return; }
+        gE.rxSub++;
+        deliverMsdu(sda, ssa, pl + 14, sl);
+        uint32_t step = (14 + sl + 3) & ~3u;
+        if (step >= plen) break;
+        pl += step;
+        plen -= step;
+    }
+}
+
+// One MSDU of awdl0: LLC/SNAP with Apple's OUI, the AWDL data header (03 04, sequence, two pad bytes), the ethertype,
+// then the packet, which goes up as an Ethernet frame.
+void MtkAwdlInterface::deliverMsdu(const uint8_t *da, const uint8_t *sa, const uint8_t *pl, uint32_t plen)
+{
+    static const uint8_t outer[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
+    if (plen >= 8 && !memcmp(pl, outer, 6)) { pl += 8; plen -= 8; }   // an outer LLC header some peers add
+    static const uint8_t snap[8] = { 0xaa, 0xaa, 0x03, 0x00, 0x17, 0xf2, 0x08, 0x00 };
+    if (plen < 16 || memcmp(pl, snap, 8) || pl[8] != 0x03 || pl[9] != 0x04) { gE.rxDataFail++; return; }
+    uint8_t et0 = pl[14], et1 = pl[15];
+    const uint8_t *ip = pl + 16;
+    uint32_t iplen = plen - 16;
+    if (et0 == 0x86 && et1 == 0xdd && iplen >= 40) {                       // the FCS may follow: IPv6 knows its length
+        uint32_t want = 40 + (((uint32_t)ip[4] << 8) | ip[5]);
+        if (want <= iplen) iplen = want;
+    }
+    uint32_t elen = 14 + iplen;
+    IOSkywalkPacket *p = nullptr;
+    IOReturn r = awdlPool->allocatePacket(1, &p, 1);
+    if (r != kIOReturnSuccess || !p) { gE.rxDataFail++; return; }
+    r = p->prepareWithQueue(nullptr, 0, 0);
+    uint8_t *e = (r == kIOReturnSuccess && p->getPacketBufferCount() == 1) ? (uint8_t *)p->getDataVirtualAddress() : nullptr;
+    if (!e || p->getBufferSize() < elen) {
+        r = kIOReturnNoSpace;
+    } else {
+        memcpy(e, da, 6);
+        memcpy(e + 6, sa, 6);
+        e[12] = et0;
+        e[13] = et1;
+        memcpy(e + 14, ip, iplen);
+        r = p->setDataOffsetAndLength(0, elen);
+        IOSkywalkNetworkPacket *np = static_cast<IOSkywalkNetworkPacket *>(p);
+        if (r == kIOReturnSuccess) r = np->setHeadroom(0);
+        if (r == kIOReturnSuccess) r = np->setLinkHeaderLength(14);
+        bool bc = (da[0] & da[1] & da[2] & da[3] & da[4] & da[5]) == 0xff;
+        if (r == kIOReturnSuccess && bc) r = np->setIsLinkBroadcast(true);
+        else if (r == kIOReturnSuccess && (da[0] & 1)) r = np->setIsLinkMulticast(true);
+        if (r == kIOReturnSuccess) r = np->setRxChecksumInfo(0, 0);
+        if (r == kIOReturnSuccess) r = ((IOSkywalkRxCompletionQueue *)awdlQueues[2])->enqueuePackets(&p, 1, 0);
+    }
+    if (r != kIOReturnSuccess) {                 // nothing consumed it: the packet goes back to the pool
+        awdlPool->deallocatePacket(p);
+        if (++gE.rxDataFail <= 4) mtk_dbg_log("awdl: data frame not delivered 0x%x len %u\n", r, elen);
+        return;
+    }
+    gE.rxDataUp++;
+}
+
+// The queues run once they are enabled: completions first, the submission last (its action uses the others).
+void MtkAwdlInterface::enableData()
+{
+    if (gE.dpOn || !awdlQueuesOnLoop) return;
+    awdlQueues[1]->enable();
+    awdlQueues[2]->enable();
+    gE.dpOn = true;                     // before the submission queue: its action can run as soon as it is enabled
+    awdlQueues[0]->enable();
+    mtk_dbg_log("awdl: data path on\n");
+    if (gE.txBlocked && gE.dpTimer) gE.dpTimer->setTimeoutUS(1);
+}
+
+// -----------------------------------------------------------------------------------------------------------------------
+// What the Family hands down, taken into the engine.
+// -----------------------------------------------------------------------------------------------------------------------
+// apple80211_awdl_sync_params: +0x10 the action frame period in TU.
+static void engineSyncParams(const uint8_t *raw)
+{
+    if (!gE.lock) return;
+    uint32_t tu = (uint32_t)raw[0x10] | ((uint32_t)raw[0x11] << 8);
+    IOLockLock(gE.lock);
+    gE.afPeriodTu = tu >= 16 && tu <= 1024 ? tu : 0;
+    IOLockUnlock(gE.lock);
+}
+
+// apple80211_awdl_sync_channel_sequence: +5 the entries, from +0xc 12 bytes each, the channel at +4 of an entry.
+//
+// At rest the Family's sequence has 3 entries on AWDL channels and one at the access point's
+// (112 0 149 0 0 0 0 0 6 0 149 0 0 0 0 0); while it has a browse or an advertisement going, 6 to 12 (149 149 149 149 0 0
+// 112 112 6 149 149 149 0 0 112 112). Busy keeps the timeline running, and wakes it. Entries at the access point's channel
+// alone do not count, unless the sequence is nearly full: they may be AWDL's own when the access point is on 149 or 44.
+static void engineChanSeq(const uint8_t *s)
+{
+    if (!gE.lock) return;
+    uint32_t n = s[5] > 16 ? 16 : s[5];
+    if (!n) return;
+    uint64_t now = mtkAwdlUptimeUs();
+    IOLockLock(gE.lock);
+    uint8_t home = mtkAwdlRadioHomeChannel();
+    uint32_t used = 0, away = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        uint8_t c = s[0xc + 12 * (i % n) + 4];
+        gE.famCh[i] = usableCh(c) ? c : 0;
+        used += c != 0;
+        away += c != 0 && c != home;
+    }
+    gE.famSet = true;
+    gE.famBusy = away >= 5 || used >= 9;
+    bool kick = gE.famBusy && noteActivity(now, kWakeSeq);
+    chooseChannel();
+    IOLockUnlock(gE.lock);
+    if (kick) kickTimeline();
+}
+
+// apple80211_awdl_sync_state: +4 the state (1 master, 2 slave, 3 non-election master), +8 the master. The Family hands the
+// elected master with state 1 whoever won: a master that is not us makes us its slave (thanhnndev 44d5bd2).
+static void engineSyncState(uint32_t state, const uint8_t *m)
+{
+    if (!gE.lock || state < 1 || state > 3) return;
+    IOLockLock(gE.lock);
+    gE.familyState = state;
+    uint32_t role = (!isZero6(m) && memcmp(m, gE.addr, 6)) ? 2 : state == 2 ? 1 : state;
+    bool changed = role != gE.role || memcmp(m, gE.master, 6);
+    gE.role = role;
+    memcpy(gE.master, m, 6);
+    if (changed && role == 2) {
+        // take the master's clock now, from the last frame it was heard with
+        const Peer *p = findPeer(m);
+        if (p && gE.tlRunning) {
+            gE.tlBaseUs = p->baseUs;
+            gE.tlBaseSeq = p->baseSeq;
+            gE.lastPostedAw = -1;
+            gE.syncs++;
+        }
+        gE.masterHeardUs = 0;
+    }
+    IOLockUnlock(gE.lock);
+    if (changed)
+        mtk_dbg_log("awdl: role %u master %02x:%02x:%02x:%02x:%02x:%02x\n", role, m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static void engineTopMaster(const uint8_t *top)
+{
+    if (!gE.lock) return;
+    IOLockLock(gE.lock);
+    memcpy(gE.topMaster, top, 6);
+    IOLockUnlock(gE.lock);
+}
+
+// A run of TLVs that ends exactly at its length.
+static bool tlvsWellFormed(const uint8_t *t, uint32_t len)
+{
+    uint32_t off = 0;
+    while (off + 3 <= len) {
+        uint32_t l = rd16(t + off + 1);
+        if (off + 3 + l > len) return false;
+        off += 3 + l;
+    }
+    return off == len;
+}
+
+// apple80211_awdl_sync_frame_template: +4 the length, +8 the TLVs of the PSF. A template of a new length comes when the
+// Family's services change (137 -> 139 bytes as AirDrop starts browsing or advertising); those it writes while it
+// configures AWDL find the timeline running anyway.
+static void engineTemplate(const uint8_t *tlv, uint32_t len)
+{
+    if (!gE.lock) return;
+    bool ok = tlv && len <= kTlvMax && tlvsWellFormed(tlv, len);
+    uint64_t now = mtkAwdlUptimeUs();
+    IOLockLock(gE.lock);
+    bool kick = ok && gE.psfLen && len != gE.psfLen && noteActivity(now, kWakeTemplate);
+    if (ok) memcpy(gE.psf, tlv, len);
+    gE.psfLen = ok ? len : 0;
+    IOLockUnlock(gE.lock);
+    if (kick) kickTimeline();
+}
+
+// A traffic registration with a peer.
+static void engineTraffic(bool active)
+{
+    if (!gE.lock || !active) return;
+    uint64_t now = mtkAwdlUptimeUs();
+    IOLockLock(gE.lock);
+    bool kick = noteActivity(now, kWakeTraffic);
+    IOLockUnlock(gE.lock);
+    if (kick) kickTimeline();
+}
+
+// apple80211_awdl_oob_request: +0x16 the destination, +0x28 the payload length, +0x30 the payload (the master
+// indication's TLVs for the automatic request; thanhnndev d4b9008, ForbiddenItlwm storeMasterIndication). Only a kernel
+// buffer of plausible size whose TLVs end where it ends is kept.
+static IOReturn engineOob(const uint8_t *r, bool autoReq)
+{
+    if (!gE.lock || !r) return kIOReturnBadArgument;
+    uint32_t len = (uint32_t)r[0x28] | ((uint32_t)r[0x29] << 8);
+    const uint8_t *pl = *(const uint8_t *const *)(r + 0x30);
+    if (!len || !pl) {
+        IOLockLock(gE.lock);
+        if (autoReq) gE.miLen = 0; else gE.onceLen = 0;
+        IOLockUnlock(gE.lock);
+        return kIOReturnSuccess;
+    }
+    if ((uintptr_t)pl < 0xffffff8000000000ULL) return kIOReturnBadArgument;
+    if (len > 16 && pl[0] == 0x7f && pl[1] == 0x00 && pl[2] == 0x17 && pl[3] == 0xf2 && pl[4] == 0x08) { pl += 16; len -= 16; }
+    if (len > kTlvMax) return kIOReturnNoSpace;
+    if (!tlvsWellFormed(pl, len)) return kIOReturnBadArgument;
+    const uint8_t *a = r + 0x16;
+    uint64_t now = mtkAwdlUptimeUs();
+    bool kick = false;
+    IOLockLock(gE.lock);
+    if (autoReq) {
+        memcpy(gE.mi, pl, len);
+        gE.miLen = len;
+    } else {
+        memcpy(gE.once, pl, len);
+        gE.onceLen = len;
+        if (isZero6(a) || (a[0] & 1) || !memcmp(a, gE.addr, 6)) memset(gE.onceDa, 0xff, 6);
+        else memcpy(gE.onceDa, a, 6);
+        kick = noteActivity(now, kWakeFrame);          // the frame goes out in the next present EAW
+    }
+    IOLockUnlock(gE.lock);
+    if (kick) kickTimeline();
     return kIOReturnSuccess;
 }

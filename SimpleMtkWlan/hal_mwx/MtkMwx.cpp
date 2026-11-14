@@ -683,6 +683,10 @@ struct mwx_softc {
 	uint32_t		sc_rx_delivered;
 	uint32_t		sc_scan_done_count;
 	uint32_t		sc_scan_last_ieee80211_nodes;
+#ifdef MTK_AWDL
+	struct mwx_awdl		*sc_awdl;	/* the AWDL radio, allocated when awdl0 starts it */
+	int			sc_awdl_ds;	/* the deep sleep setting the station asked for last */
+#endif
 
 };
 
@@ -1180,6 +1184,17 @@ int		 mt7921_mcu_sta_key_update(struct mwx_softc *,
 		    struct ieee80211_node *, struct ieee80211_key *);
 void		 mt7921_mcu_sta_key_delete(struct mwx_softc *,
 			    struct ieee80211_node *, struct ieee80211_key *);
+#ifdef MTK_AWDL
+/* The AWDL radio, at the end of this file. Each of these is called only when sc_awdl is set. */
+static bool	mwx_awdl_rx_tap(struct mwx_softc *, struct mbuf *, const struct ieee80211_rxinfo *);
+static bool	mwx_awdl_mcu_event(struct mwx_softc *, uint8_t, uint8_t, uint8_t, struct mbuf *);
+static bool	mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
+static void	mwx_awdl_quiesce(struct mwx_softc *);
+static void	mwx_awdl_firmware_reset(struct mwx_softc *);
+static void	mwx_awdl_resume(struct mwx_softc *);
+static void	mwx_awdl_free(struct mwx_softc *);
+static void	mwx_awdl_attach(struct mwx_softc *);
+#endif
 
 static inline int
 mwx_dbm_to_rssi(int dbm)
@@ -1309,6 +1324,11 @@ mwx_init_hw(struct ifnet *ifp)
 
 	sc->sc_mcu_mute = 0;
 	if (!sc->sc_fw_loaded) {
+#ifdef MTK_AWDL
+		/* A new firmware has none of the AWDL radio's settings. */
+		if (sc->sc_awdl != NULL)
+			mwx_awdl_firmware_reset(sc);
+#endif
 		rv = mwx_preinit(sc);
 		if (rv) {
 			MWX_DEV_LOG(sc, "init preinit failed error=%d\n", rv);
@@ -1454,6 +1474,11 @@ mwx_init_hw(struct ifnet *ifp)
 		MWX_DEV_LOG(sc, "init: scan state idle until macOS asks, %d channels\n",
 		    active);
 	}
+#ifdef MTK_AWDL
+	/* The station's reception is set again above: the AWDL radio may open windows again. */
+	if (sc->sc_awdl != NULL)
+		mwx_awdl_resume(sc);
+#endif
 #else
 	MWX_DEV_LOG(sc, "init begin scan\n");
 	ieee80211_begin_scan(ifp);
@@ -1489,6 +1514,14 @@ mwx_stop_internal(struct ifnet *ifp, bool teardown_owner)
 		return;
 	}
 	DPRINTF("%s: stop\n", DEVNAME(sc));
+#ifdef MTK_AWDL
+	/*
+	 * Interface down, system sleep, shutdown, reset and detach all come here: the AWDL radio ends its window
+	 * and gives a remain-on-channel period back while the firmware still answers, before the deauth below.
+	 */
+	if (sc->sc_awdl != NULL)
+		mwx_awdl_quiesce(sc);
+#endif
 	sc->sc_stopping = 1;
 
 	/*
@@ -2543,6 +2576,13 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 		m_freem(m);
 		return;
 	}
+#ifdef MTK_AWDL
+	/* AWDL frames go to awdl0; while other devices' frames may arrive, the station's filter runs here. */
+	if (sc->sc_awdl != NULL && mwx_awdl_rx_tap(sc, m, &rxi)) {
+		m_freem(m);
+		return;
+	}
+#endif
 
 	if (aggregate) {
 		if (!mtkRxAmsduRemovePad(m, descriptor)) {
@@ -4981,7 +5021,7 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 {
 	struct mwx_mcu_rxd *rxd;
 	uint32_t cmd, mcu_int = 0;
-	uint8_t rxd_eid, rxd_ext_eid, rxd_seq;
+	uint8_t rxd_eid, rxd_ext_eid, rxd_seq, rxd_option;
 	int len, rxd_size;
 
 	rxd_size = MT7921_MCU_RXD_SIZE;
@@ -5007,6 +5047,8 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	rxd_eid = rxd->eid;
 	rxd_ext_eid = rxd->ext_eid;
 	rxd_seq = rxd->seq;
+	rxd_option = rxd->option;
+	(void)rxd_option;
 	m_adj(m, sizeof(*rxd));
 	mwx_mcu_trace_sta_status(sc, rxd_eid, rxd_seq, m);
 
@@ -5041,6 +5083,12 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	case 0x6:
 		printf("%s: MAGIC COMMAND\n", DEVNAME(sc));
 	default:
+#ifdef MTK_AWDL
+		/* The remain-on-channel grant, or the answer to one of the AWDL radio's own commands. */
+		if (sc->sc_awdl != NULL &&
+		    mwx_awdl_mcu_event(sc, rxd_eid, rxd_seq, rxd_option, m))
+			break;
+#endif
 		if (rxd_seq == 0 || rxd_seq >= nitems(sc->sc_mcu_wait)) {
 			printf("%s: mcu rx bad seq %x\n", DEVNAME(sc),
 			    rxd_seq);
@@ -6118,6 +6166,9 @@ mwx_mcu_set_deep_sleep(struct mwx_softc *sc, int ena)
 	};
 
 	DPRINTF("%s: %s deep sleep\n", DEVNAME(sc), ena ? "enable" : "disable");
+#ifdef MTK_AWDL
+	sc->sc_awdl_ds = ena;	/* the AWDL radio keeps full power for its windows and then gives this back */
+#endif
 	snprintf((char *)req.data, sizeof(req.data), "KeepFullPwr %d", !ena);
 	return mwx_mcu_send_msg(sc, MCU_CE_CMD_CHIP_CONFIG, &req,
 	     sizeof(req), NULL);
@@ -7999,6 +8050,10 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 		mt = &sc->sc_txwi.mt_data[msdu];
 		if (mt->mt_busy == 0)
 			continue;
+#ifdef MTK_AWDL
+		if (sc->sc_awdl != NULL)
+			(void)mwx_awdl_tx_done(sc, msdu, txval);
+#endif
 		mwx_txwi_put(sc, mt);
 	}
 
@@ -8675,6 +8730,9 @@ MtkMwx::attach(IOPCIDevice *device)
 		detach(device);
 		return false;
 	}
+#ifdef MTK_AWDL
+	mwx_awdl_attach(com);
+#endif
 	MWX_LOG("HAL attach complete\n");
 	return true;
 }
@@ -8689,6 +8747,11 @@ MtkMwx::detach(IOPCIDevice *device)
         return;
     }
     struct ifnet *ifp = &com->sc_ic.ic_if;
+#ifdef MTK_AWDL
+    /* Before sc_detaching: a remain-on-channel period is given back while the firmware still answers. */
+    if (com->sc_awdl != NULL)
+        mwx_awdl_quiesce(com);
+#endif
     com->sc_detaching = true;
     mwx_rx_amsdu_begin_teardown(com);
     timeout_del(&com->sc_reset_to);
@@ -8708,6 +8771,10 @@ MtkMwx::detach(IOPCIDevice *device)
         IOLockUnlock(com->sc_rx_amsdu_lock);
     }
     mwx_rx_amsdu_purge(com);
+#ifdef MTK_AWDL
+    /* No interrupt and no RX any more: the radio's thread and memory can go. */
+    mwx_awdl_free(com);
+#endif
     if (com->sc_net_attached && com->sc_newstate != NULL)
         com->sc_newstate(&com->sc_ic, IEEE80211_S_INIT, -1);
     if (com->sc_memh) {
@@ -9810,3 +9877,1550 @@ MtkMwx::debugPoll()
 		mwx_intr(sc);
 	}
 }
+
+#ifdef MTK_AWDL
+/*
+ * AWDL radio, for the AWDL interface (AirportMtkWlan/awdl). It does nothing until awdl0 starts it, which needs
+ * -mtkawdl: until then sc_awdl is NULL, every hook in the code above returns at once and the firmware sees no
+ * new command.
+ *
+ * The firmware has no AWDL of its own. The interface keeps the AWDL timeline and asks for windows; this part
+ * puts the radio where it is asked to be, opens the reception of other devices' frames there, sends the frames
+ * queued for that channel and hands the AWDL frames it hears to the interface. Each mechanism is the one Linux
+ * mt76 uses on the MT7921 family (drivers/net/wireless/mediatek/mt76/mt7921/mcu.c and main.c), in the order
+ * thanhnndev found to hold on MediaTek firmware (mt7925-macos-wifi, kexts/itlmt7925/itlmt7925_m3.cpp):
+ *  - time on another channel: a remain-on-channel request, MCU_UNI_CMD(ROC) with UNI_ROC_ACQUIRE, request type
+ *    MT7921_ROC_REQ_ROC and the duration in ms (mt7921_mcu_set_roc), granted by the unsolicited
+ *    MCU_UNI_EVENT_ROC (mt7921_mcu_uni_roc_event) and always ended with UNI_ROC_ABORT (mt7921_mcu_abort_roc).
+ *    Neither request waits for an answer, as in Linux; the firmware tells the access point about the absence;
+ *  - hearing other devices: in station mode the firmware hands the host its own BSS only. A window turns on
+ *    the RX filter with FIF_OTHER_BSS, MCU_CE_CMD(SET_RX_FILTER) (mt7921_mcu_set_rxfilter from
+ *    mt7921_configure_filter), and the firmware sniffer, MCU_UNI_CMD(SNIFFER) UNI_SNIFFER_ENABLE
+ *    (mt7921_mcu_set_sniffer), then UNI_SNIFFER_CONFIG for the window's channel once the radio is there
+ *    (mt7921_mcu_config_sniffer). Both go back to the station's settings when the window ends;
+ *  - acknowledging frames sent to awdl0: its address on a second own MAC, OMAC 1, with the DEV_INFO_UPDATE
+ *    that mt76_connac_mcu_uni_add_dev sends for a second interface;
+ *  - sending: the normal TX path with the 802.11 header kept (mt76_connac2_mac_write_txwi), on ALTX0, the
+ *    queue mt76 uses for frames sent outside the station's schedule, at a fixed OFDM rate on either band;
+ *  - the regulatory country: the access point's Country element, as cfg80211 hands it to
+ *    mt7921_regd_notifier. With the world domain the firmware sends on the access point's own 5 GHz channel
+ *    only (thanhnndev, mt7925-macos-wifi af60e21).
+ *
+ * Threads and locks. The interface calls the functions at the bottom from the main work loop or from the
+ * Family's threads: they only fill the mailbox and the TX queue, under awdl->lock, and start the radio's
+ * timer. A window runs on the radio's own work loop thread, inside the main command gate; its waits go
+ * through tsleep_nsec(), which opens that gate, so the interrupt keeps being served. Lock order: the radio
+ * work loop's gate (held by the radio thread for a whole run), then the main gate, then awdl->lock (a leaf).
+ * The radio thread never waits for the main gate from outside (attemptAction), and a stop path, which may
+ * hold the main gate, waits for the radio thread only by sleeping on that gate (mwx_awdl_quiesce) and takes
+ * the radio work loop's gate (removeEventSource) only once the thread has left the gated part for good.
+ * Frames heard are handed to the interface from mwx_rx(), on the main work loop inside the gate.
+ */
+#include <IOKit/IOTimerEventSource.h>
+#include "awdl/MtkAwdl.h"
+
+#define MWX_AWDL_FRAME_MAX	1600	/* a master indication with every service, or a full data frame */
+#define MWX_AWDL_RX_MAX		12288	/* received: an A-MSDU up to VHT's 11454-byte MPDU. The Family announces AWDL
+					 * capabilities of its own, and the Pixel sent frames over 4096 bytes:
+					 * dropped, they came back the same way and a transfer stopped at 75% */
+#define MWX_AWDL_TX_SLOTS	64
+#define MWX_AWDL_PEERS		8
+#define MWX_AWDL_MCU_MS		300	/* for the answer to one command */
+#define MWX_AWDL_ROC_GRANT_MS	300	/* a grant is waited for this long, then the request is aborted */
+#define MWX_AWDL_ROC_LATE_MS	80	/* a grant later than this is released without sending in it */
+#define MWX_AWDL_ROC_BACKOFF_MS	2000	/* after a request that was never granted */
+#define MWX_AWDL_ROC_SPARE_MS	95	/* asked on top of the dwell: grant, drain and abort have to fit */
+#define MWX_AWDL_ROC_STOP_MS	40	/* the dwell ends this long before the firmware ends the period itself */
+#define MWX_AWDL_TX_GUARD_MS	10	/* nothing new for the hardware this close to the end of a window */
+#define MWX_AWDL_DRAIN_MS	25	/* for the frames handed to the hardware to leave */
+#define MWX_AWDL_FAULT_MAX	3	/* unanswered commands in a row before the radio stays off */
+#define MWX_AWDL_TAP_GRACE_MS	100	/* frames still on their way after the sniffer was switched off */
+#define MWX_AWDL_FILTER_ENABLE	(1U << 31)	/* MT7921_FILTER_ENABLE */
+#define MWX_AWDL_FILTER_OTHER_BSS (1U << 6)	/* MT7921_FILTER_OTHER_BSS */
+#define MWX_AWDL_RATE_MIN	4	/* mt76_rates[]: OFDM 6 Mb/s */
+#define MWX_AWDL_RATE_START	8	/* 24 Mb/s */
+#define MWX_AWDL_RATE_MAX	11	/* 54 Mb/s */
+
+static const uint8_t mwx_awdl_bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+
+struct mwx_awdl_tx_slot {
+	uint16_t	len;
+	uint8_t		ch;
+	uint64_t	deadline_us;
+	uint8_t		data[MWX_AWDL_FRAME_MAX];
+};
+
+/* The rate of the unicast frames to one address, moved by the hardware's report of each frame. */
+struct mwx_awdl_peer {
+	uint8_t		addr[6];
+	uint8_t		rate;
+	uint8_t		good;
+	uint32_t	used;
+};
+
+struct mwx_awdl {
+	IOLock			*lock;		/* mailbox and TX queue */
+	IOWorkLoop		*wl;		/* the radio's thread */
+	IOTimerEventSource	*timer;
+	volatile bool		armed;		/* started by the interface */
+	volatile bool		paused;		/* a stop path is waiting: no window, no waiting */
+	volatile bool		dying;		/* detach */
+	volatile bool		running;	/* the radio thread is inside the gated part */
+	bool			off;		/* too many unanswered commands: off until the firmware starts again */
+	uint8_t			faults;
+	uint8_t			addr[6];	/* awdl0 */
+	/*
+	 * What the firmware was told. Each is set before the command that turns it on is sent and cleared
+	 * once the command that turns it off is out, so the receive tap can go by them at any moment.
+	 */
+	bool			omac_on;	/* addr is OMAC 1 */
+	bool			omac_failed;
+	bool			sniffer_on;
+	bool			filter_open;	/* RX filter with FIF_OTHER_BSS */
+	bool			fullpwr;	/* deep sleep taken away from a station that had asked for it */
+	bool			roc_active;
+	volatile bool		tap_filter;	/* sniffer_on || filter_open */
+	volatile bool		tap_grace;
+	uint64_t		tap_grace_until_us;
+	char			cc[2];		/* the country taken from the access point */
+	uint8_t			cc_bssid[6];
+	/* the window in progress */
+	volatile bool		rx_open;
+	volatile uint8_t	rx_ch;
+	/* remain on channel */
+	uint8_t			roc_token;
+	volatile bool		roc_want;
+	volatile bool		roc_granted;
+	uint8_t			roc_status;
+	uint64_t		off_since_us;
+	uint64_t		backoff_until_us;
+	uint64_t		home_until_us;	/* the access point keeps the radio until then */
+	uint32_t		lead_us;	/* measured request-to-grant time, the setup lead of the next window */
+	/* the radio's own commands: their answers never reach sc_mcu_wait[] */
+	uint32_t		seq_cmd[16];
+	uint32_t		seq_gen[16];
+	uint32_t		seq_status[16];
+	bool			seq_done[16];
+	/* mailbox: the next window */
+	MtkAwdlWindow		next;
+	bool			next_valid;
+	int			wake;		/* sleep channel of the radio thread */
+	/* frames for the windows */
+	struct mwx_awdl_tx_slot	*tx;
+	uint32_t		tx_head, tx_count;
+	bool			tx_was_full;	/* a frame was refused: tell the interface once there is room */
+	uint32_t		tx_inflight;	/* handed to the hardware, not reported yet */
+	uint8_t			txinfo[MWX_TXWI_MAX];	/* per TXWI: 0 not ours, 1 group or action, 2 + peer */
+	struct mwx_awdl_peer	peers[MWX_AWDL_PEERS];
+	uint32_t		peer_clock;
+	uint8_t			txbuf[MWX_AWDL_FRAME_MAX];	/* radio thread only */
+	uint8_t			rxbuf[MWX_AWDL_RX_MAX];	/* main work loop only */
+	/* counters */
+	uint32_t		c_win, c_onch, c_late, c_busy, c_share, c_badch, c_gone;
+	uint32_t		c_roc_ok, c_roc_fail, c_roc_late, c_roc_stray, c_roc_clip, c_cmd, c_cmd_err;
+	uint32_t		c_tx_group, c_tx_uc_ok[2], c_tx_uc_fail[2], c_tx_err, c_tx_stale, c_tx_full;
+	uint32_t		c_rx_af, c_rx_data, c_rx_long, c_rx_echo, c_rx_other, c_drain;
+	/* by social channel, 6, 44, 149, then any other: windows, AWDL frames heard, other frames heard */
+	uint32_t		c_win_ch[4], c_af_ch[4], c_other_ch[4];
+	uint32_t		c_rx_uc;	/* AWDL data frames addressed to awdl0 */
+	uint8_t			first_af;	/* bit per bucket: the first AWDL frame there was logged */
+	uint32_t		c_log;
+	uint64_t		late_us, off_us, log_us;
+};
+
+static struct mwx_softc *gMwxAwdlSc;
+
+/* The counters' bucket of a channel: AWDL's social channels 6, 44 and 149, then all the others. */
+static inline int
+mwx_awdl_bucket(uint8_t ch)
+{
+	return ch == 6 ? 0 : ch == 44 ? 1 : ch == 149 ? 2 : 3;
+}
+
+static bool mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
+static void mwx_awdl_close(struct mwx_softc *);
+
+uint64_t
+mtkAwdlUptimeUs()
+{
+	uint64_t ns = 0;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
+}
+
+/* The firmware cannot be talked to: asleep, stopping, reloading or gone. Nothing is sent to it then. */
+static bool
+mwx_awdl_fw_gone(struct mwx_softc *sc)
+{
+	return sc->sc_suspended || sc->sc_stopping || sc->sc_mcu_mute || sc->sc_resetting || sc->sc_detaching ||
+	    !sc->sc_fw_loaded || !(sc->sc_ic.ic_if.if_flags & IFF_RUNNING);
+}
+
+/* The station needs the radio for itself: a scan, a join, or the key handshake right after it. */
+static bool
+mwx_awdl_station_busy(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	if (sc->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN))
+		return true;
+	if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+		return true;
+	return ic->ic_state == IEEE80211_S_RUN && (ic->ic_flags & IEEE80211_F_RSNON) && ic->ic_bss != NULL &&
+	    !ic->ic_bss->ni_port_valid;
+}
+
+static bool
+mwx_awdl_stop_asked(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	return !a->armed || a->paused || a->dying || a->off || mwx_awdl_fw_gone(sc);
+}
+
+static uint8_t
+mwx_awdl_home(struct mwx_softc *sc, uint8_t *bw, uint8_t *center)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	uint8_t b = CMD_CBW_20MHZ, c = 0, ch;
+
+	if (ic->ic_state != IEEE80211_S_RUN || ni == NULL || ni->ni_chan == NULL ||
+	    ni->ni_chan == IEEE80211_CHAN_ANYC)
+		return 0;
+	ch = ieee80211_chan2ieee(ic, ni->ni_chan);
+	mwx_node_chan_width(ni, &b, &c);
+	if (bw != NULL)
+		*bw = b;
+	if (center != NULL)
+		*center = c ? c : ch;
+	return ch;
+}
+
+/*
+ * Only a real 20 MHz channel without radar duty, as thanhnndev's driver ended up doing: a remain-on-channel
+ * request for a DFS channel, or for a number that is no channel, is never granted and the firmware stopped
+ * answering after a few of them (mt7925-macos-wifi 61cd987, c8a285f).
+ */
+static bool
+mwx_awdl_channel_ok(struct mwx_softc *sc, uint8_t ch)
+{
+	const struct ieee80211_channel *c;
+
+	if (!((ch >= 1 && ch <= 13) || (ch >= 36 && ch <= 48 && (ch % 4) == 0) ||
+	    (ch >= 149 && ch <= 165 && (ch % 4) == 1)))
+		return false;
+	c = &sc->sc_ic.ic_channels[ch];
+	return c->ic_flags != 0 && !(c->ic_flags & (IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DFS));
+}
+
+/* An unanswered command. The station's own commands reload the firmware then; the radio only steps back. */
+static void
+mwx_awdl_fault(struct mwx_softc *sc, uint32_t cmd)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	a->c_cmd_err++;
+	a->backoff_until_us = mtkAwdlUptimeUs() + 5000000ULL;
+	if (++a->faults >= MWX_AWDL_FAULT_MAX && !a->off) {
+		a->off = true;
+		MWX_DEV_LOG(sc, "awdl: radio off, the firmware left %u commands unanswered (last 0x%08x)\n",
+		    a->faults, cmd);
+	} else if (a->c_cmd_err <= 8) {
+		MWX_DEV_LOG(sc, "awdl: command 0x%08x not answered in %u ms\n", cmd, MWX_AWDL_MCU_MS);
+	}
+}
+
+/*
+ * One command of the radio. Its answer is taken by mwx_awdl_mcu_event() instead of sc_mcu_wait[], so a late
+ * or missing one costs nothing and never reloads the firmware. wait_ms 0 sends without waiting, as Linux
+ * does for the remain-on-channel requests.
+ */
+static int
+mwx_awdl_mcu(struct mwx_softc *sc, uint32_t cmd, void *data, size_t len, uint32_t wait_ms, uint32_t *status)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint64_t until;
+	int rv, seq = 0;
+
+	if (mwx_awdl_fw_gone(sc))
+		return ENXIO;
+	rv = mwx_mcu_send_msg(sc, cmd, data, len, &seq);
+	if (rv != 0) {
+		a->c_cmd_err++;
+		return rv;
+	}
+	a->c_cmd++;
+	a->seq_status[seq] = 0;
+	a->seq_done[seq] = false;
+	a->seq_gen[seq] = sc->sc_mcu_seq;
+	a->seq_cmd[seq] = cmd;
+	if (wait_ms == 0 || a->paused || a->dying)
+		return 0;
+	until = mtkAwdlUptimeUs() + wait_ms * 1000ULL;
+	while (!a->seq_done[seq] && a->seq_cmd[seq] == cmd && !a->paused && !a->dying) {
+		uint64_t now = mtkAwdlUptimeUs();
+		if (now >= until)
+			break;
+		tsleep_nsec(&a->seq_cmd[seq], 0, "mwxawdl", (until - now) * 1000);
+	}
+	if (!a->seq_done[seq]) {
+		if (a->paused || a->dying)
+			return 0;
+		/* Still registered: a late answer is taken and freed by mwx_awdl_mcu_event(), never left in sc_mcu_wait[]. */
+		mwx_awdl_fault(sc, cmd);
+		return ETIMEDOUT;
+	}
+	a->faults = 0;
+	if (status != NULL)
+		*status = a->seq_status[seq];
+	return 0;
+}
+
+/* UNI_ROC_ACQUIRE: struct roc_acquire_tlv of mt7921_mcu_set_roc. */
+static int
+mwx_awdl_roc(struct mwx_softc *sc, uint8_t ch, uint32_t duration_ms)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct {
+		uint8_t		rsv[4];
+		uint16_t	tag;
+		uint16_t	len;
+		uint8_t		bss_idx;
+		uint8_t		tokenid;
+		uint8_t		control_channel;
+		uint8_t		sco;
+		uint8_t		band;
+		uint8_t		bw;
+		uint8_t		center_chan;
+		uint8_t		center_chan2;
+		uint8_t		bw_from_ap;
+		uint8_t		center_chan_from_ap;
+		uint8_t		center_chan2_from_ap;
+		uint8_t		reqtype;
+		uint32_t	maxinterval;
+		uint8_t		dbdcband;
+		uint8_t		rsv2[3];
+	} __packed req;
+	int rv;
+
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(0);			/* UNI_ROC_ACQUIRE */
+	req.len = htole16(sizeof(req) - 4);
+	req.bss_idx = sc->sc_vif.idx;
+	req.tokenid = ++a->roc_token;
+	req.control_channel = ch;
+	req.band = ch > 14 ? 2 : 1;
+	req.bw = CMD_CBW_20MHZ;
+	req.center_chan = ch;
+	req.bw_from_ap = CMD_CBW_20MHZ;
+	req.center_chan_from_ap = ch;
+	req.reqtype = 1;			/* MT7921_ROC_REQ_ROC */
+	req.maxinterval = htole32(duration_ms);
+	req.dbdcband = 0xff;			/* auto */
+	a->roc_granted = false;
+	a->roc_status = 0xff;
+	a->roc_want = true;
+	rv = mwx_awdl_mcu(sc, MCU_UNI_CMD_ROC, &req, sizeof(req), 0, NULL);
+	if (rv != 0)
+		a->roc_want = false;
+	return rv;
+}
+
+/* UNI_ROC_ABORT: struct roc_abort_tlv of mt7921_mcu_abort_roc. */
+static int
+mwx_awdl_roc_abort(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct {
+		uint8_t		rsv[4];
+		uint16_t	tag;
+		uint16_t	len;
+		uint8_t		bss_idx;
+		uint8_t		tokenid;
+		uint8_t		dbdcband;
+		uint8_t		rsv2[5];
+	} __packed req;
+
+	memset(&req, 0, sizeof(req));
+	req.tag = htole16(1);			/* UNI_ROC_ABORT */
+	req.len = htole16(sizeof(req) - 4);
+	req.bss_idx = sc->sc_vif.idx;
+	req.tokenid = a->roc_token;
+	req.dbdcband = 0xff;
+	a->roc_want = false;
+	return mwx_awdl_mcu(sc, MCU_UNI_CMD_ROC, &req, sizeof(req), 0, NULL);
+}
+
+/*
+ * MCU_UNI_EVENT_ROC, unsolicited; m starts after the event header. struct mt7921_roc_grant_tlv follows a
+ * 4-byte header: tag, len, bss_idx, tokenid, status, primarychannel, rfsco, rfband, channelwidth,
+ * centerfreqseg1, centerfreqseg2, reqtype, dbdcband, rsv, max_interval. Only the grant of the request in
+ * flight counts: an event for an older token is ignored (mt7925-macos-wifi 2545c30).
+ */
+static void
+mwx_awdl_roc_event(struct mwx_softc *sc, struct mbuf *m)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint8_t g[20];
+
+	if (mbuf_len(m) < 4 + sizeof(g) || mbuf_copydata(m, 4, sizeof(g), g) != 0)
+		return;
+	if ((g[0] | g[1] << 8) != 0 || !a->roc_want || g[5] != a->roc_token) {	/* UNI_EVENT_ROC_GRANT */
+		a->c_roc_stray++;
+		return;
+	}
+	a->roc_status = g[6];
+	a->roc_granted = true;
+	a->roc_want = false;
+	wakeup((void *)&a->roc_granted);
+}
+
+/*
+ * From mwx_mcu_rx_event(), main work loop; m starts after the event header. True when the event belongs to
+ * the radio: the remain-on-channel grant, or the answer to one of its own commands. A sequence number is
+ * the radio's only as long as fewer than 15 commands were sent after it, the distance at which the HAL
+ * hands the same number out again.
+ */
+static bool
+mwx_awdl_mcu_event(struct mwx_softc *sc, uint8_t eid, uint8_t seq, uint8_t option, struct mbuf *m)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	if ((option & MCU_UNI_CMD_UNSOLICITED_EVENT) && eid == MCU_UNI_EVENT_ROC) {
+		mwx_awdl_roc_event(sc, m);
+		return true;
+	}
+	if (seq == 0 || seq >= nitems(a->seq_cmd) || a->seq_cmd[seq] == 0)
+		return false;
+	if ((uint32_t)(sc->sc_mcu_seq - a->seq_gen[seq]) >= 15 ||
+	    sc->sc_mcu_wait[seq].mcu_cmd != a->seq_cmd[seq]) {
+		a->seq_cmd[seq] = 0;
+		return false;
+	}
+	if (eid == MCU_UNI_EVENT_RESULT && mbuf_len(m) >= sizeof(struct mt7921_mcu_uni_event))
+		a->seq_status[seq] = le32toh(mtod(m, struct mt7921_mcu_uni_event *)->status);
+	a->seq_done[seq] = true;
+	a->seq_cmd[seq] = 0;
+	wakeup(&a->seq_cmd[seq]);
+	return true;
+}
+
+/* UNI_SNIFFER_ENABLE: struct sniffer_enable_tlv of mt7921_mcu_set_sniffer. */
+static int
+mwx_awdl_sniffer(struct mwx_softc *sc, int enable, uint32_t wait_ms)
+{
+	struct {
+		uint8_t		band_idx;
+		uint8_t		pad[3];
+		uint16_t	tag;
+		uint16_t	len;
+		uint8_t		enable;
+		uint8_t		pad2[3];
+	} __packed req;
+
+	memset(&req, 0, sizeof(req));
+	req.band_idx = sc->sc_vif.band_idx;
+	req.tag = htole16(0);
+	req.len = htole16(sizeof(req) - 4);
+	req.enable = (uint8_t)enable;
+	return mwx_awdl_mcu(sc, MCU_UNI_CMD_SNIFFER, &req, sizeof(req), wait_ms, NULL);
+}
+
+/* UNI_SNIFFER_CONFIG: struct config_tlv of mt7921_mcu_config_sniffer. */
+static int
+mwx_awdl_sniffer_config(struct mwx_softc *sc, uint8_t ch, uint8_t bw, uint8_t center)
+{
+	struct {
+		uint8_t		band_idx;
+		uint8_t		pad[3];
+		uint16_t	tag;
+		uint16_t	len;
+		uint16_t	aid;
+		uint8_t		ch_band;
+		uint8_t		bw;
+		uint8_t		control_ch;
+		uint8_t		sco;
+		uint8_t		center_ch;
+		uint8_t		center_ch2;
+		uint8_t		drop_err;
+		uint8_t		pad2[3];
+	} __packed req;
+
+	memset(&req, 0, sizeof(req));
+	req.band_idx = sc->sc_vif.band_idx;
+	req.tag = htole16(1);
+	req.len = htole16(sizeof(req) - 4);
+	req.ch_band = ch > 14 ? 2 : 1;
+	/*
+	 * ch_width[] of mt7921_mcu_config_sniffer, not CMD_CBW_*: 20 and 40 MHz are 0 (40 comes from sco), 80
+	 * is 1, 160 is 2. The wrong table stopped the firmware on a 160 MHz link (mt7925-macos-wifi 4568bf2).
+	 */
+	req.bw = bw == CMD_CBW_160MHZ ? 2 : bw == CMD_CBW_80MHZ ? 1 : 0;
+	req.control_ch = ch;
+	req.center_ch = center ? center : ch;
+	if (req.control_ch < req.center_ch)
+		req.sco = 1;			/* SCA */
+	else if (req.control_ch > req.center_ch)
+		req.sco = 3;			/* SCB */
+	req.drop_err = 1;			/* no FCS-failed frames: their TLVs are noise */
+	return mwx_awdl_mcu(sc, MCU_UNI_CMD_SNIFFER, &req, sizeof(req), 0, NULL);
+}
+
+/*
+ * MCU_CE_CMD(SET_RX_FILTER), mt7921_mcu_set_rxfilter(dev, fif, 0, 0): mode 1 sets the whole filter. The
+ * firmware does not answer it, and Linux does not wait either.
+ */
+static int
+mwx_awdl_rxfilter(struct mwx_softc *sc, uint32_t fif)
+{
+	struct {
+		uint8_t		rsv[4];
+		uint8_t		mode;
+		uint8_t		rsv2[3];
+		uint32_t	fif;
+		uint32_t	bit_map;
+		uint8_t		bit_op;
+		uint8_t		pad[51];
+	} __packed req;
+
+	if (mwx_awdl_fw_gone(sc))
+		return ENXIO;
+	memset(&req, 0, sizeof(req));
+	req.mode = fif ? 1 : 2;
+	req.fif = htole32(fif);
+	sc->sc_awdl->c_cmd++;
+	return mwx_mcu_send_msg(sc, MCU_CE_CMD_SET_RX_FILTER, &req, sizeof(req), NULL);
+}
+
+/* DEV_INFO_UPDATE for OMAC 1, the request mt76_connac_mcu_uni_add_dev makes for a second interface. */
+static int
+mwx_awdl_omac(struct mwx_softc *sc, int enable)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct {
+		uint8_t		omac_idx;
+		uint8_t		band_idx;
+		uint16_t	pad;
+		uint16_t	tag;
+		uint16_t	len;
+		uint8_t		active;
+		uint8_t		pad2;
+		uint8_t		omac_addr[ETHER_ADDR_LEN];
+	} __packed req;
+	uint32_t status = 0;
+	int rv;
+
+	memset(&req, 0, sizeof(req));
+	req.omac_idx = 1;
+	req.band_idx = sc->sc_vif.band_idx;
+	req.tag = htole16(DEV_INFO_ACTIVE);
+	req.len = htole16(sizeof(req) - 4);
+	req.active = (uint8_t)enable;
+	memcpy(req.omac_addr, a->addr, ETHER_ADDR_LEN);
+	rv = mwx_awdl_mcu(sc, MCU_UNI_CMD_DEV_INFO_UPDATE, &req, sizeof(req), MWX_AWDL_MCU_MS, &status);
+	return rv != 0 ? rv : status != 0 ? EIO : 0;
+}
+
+/*
+ * "KeepFullPwr", what mwx_mcu_set_deep_sleep() sends, without touching the station's own record of it
+ * (sc_awdl_ds). Linux keeps the chip out of deep sleep for as long as the sniffer is on
+ * (mt7921_sniffer_interface_iter). An associated station already runs at full power here; this is for the
+ * windows of a station without a network, which the HAL leaves in deep sleep after a disconnection.
+ */
+static void
+mwx_awdl_fullpwr(struct mwx_softc *sc, bool on)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct mwx_connac_config req = { .resp_type = 0, };
+
+	if (a->fullpwr == on || mwx_awdl_fw_gone(sc))
+		return;
+	if (on && !sc->sc_awdl_ds)
+		return;				/* the station keeps full power itself */
+	if (!on && !sc->sc_awdl_ds) {
+		a->fullpwr = false;		/* the station changed its mind meanwhile: its setting stands */
+		return;
+	}
+	snprintf((char *)req.data, sizeof(req.data), "KeepFullPwr %d", on ? 1 : 0);
+	a->c_cmd++;
+	if (mwx_mcu_send_msg(sc, MCU_CE_CMD_CHIP_CONFIG, &req, sizeof(req), NULL) == 0)
+		a->fullpwr = on;
+}
+
+/*
+ * The regulatory country from the access point's Country element, as cfg80211 does (802.11d) before
+ * mt7921_regd_notifier sends the channel domain and the power limits again. The HAL starts with the world
+ * domain, "00".
+ */
+static void
+mwx_awdl_country(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	const uint8_t *ie, *end;
+
+	if (ic->ic_state != IEEE80211_S_RUN || ni == NULL || ni->ni_rsnie_tlv == NULL ||
+	    memcmp(a->cc_bssid, ni->ni_bssid, 6) == 0)
+		return;
+	memcpy(a->cc_bssid, ni->ni_bssid, 6);	/* once per access point */
+	ie = ni->ni_rsnie_tlv;
+	end = ie + ni->ni_rsnie_tlv_len;
+	while (end - ie >= 2 && end - ie >= 2 + ie[1]) {
+		if (ie[0] == IEEE80211_ELEMID_COUNTRY && ie[1] >= 3 && ie[2] >= 'A' && ie[2] <= 'Z' &&
+		    ie[3] >= 'A' && ie[3] <= 'Z')
+			break;
+		ie += 2 + ie[1];
+	}
+	if (end - ie < 5 || ie[0] != IEEE80211_ELEMID_COUNTRY)
+		return;
+	if (sc->sc_alpha2[0] == (char)ie[2] && sc->sc_alpha2[1] == (char)ie[3])
+		return;
+	MWX_DEV_LOG(sc, "awdl: regulatory country %c%c from the access point (was %c%c)\n", ie[2], ie[3],
+	    sc->sc_alpha2[0], sc->sc_alpha2[1]);
+	a->cc[0] = sc->sc_alpha2[0] = (char)ie[2];
+	a->cc[1] = sc->sc_alpha2[1] = (char)ie[3];
+	if (mt7921_mcu_set_channel_domain(sc) != 0 || mt7921_mcu_set_rate_txpower(sc) != 0)
+		MWX_DEV_LOG(sc, "awdl: the country was not taken by the firmware\n");
+}
+
+static struct mwx_awdl_peer *
+mwx_awdl_peer(struct mwx_awdl *a, const uint8_t *addr, int *slot)
+{
+	int i, old = 0;
+
+	for (i = 0; i < MWX_AWDL_PEERS; i++) {
+		if (a->peers[i].rate != 0 && memcmp(a->peers[i].addr, addr, 6) == 0) {
+			old = i;
+			goto found;
+		}
+		if (a->peers[i].used < a->peers[old].used)
+			old = i;
+	}
+	memcpy(a->peers[old].addr, addr, 6);
+	a->peers[old].rate = MWX_AWDL_RATE_START;
+	a->peers[old].good = 0;
+found:
+	a->peers[old].used = ++a->peer_clock;
+	*slot = old;
+	return &a->peers[old];
+}
+
+/*
+ * One frame on the air, as mt7921_mac_write_txwi() and mt7921_mac_write_txwi_80211() above describe a
+ * management frame, with these differences: the queue is ALTX0; the rate is a fixed OFDM one whatever the
+ * station's band (the station's basic rate is CCK on 2.4 GHz, which a 5 GHz window cannot send): 6 Mb/s for
+ * action and group frames, and for unicast data the rate the peer's acknowledgements allow; the frame comes
+ * from OMAC 1 once that carries awdl0's address, so that the MAC matches the peer's acknowledgement.
+ */
+static int
+mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct mwx_txwi *mt;
+	struct mt76_txwi *txp;
+	struct mbuf *m;
+	uint32_t val, rate, mode;
+	uint8_t type, subtype, omac, info = 1, ridx = MWX_AWDL_RATE_MIN, count = 15;
+	u_int hdrlen = 24;
+	int rv, slot;
+
+	if (len < 24 || len > MWX_AWDL_FRAME_MAX)
+		return EINVAL;
+	if (!mwx_tx_has_room(sc, 1))
+		return ENOBUFS;
+	type = (frame[0] & IEEE80211_FC0_TYPE_MASK) >> IEEE80211_FC0_TYPE_SHIFT;
+	subtype = (frame[0] & IEEE80211_FC0_SUBTYPE_MASK) >> IEEE80211_FC0_SUBTYPE_SHIFT;
+	if ((frame[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA) {
+		if (frame[0] & IEEE80211_FC0_SUBTYPE_QOS)
+			hdrlen = 26;
+		if (!(frame[4] & 1)) {
+			struct mwx_awdl_peer *p = mwx_awdl_peer(a, frame + 4, &slot);
+			ridx = p->rate;
+			info = (uint8_t)(2 + slot);
+			count = 8;
+		}
+	}
+	if (len < hdrlen)
+		return EINVAL;
+	m = MCLGETL(NULL, M_DONTWAIT, len);
+	if (m == NULL)
+		return ENOMEM;
+	if (mbuf_next(m) != NULL) {
+		m_freem(m);
+		return ENOMEM;
+	}
+	mbuf_setlen(m, len);
+	mbuf_pkthdr_setlen(m, len);
+	memcpy(mtod(m, uint8_t *), frame, len);
+	if ((mt = mwx_txwi_get(sc)) == NULL) {
+		m_freem(m);
+		return ENOBUFS;
+	}
+	txp = mt->mt_desc;
+	memset(txp, 0, sizeof(*txp));
+
+	omac = a->omac_on ? 1 : sc->sc_vif.omac_idx;
+	rate = mt76_rates[ridx].hw_value;
+	mode = (rate >> 8) << MT_TX_RATE_MODE_SHIFT;
+	rate = (rate & MT_TX_RATE_IDX_MASK) | (mode & MT_TX_RATE_MODE_MASK);
+
+	val = ((len + MT_TXD_SIZE) & MT_TXD0_TX_BYTES_MASK) | MT_TX_TYPE_CT | MT_TXD0_Q_IDX(MT_LMAC_ALTX0);
+	txp->txwi[0] = htole32(val);
+	val = MT_TXD1_LONG_FORMAT | (sc->sc_vif.vif_mn.wcid & MT_TXD1_WLAN_IDX_MASK) |
+	    (((uint32_t)omac << MT_TXD1_OWN_MAC_SHIFT) & MT_TXD1_OWN_MAC_MASK) |
+	    MT_HDR_FORMAT_802_11 | MT_TXD1_HDR_INFO(hdrlen / 2) | MT_TXD1_TID(0);
+	if (sc->sc_vif.band_idx)
+		val |= MT_TXD1_TGID;
+	txp->txwi[1] = htole32(val);
+	val = MT_TXD2_FRAME_TYPE(type) | MT_TXD2_SUB_TYPE(subtype) | MT_TXD2_FIX_RATE | MT_TXD2_HTC_VLD;
+	if (frame[4] & 1)
+		val |= MT_TXD2_MULTICAST;
+	txp->txwi[2] = htole32(val);
+	txp->txwi[3] = htole32(((uint32_t)count << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE);
+	txp->txwi[5] = htole32(MT_PACKET_ID_NO_SKB & MT_TXD5_PID);
+	txp->txwi[6] = htole32(MT_TXD6_FIXED_BW | ((rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK));
+	txp->txwi[7] = htole32(MT_TXD7_TYPE(type) | MT_TXD7_SUB_TYPE(subtype));
+
+	/* From here on the error paths are those of mwx_tx(). */
+	rv = mwx_txwi_enqueue(sc, mt, m);
+	if (rv != 0) {
+		m_freem(m);
+		mwx_txwi_put(sc, mt);
+		return rv;
+	}
+	if (mt->mt_idx < nitems(a->txinfo)) {
+		a->txinfo[mt->mt_idx] = (uint8_t)(info | (a->rx_ch > 14 ? 0x80 : 0));
+		a->tx_inflight++;
+	}
+	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
+	if (rv != 0) {
+		if (mt->mt_idx < nitems(a->txinfo) && a->txinfo[mt->mt_idx] != 0) {
+			a->txinfo[mt->mt_idx] = 0;
+			a->tx_inflight--;
+		}
+		mwx_txwi_put(sc, mt);
+	}
+	return rv;
+}
+
+/*
+ * From mwx_mac_tx_free(), main work loop: the hardware's report of one frame, the status and the number of
+ * transmissions it took (MT_TX_FREE_STATUS and MT_TX_FREE_COUNT, as mt7921_mac_tx_free reads them). True when
+ * the frame was the radio's.
+ */
+static bool
+mwx_awdl_tx_done(struct mwx_softc *sc, uint16_t msdu, uint32_t txval)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint8_t info;
+	bool failed = (txval & MT_TX_FREE_STATUS_MASK) != 0;
+	uint32_t count = txval & MT_TX_FREE_COUNT_MASK;
+
+	if (msdu >= nitems(a->txinfo) || (info = a->txinfo[msdu]) == 0)
+		return false;
+	a->txinfo[msdu] = 0;
+	if (a->tx_inflight != 0 && --a->tx_inflight == 0)
+		wakeup(&a->tx_inflight);
+	if ((info & 0x7f) >= 2 && (info & 0x7f) < 2 + MWX_AWDL_PEERS) {
+		struct mwx_awdl_peer *p = &a->peers[(info & 0x7f) - 2];
+		int band = (info & 0x80) ? 1 : 0;
+
+		if (failed)
+			a->c_tx_uc_fail[band]++;
+		else
+			a->c_tx_uc_ok[band]++;
+		if (failed || count > 3) {
+			if (p->rate > MWX_AWDL_RATE_MIN)
+				p->rate--;
+			p->good = 0;
+		} else if (count <= 1) {
+			if (++p->good >= 10 && p->rate < MWX_AWDL_RATE_MAX) {
+				p->rate++;
+				p->good = 0;
+			}
+		} else {
+			p->good = 0;
+		}
+	} else if (failed) {
+		a->c_tx_err++;
+	}
+	return true;
+}
+
+/* Sends the queued frames for `ch`; the ones for another channel or too old are dropped. Radio thread. */
+static void
+mwx_awdl_tx_flush(struct mwx_softc *sc, uint8_t ch)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	int budget;
+
+	for (budget = MWX_AWDL_TX_SLOTS; budget > 0; budget--) {
+		uint32_t len = 0;
+		uint64_t now = mtkAwdlUptimeUs();
+		bool freed = false;
+
+		if (!mwx_tx_has_room(sc, 1))
+			return;
+		IOLockLock(a->lock);
+		while (a->tx_count) {
+			struct mwx_awdl_tx_slot *s = &a->tx[a->tx_head];
+			if (s->deadline_us >= now && (s->ch == ch || s->ch == 0)) {
+				len = s->len;
+				memcpy(a->txbuf, s->data, len);
+			} else {
+				a->c_tx_stale++;
+			}
+			a->tx_head = (a->tx_head + 1) % MWX_AWDL_TX_SLOTS;
+			a->tx_count--;
+			if (len)
+				break;
+		}
+		if (a->tx_was_full && a->tx_count <= MWX_AWDL_TX_SLOTS / 2) {
+			a->tx_was_full = false;
+			freed = true;
+		}
+		IOLockUnlock(a->lock);
+		if (freed)
+			mtkAwdlRadioRoomFreed();
+		if (!len)
+			return;
+		mtkAwdlStampFrame(a->txbuf, len, mtkAwdlUptimeUs());
+		if (mwx_awdl_tx(sc, a->txbuf, len) != 0)
+			a->c_tx_err++;
+		else if (a->txbuf[4] & 1 || (a->txbuf[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA)
+			a->c_tx_group++;
+	}
+}
+
+/* Sleeps (gate open) until the uptime reaches `until_us`, a stop is asked for or another window arrives. */
+static void
+mwx_awdl_sleep_until(struct mwx_softc *sc, uint64_t until_us, bool wake_on_window)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	for (;;) {
+		uint64_t now = mtkAwdlUptimeUs();
+		uint64_t ns;
+
+		if (now >= until_us || mwx_awdl_stop_asked(sc))
+			return;
+		if (wake_on_window) {
+			bool newer;
+			IOLockLock(a->lock);
+			newer = a->next_valid;
+			IOLockUnlock(a->lock);
+			if (newer)
+				return;
+		}
+		ns = (until_us - now) * 1000;
+		if (ns > 5000000ULL)
+			ns = 5000000ULL;
+		tsleep_nsec(&a->wake, 0, "mwxawdl", ns);
+	}
+}
+
+/*
+ * Back to the station's own reception. The sniffer goes off first and its answer is waited for: until then
+ * the receive tap keeps the station's filter in software. Then MT7921_FILTER_ENABLE alone, which is
+ * mt7921_configure_filter() without FIF flags, and the register value mwx_init_hw() wrote, as the daily
+ * driver has it. Nothing is sent to a firmware that is not there: mwx_awdl_resume() or a reload sorts it.
+ */
+static void
+mwx_awdl_close(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	a->rx_open = false;
+	if ((!a->sniffer_on && !a->filter_open) || mwx_awdl_fw_gone(sc))
+		return;
+	if (a->sniffer_on && mwx_awdl_sniffer(sc, 0, MWX_AWDL_MCU_MS) == 0)
+		a->sniffer_on = false;
+	if (a->filter_open && !a->sniffer_on && mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE) == 0) {
+		mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
+		a->filter_open = false;
+	}
+	if (!a->sniffer_on && !a->filter_open) {
+		a->tap_grace_until_us = mtkAwdlUptimeUs() + MWX_AWDL_TAP_GRACE_MS * 1000ULL;
+		a->tap_grace = true;
+		a->tap_filter = false;
+	}
+}
+
+/*
+ * One window. Radio thread, inside the main command gate; every wait opens the gate, and after every wait
+ * the reasons to stop are looked at again. A step that fails ends the window: the remain-on-channel period
+ * is always given back with an abort and the reception goes back to the station's settings.
+ */
+static void
+mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint8_t bw = CMD_CBW_20MHZ, center = 0;
+	uint8_t home = mwx_awdl_home(sc, &bw, &center);
+	bool onch = home != 0 && home == w->channel;
+	uint64_t now = mtkAwdlUptimeUs(), start = w->startUs, end, roc_deadline = 0, t;
+	uint32_t lead = onch ? 5000 : a->lead_us, dwell = w->dwellMs;
+
+	if (a->off || mwx_awdl_fw_gone(sc)) {
+		a->c_gone++;
+		return;
+	}
+	if (mwx_awdl_station_busy(sc) || now < a->backoff_until_us) {
+		a->c_busy++;
+		mwx_awdl_close(sc);
+		return;
+	}
+	/*
+	 * The access point keeps the radio until home_until_us. The interface's schedule leaves it whole EAWs, and
+	 * this window is picked up right when the one before it ended: what counts is when its setup will begin.
+	 */
+	if (!onch && home != 0 &&
+	    (start == 0 ? now : start > lead ? start - lead : 0) < a->home_until_us) {
+		a->c_share++;
+		mwx_awdl_close(sc);
+		return;
+	}
+	if (!mwx_awdl_channel_ok(sc, w->channel)) {
+		a->c_badch++;
+		mwx_awdl_close(sc);
+		return;
+	}
+	if (start == 0)
+		start = now;
+	if (start > now + lead)
+		mwx_awdl_sleep_until(sc, start - lead, false);
+	now = mtkAwdlUptimeUs();
+	if (mwx_awdl_stop_asked(sc))
+		return;
+	if (now > start + (uint64_t)dwell * 500 || mwx_awdl_station_busy(sc)) {
+		a->c_late++;
+		mwx_awdl_close(sc);
+		return;
+	}
+
+	mwx_awdl_country(sc);
+	if (!a->omac_on && !a->omac_failed) {
+		if (mwx_awdl_omac(sc, 1) == 0)
+			a->omac_on = true;
+		else
+			a->omac_failed = true;	/* frames then leave from the station's own MAC, unacknowledged */
+		MWX_DEV_LOG(sc, "awdl: own MAC 1 %s for %s\n", a->omac_on ? "set" : "refused",
+		    ether_sprintf(a->addr));
+		if (mwx_awdl_stop_asked(sc))
+			return;
+	}
+	if (home == 0)
+		mwx_awdl_fullpwr(sc, true);
+
+	/* Other devices' frames, from before the radio moves. */
+	a->tap_filter = true;
+	a->filter_open = true;
+	if (mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE | MWX_AWDL_FILTER_OTHER_BSS) != 0)
+		goto fail;
+	if (!a->sniffer_on) {
+		a->sniffer_on = true;
+		if (mwx_awdl_sniffer(sc, 1, 0) != 0)
+			goto fail;
+	}
+	if (!onch) {
+		/*
+		 * A timed request, long enough for the grant, the wait for the start, the dwell, the drain and
+		 * the abort, which has to reach the firmware before the period ends on its own (mt7925-macos-wifi
+		 * 0b3a4f0, 2ab8329).
+		 */
+		uint32_t ahead = start > now ? (uint32_t)((start - now) / 1000) : 0;
+		uint32_t duration = ahead + dwell + MWX_AWDL_ROC_SPARE_MS, took;
+		uint64_t asked = mtkAwdlUptimeUs();
+
+		if (mwx_awdl_roc(sc, w->channel, duration) != 0)
+			goto fail;
+		a->roc_active = true;
+		a->off_since_us = asked;
+		roc_deadline = asked + (uint64_t)duration * 1000;
+		/*
+		 * The grant is waited for, never given up early: an abort sent before a grant that was still
+		 * coming is what the firmware did not survive (mt7925-macos-wifi 0f00c9a).
+		 */
+		while (a->roc_want && !a->roc_granted &&
+		    mtkAwdlUptimeUs() < asked + MWX_AWDL_ROC_GRANT_MS * 1000ULL && !mwx_awdl_fw_gone(sc) &&
+		    !a->dying)
+			tsleep_nsec((void *)&a->roc_granted, 0, "mwxroc", 2000000ULL);
+		took = (uint32_t)((mtkAwdlUptimeUs() - asked) / 1000);
+		if (!a->roc_granted || a->roc_status != 0 || took >= MWX_AWDL_ROC_LATE_MS) {
+			if (a->roc_granted && a->roc_status == 0)
+				a->c_roc_late++;
+			else
+				a->c_roc_fail++;
+			if (a->c_roc_fail + a->c_roc_late <= 8)
+				MWX_DEV_LOG(sc, "awdl: no window on %u: grant %d status %u after %u ms\n",
+				    w->channel, a->roc_granted, a->roc_status, took);
+			if (!a->roc_granted)
+				a->backoff_until_us = mtkAwdlUptimeUs() + MWX_AWDL_ROC_BACKOFF_MS * 1000ULL;
+			goto abort;
+		}
+		a->c_roc_ok++;
+		/* The next window starts its setup this much earlier (an average, kept between 4 and 45 ms). */
+		took = (uint32_t)(mtkAwdlUptimeUs() - now) + 3000;
+		took = (7 * a->lead_us + took) / 8;
+		a->lead_us = took < 4000 ? 4000 : took > 45000 ? 45000 : took;
+	} else {
+		a->c_onch++;
+	}
+	/*
+	 * The sniffer follows the radio. On the station's channel it listens at the link's own width, or the link
+	 * would be narrowed for the window (mt7925-macos-wifi 15a6659). Off it, on the 5 GHz social channels, at 80
+	 * MHz: Apple devices run AWDL there at 80 MHz (44: 36-48, 149: 149-161), and a peer that sends its unicast
+	 * data that wide is not heard by a radio listening at 20 (mt7925-macos-wifi completed its first transfer
+	 * with the station at 80 MHz on 149; ForbiddenItlwm listens at 80 on 44 and 149). The remain-on-channel
+	 * request stays at 20 MHz, as Linux makes it; our frames leave at 20 MHz on the primary channel.
+	 */
+	{
+		uint8_t sbw = CMD_CBW_20MHZ, sctr = w->channel;
+
+		if (onch) {
+			sbw = bw;
+			sctr = center;
+		} else if (w->channel == 44 || w->channel == 149) {
+			sbw = CMD_CBW_80MHZ;
+			sctr = w->channel == 44 ? 42 : 155;
+		}
+		if (mwx_awdl_sniffer_config(sc, w->channel, sbw, sctr) != 0)
+			goto abort;
+	}
+	if (mtkAwdlUptimeUs() < start)
+		mwx_awdl_sleep_until(sc, start, false);
+	now = mtkAwdlUptimeUs();
+	if (now > start + 2000) {
+		a->c_late++;
+		a->late_us += now - start;
+	}
+	end = start + (uint64_t)dwell * 1000;
+	if (roc_deadline != 0 && end + MWX_AWDL_ROC_STOP_MS * 1000ULL > roc_deadline) {
+		end = roc_deadline - MWX_AWDL_ROC_STOP_MS * 1000ULL;
+		a->c_roc_clip++;
+	}
+	a->rx_ch = w->channel;
+	a->rx_open = true;
+	a->c_win++;
+	a->c_win_ch[mwx_awdl_bucket(w->channel)]++;
+
+	for (;;) {
+		now = mtkAwdlUptimeUs();
+		if (now >= end || mwx_awdl_stop_asked(sc) || mwx_awdl_station_busy(sc))
+			break;
+		/* Nothing new for the hardware near the end: it would leave after the radio went back. */
+		if (now + MWX_AWDL_TX_GUARD_MS * 1000ULL < end)
+			mwx_awdl_tx_flush(sc, w->channel);
+		tsleep_nsec(&a->wake, 0, "mwxawdl", end - now > 1000 ? 1000000ULL : (end - now) * 1000);
+	}
+	/* What the hardware still holds leaves on this channel, as far as the period allows. */
+	t = mtkAwdlUptimeUs();
+	while (a->tx_inflight != 0 && !mwx_awdl_fw_gone(sc) && !a->dying) {
+		now = mtkAwdlUptimeUs();
+		if (now >= t + MWX_AWDL_DRAIN_MS * 1000ULL ||
+		    (roc_deadline != 0 && now + 15000 >= roc_deadline))
+			break;
+		tsleep_nsec(&a->tx_inflight, 0, "mwxawdl", 1000000ULL);
+	}
+	if (a->tx_inflight != 0) {
+		a->c_drain++;
+		a->tx_inflight = 0;		/* not carried into the next window */
+	}
+	a->rx_open = false;
+
+	/* The next window on the station's channel right after this one keeps the reception open. */
+	if (onch && !mwx_awdl_stop_asked(sc) && !mwx_awdl_station_busy(sc)) {
+		bool chained;
+		IOLockLock(a->lock);
+		chained = a->next_valid && a->next.channel == w->channel && a->next.startUs <= end + 10000;
+		IOLockUnlock(a->lock);
+		if (chained)
+			return;
+	}
+abort:
+	if (a->roc_active) {
+		/*
+		 * Always, late or not: the firmware does not leave the channel by itself when the time is up
+		 * (mt7925-macos-wifi b4ec2f0). The abort goes before the sniffer is switched off, whose answer can
+		 * take long (67c0c45).
+		 */
+		mwx_awdl_roc_abort(sc);
+		a->roc_active = false;
+		now = mtkAwdlUptimeUs();
+		a->off_us += now - a->off_since_us;
+		/* The access point gets the radio back for at least a third of the time it was away. */
+		a->home_until_us = now + (now - a->off_since_us) / 3;
+	}
+fail:
+	mwx_awdl_close(sc);
+}
+
+static IOReturn
+mwx_awdl_run_gated(OSObject *, void *arg, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct mwx_awdl *a = sc->sc_awdl;
+	MtkAwdlWindow w;
+	uint64_t now;
+	bool have;
+
+	if (a == NULL || a->dying)
+		return kIOReturnSuccess;
+	a->running = true;
+	for (;;) {
+		IOLockLock(a->lock);
+		have = a->armed && !a->paused && !a->dying && a->next_valid;
+		if (have) {
+			w = a->next;
+			a->next_valid = false;
+		}
+		IOLockUnlock(a->lock);
+		if (!have)
+			break;
+		mwx_awdl_window(sc, &w);
+	}
+	if (!a->dying) {
+		mwx_awdl_close(sc);
+		if (!a->armed && !a->paused) {
+			mwx_awdl_fullpwr(sc, false);
+			/* AWDL is off: the chip stops acknowledging frames for awdl0's address. */
+			if (a->omac_on && !mwx_awdl_fw_gone(sc) && mwx_awdl_omac(sc, 0) == 0)
+				a->omac_on = false;
+		}
+	}
+	now = mtkAwdlUptimeUs();
+	if (a->c_log < 4 || now - a->log_us > 30000000ULL) {
+		char line[480];
+
+		a->c_log++;
+		a->log_us = now;
+		mtkAwdlRadioSummary(line, sizeof(line));
+		MWX_DEV_LOG(sc, "awdl: radio %s\n", line);
+		mtkAwdlRadioChannels(line, sizeof(line));
+		MWX_DEV_LOG(sc, "awdl: radio %s\n", line);
+	}
+	a->running = false;
+	wakeup((void *)&a->running);
+	return kIOReturnSuccess;
+}
+
+/* The radio thread. It only tries the main gate: a stop path that holds it may be waiting for this thread. */
+static void
+mwx_awdl_timer(OSObject *, IOTimerEventSource *)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a;
+	IOCommandGate *gate;
+	int tries;
+
+	if (sc == NULL || (a = sc->sc_awdl) == NULL || (gate = sc->sc_rx_amsdu_gate) == NULL)
+		return;
+	for (tries = 0; tries < 5000 && !a->dying && !a->paused; tries++) {
+		if (gate->attemptAction(mwx_awdl_run_gated, sc) != kIOReturnCannotLock)
+			break;
+		IOSleep(1);
+	}
+}
+
+/*
+ * Receive tap, from mwx_rx() after mt7921_mac_fill_rx(): m starts with the 802.11 header. True when the
+ * frame is not for net80211.
+ *
+ * AWDL frames go to the interface. For everything else, as long as the firmware may be handing over other
+ * devices' frames (the sniffer or the wider filter is on, or was a moment ago), the station's own filter is
+ * applied here: net80211 gets a frame only if it is addressed to the station, or group addressed in the
+ * station's BSS. net80211 does not look at addr1 of a unicast frame, so a frame of our access point for
+ * another station would otherwise run through this station's Block Ack window with that station's sequence
+ * numbers.
+ */
+static bool
+mwx_awdl_rx_tap(struct mwx_softc *sc, struct mbuf *m, const struct ieee80211_rxinfo *rxi)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct ieee80211com *ic = &sc->sc_ic;
+	size_t len = mbuf_pkthdr_len(m), n = len < 30 ? len : 30;
+	uint8_t h[30];
+	const uint8_t *bssid;
+	bool filter = a->tap_filter;
+
+	if (!filter && a->tap_grace) {
+		if (mtkAwdlUptimeUs() < a->tap_grace_until_us)
+			filter = true;
+		else
+			a->tap_grace = false;
+	}
+	if (!filter && !a->armed)
+		return false;
+	if (len < 10 || mbuf_copydata(m, 0, n, h) != 0)
+		return filter;
+
+	if (n >= 24 && memcmp(h + 16, mwx_awdl_bssid, 6) == 0 &&
+	    ((h[0] == 0xd0 && n >= 29 && h[24] == 0x7f && h[25] == 0x00 && h[26] == 0x17 && h[27] == 0xf2 &&
+	    h[28] == 0x08) ||
+	    ((h[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA && (h[1] & IEEE80211_FC1_DIR_MASK) == 0))) {
+		int rssi = rxi->rxi_rssi;
+
+		if (!a->armed)
+			return true;
+		if (memcmp(h + 10, a->addr, 6) == 0) {
+			a->c_rx_echo++;		/* our own frame */
+			return true;
+		}
+		if (len > sizeof(a->rxbuf) || mbuf_copydata(m, 0, len, a->rxbuf) != 0) {
+			a->c_rx_long++;
+			return true;
+		}
+		if (h[0] == 0xd0) {
+			uint8_t ch = rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch;
+			int b = mwx_awdl_bucket(ch);
+
+			a->c_rx_af++;
+			a->c_af_ch[b]++;
+			if (!(a->first_af & (1U << b))) {
+				a->first_af |= (uint8_t)(1U << b);
+				MWX_DEV_LOG(sc, "awdl: first AWDL frame heard on channel %u, from %s\n", ch,
+				    ether_sprintf(h + 10));
+			}
+		} else {
+			a->c_rx_data++;
+			if (!(h[4] & 1) && memcmp(h + 4, a->addr, 6) == 0)
+				a->c_rx_uc++;
+		}
+		mtkAwdlInput(a->rxbuf, (uint32_t)len, rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch,
+		    rssi < 0 && rssi > -128 ? rssi : 0, mtkAwdlUptimeUs());
+		return true;
+	}
+	if (!filter)
+		return false;
+
+	/* The station's filter. */
+	if (memcmp(h + 4, ic->ic_myaddr, 6) == 0)
+		return false;
+	if ((h[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_CTL && n >= 24 && (h[4] & 1)) {
+		if ((h[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT &&
+		    (sc->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) &&
+		    ((h[0] & IEEE80211_FC0_SUBTYPE_MASK) == IEEE80211_FC0_SUBTYPE_BEACON ||
+		    (h[0] & IEEE80211_FC0_SUBTYPE_MASK) == IEEE80211_FC0_SUBTYPE_PROBE_RESP))
+			return false;		/* a scan wants every network */
+		bssid = (h[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
+		    (h[1] & IEEE80211_FC1_DIR_MASK) == IEEE80211_FC1_DIR_FROMDS ? h + 10 : h + 16;
+		if (ic->ic_state >= IEEE80211_S_AUTH && ic->ic_bss != NULL &&
+		    memcmp(bssid, ic->ic_bss->ni_bssid, 6) == 0)
+			return false;
+	}
+	a->c_rx_other++;
+	a->c_other_ch[mwx_awdl_bucket(rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch)]++;
+	return true;
+}
+
+/*
+ * A stop path (interface down, system sleep, shutdown, reset, detach) is about to stop the chip: no new
+ * window, and the one in progress ends now, giving its remain-on-channel period back if the firmware is
+ * still there. Returns when the radio thread is out of the gated part. Called with or without the main gate
+ * held; the wait opens it. mwx_awdl_resume() lets the radio work again.
+ */
+static void
+mwx_awdl_quiesce(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	int tries;
+
+	if (a == NULL)
+		return;
+	a->paused = true;
+	wakeup(&a->wake);
+	wakeup((void *)&a->roc_granted);
+	for (tries = 0; a->running && tries < 400; tries++)
+		tsleep_nsec((void *)&a->running, 0, "mwxawq", 5000000ULL);
+	if (a->running)
+		MWX_DEV_LOG(sc, "awdl: the radio thread did not stop in 2 s\n");
+	a->rx_open = false;
+}
+
+/* The firmware was loaded again: it has none of the radio's settings. From mwx_init_hw(). */
+static void
+mwx_awdl_firmware_reset(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	if (a == NULL)
+		return;
+	a->omac_on = a->omac_failed = false;
+	a->sniffer_on = a->filter_open = a->fullpwr = a->roc_active = false;
+	a->rx_open = false;
+	a->roc_want = a->roc_granted = false;
+	a->tap_filter = false;
+	a->tx_inflight = 0;
+	memset(a->txinfo, 0, sizeof(a->txinfo));
+	memset(a->seq_cmd, 0, sizeof(a->seq_cmd));
+	a->faults = 0;
+	a->off = false;
+}
+
+/*
+ * The interface runs again, at the end of mwx_init_hw(), which has just switched the sniffer off and written
+ * the station's RX filter register. What a window left behind in a firmware that was not reloaded is taken
+ * back, and windows are allowed again.
+ */
+static void
+mwx_awdl_resume(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	if (a == NULL)
+		return;
+	if (a->filter_open)
+		mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE);
+	a->sniffer_on = a->filter_open = a->roc_active = false;
+	a->omac_on = a->omac_failed = false;	/* the interface was registered again */
+	a->rx_open = false;
+	a->roc_want = a->roc_granted = false;
+	a->tap_grace_until_us = mtkAwdlUptimeUs() + MWX_AWDL_TAP_GRACE_MS * 1000ULL;
+	a->tap_grace = true;
+	a->tap_filter = false;
+	a->faults = 0;
+	a->off = false;
+	a->paused = false;
+	if (a->armed && a->timer != NULL)
+		a->timer->setTimeoutUS(1000);
+}
+
+/* Attach: the functions below find the hardware layer through this. */
+static void
+mwx_awdl_attach(struct mwx_softc *sc)
+{
+	gMwxAwdlSc = sc;
+}
+
+/* Detach. The radio thread is waited for before its timer is taken off its work loop (see the top). */
+static void
+mwx_awdl_free(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	int tries;
+
+	if (gMwxAwdlSc == sc)
+		gMwxAwdlSc = NULL;
+	if (a == NULL)
+		return;
+	a->armed = false;
+	a->dying = true;
+	wakeup(&a->wake);
+	wakeup((void *)&a->roc_granted);
+	if (a->timer != NULL)
+		a->timer->cancelTimeout();
+	for (tries = 0; a->running && tries < 400; tries++)
+		tsleep_nsec((void *)&a->running, 0, "mwxawf", 5000000ULL);
+	if (a->timer != NULL) {
+		if (a->wl != NULL)
+			a->wl->removeEventSource(a->timer);
+		a->timer->release();
+		a->timer = NULL;
+	}
+	if (a->wl != NULL) {
+		a->wl->release();
+		a->wl = NULL;
+	}
+	sc->sc_awdl = NULL;
+	if (a->lock != NULL) {
+		IOLockLock(a->lock);		/* a caller of the functions below that is still inside */
+		IOLockUnlock(a->lock);
+	}
+	if (a->tx != NULL)
+		IOFree(a->tx, sizeof(*a->tx) * MWX_AWDL_TX_SLOTS);
+	if (a->lock != NULL)
+		IOLockFree(a->lock);
+	IOFree(a, sizeof(*a));
+}
+
+int
+mtkAwdlRadioStart(const uint8_t *address)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a;
+
+	if (sc == NULL || gMwxHal == NULL || address == NULL || sc->sc_detaching)
+		return ENXIO;
+	a = sc->sc_awdl;
+	if (a == NULL) {
+		a = (struct mwx_awdl *)IOMalloc(sizeof(*a));
+		if (a == NULL)
+			return ENOMEM;
+		memset(a, 0, sizeof(*a));
+		a->lock = IOLockAlloc();
+		a->tx = (struct mwx_awdl_tx_slot *)IOMalloc(sizeof(*a->tx) * MWX_AWDL_TX_SLOTS);
+		a->wl = IOWorkLoop::workLoop();
+		a->timer = IOTimerEventSource::timerEventSource(gMwxHal, mwx_awdl_timer);
+		a->lead_us = 30000;
+		if (a->lock == NULL || a->tx == NULL || a->wl == NULL || a->timer == NULL ||
+		    a->wl->addEventSource(a->timer) != kIOReturnSuccess) {
+			if (a->timer != NULL)
+				a->timer->release();
+			if (a->wl != NULL)
+				a->wl->release();
+			if (a->tx != NULL)
+				IOFree(a->tx, sizeof(*a->tx) * MWX_AWDL_TX_SLOTS);
+			if (a->lock != NULL)
+				IOLockFree(a->lock);
+			IOFree(a, sizeof(*a));
+			return ENOMEM;
+		}
+		sc->sc_awdl = a;
+	}
+	IOLockLock(a->lock);
+	if (memcmp(a->addr, address, 6) != 0) {
+		memcpy(a->addr, address, 6);
+		a->omac_on = a->omac_failed = false;	/* the next window registers the new address */
+	}
+	a->next_valid = false;
+	a->tx_count = 0;
+	IOLockUnlock(a->lock);
+	a->armed = true;
+	MWX_DEV_LOG(sc, "awdl: radio started for %s\n", ether_sprintf((uint8_t *)a->addr));
+	return 0;
+}
+
+void
+mtkAwdlRadioStop()
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+
+	if (a == NULL)
+		return;
+	a->armed = false;
+	IOLockLock(a->lock);
+	a->next_valid = false;
+	a->tx_count = 0;
+	IOLockUnlock(a->lock);
+	/* The radio thread ends the window in progress and closes the reception. */
+	wakeup(&a->wake);
+	if (a->timer != NULL && !a->dying)
+		a->timer->setTimeoutUS(1);
+}
+
+int
+mtkAwdlRadioWindow(const MtkAwdlWindow *window)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+
+	if (a == NULL || !a->armed || a->dying || window == NULL || !window->channel || !window->dwellMs)
+		return ENXIO;
+	if (a->off)
+		return EIO;
+	IOLockLock(a->lock);
+	a->next = *window;
+	a->next_valid = true;
+	IOLockUnlock(a->lock);
+	wakeup(&a->wake);
+	if (a->timer != NULL)
+		a->timer->setTimeoutUS(1);
+	return 0;
+}
+
+int
+mtkAwdlRadioQueue(const uint8_t *frame, uint32_t length, uint8_t channel, uint32_t maxAgeMs)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+	int rv = 0;
+
+	if (a == NULL || !a->armed || a->dying)
+		return ENXIO;
+	if (frame == NULL || length < 24 || length > MWX_AWDL_FRAME_MAX)
+		return EINVAL;
+	IOLockLock(a->lock);
+	if (a->tx_count >= MWX_AWDL_TX_SLOTS) {
+		a->c_tx_full++;
+		a->tx_was_full = true;
+		rv = ENOBUFS;
+	} else {
+		struct mwx_awdl_tx_slot *s = &a->tx[(a->tx_head + a->tx_count) % MWX_AWDL_TX_SLOTS];
+		memcpy(s->data, frame, length);
+		s->len = (uint16_t)length;
+		s->ch = channel;
+		s->deadline_us = mtkAwdlUptimeUs() + (uint64_t)maxAgeMs * 1000;
+		a->tx_count++;
+	}
+	IOLockUnlock(a->lock);
+	if (rv == 0 && a->rx_open)
+		wakeup(&a->wake);		/* a window is open: the frame leaves now */
+	return rv;
+}
+
+uint32_t
+mtkAwdlRadioRoom()
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+	uint32_t room;
+
+	if (a == NULL || !a->armed || a->dying)
+		return 0;
+	IOLockLock(a->lock);
+	room = MWX_AWDL_TX_SLOTS - a->tx_count;
+	IOLockUnlock(a->lock);
+	return room;
+}
+
+uint8_t
+mtkAwdlRadioHomeChannel()
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+
+	return sc != NULL ? mwx_awdl_home(sc, NULL, NULL) : 0;
+}
+
+bool
+mtkAwdlRadioChannelAllowed(uint8_t channel)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+
+	return sc != NULL && mwx_awdl_channel_ok(sc, channel);
+}
+
+void
+mtkAwdlRadioSummary(char *buffer, size_t length)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+
+	if (buffer == NULL || length == 0)
+		return;
+	if (a == NULL) {
+		snprintf(buffer, length, "not started");
+		return;
+	}
+	snprintf(buffer, length,
+	    "win=%u onch=%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
+	    "badch=%u gone=%u cmd=%u/%u tx grp=%u uc2=%u/%u uc5=%u/%u err=%u stale=%u full=%u drain=%u "
+	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d",
+	    a->c_win, a->c_onch, a->c_roc_ok, a->c_roc_fail, a->c_roc_late, a->c_roc_stray, a->c_roc_clip, a->lead_us,
+	    a->c_late, a->late_us / 1000, a->off_us / 1000, a->c_busy, a->c_share, a->c_badch, a->c_gone, a->c_cmd,
+	    a->c_cmd_err, a->c_tx_group, a->c_tx_uc_ok[0], a->c_tx_uc_fail[0], a->c_tx_uc_ok[1], a->c_tx_uc_fail[1],
+	    a->c_tx_err, a->c_tx_stale, a->c_tx_full, a->c_drain, a->c_rx_af, a->c_rx_data, a->c_rx_uc, a->c_rx_echo,
+	    a->c_rx_other, a->c_rx_long, a->omac_on, sc->sc_alpha2[0], sc->sc_alpha2[1], a->off);
+}
+
+/* Windows, AWDL frames and other frames heard, by social channel: a line of its own, the summary is long already. */
+void
+mtkAwdlRadioChannels(char *buffer, size_t length)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+
+	if (buffer == NULL || length == 0)
+		return;
+	if (a == NULL) {
+		snprintf(buffer, length, "not started");
+		return;
+	}
+	snprintf(buffer, length, "win/af/other ch6=%u/%u/%u ch44=%u/%u/%u ch149=%u/%u/%u chx=%u/%u/%u",
+	    a->c_win_ch[0], a->c_af_ch[0], a->c_other_ch[0], a->c_win_ch[1], a->c_af_ch[1], a->c_other_ch[1],
+	    a->c_win_ch[2], a->c_af_ch[2], a->c_other_ch[2], a->c_win_ch[3], a->c_af_ch[3], a->c_other_ch[3]);
+}
+#endif /* MTK_AWDL */
