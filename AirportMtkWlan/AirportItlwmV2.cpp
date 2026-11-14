@@ -7,6 +7,9 @@
 //
 
 #include "AirportItlwmV2.hpp"
+#ifdef MTK_AWDL
+#include "awdl/MtkAwdl.h"
+#endif
 #include <sys/_netstat.h>
 #include <crypto/sha1.h>
 #include <IOKit/IOMessage.h>
@@ -1119,6 +1122,11 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
+#ifdef MTK_AWDL
+    // wifip2pd reads capability 32 (AWDL) here and asks for awdl0 only if it is set.
+    if (mtkAwdlEnabled())
+        cd->capabilities[4] |= 0x01;
+#endif
 #else
     cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
     cd->capabilities[3] = 0x2B;

@@ -38,6 +38,11 @@ files.
   integration with this hardware layer: flxxxxddd
   (https://github.com/flxxxxddd/SimpleMtkWlan).
 
+- `AirportMtkWlan/awdl/`: the AWDL virtual interface and the generated layouts of
+  Apple's classes, from thanhnndev's mt7925-macos-wifi
+  (https://github.com/thanhnndev/mt7925-macos-wifi), BSD-3-Clause-Clear, see the
+  LICENSE in that directory.
+
 ## Current Project Work
 
 - Project rename, packaging, and MT7921/MT7922-focused maintenance by laobamac

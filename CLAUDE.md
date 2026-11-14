@@ -154,7 +154,14 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - HAL sleeps (`tsleep_nsec`) go through `IOCommandGate::commandSleep` in the
   AIRPORT build: `enable()` runs with the gate held, and the interrupt that
   completes an MCU command needs that gate.
-- No AppleVTD support (needs `DisableIoMapper`), no WPA3-SAE, no AWDL.
+- No AppleVTD support (needs `DisableIoMapper`), no WPA3-SAE.
+- AWDL (Tahoe only, `-mtkawdl`): `AirportMtkWlan/awdl/` creates `awdl0` as a subclass
+  of `IO80211AWDLProtocol` and answers the AWDL peer manager's configure
+  handshake. Nothing goes on the air yet, so no AirDrop. `-mtkawdl` also
+  publishes the driver log, as `-mtkdbglog` does, so it is the only switch an
+  AWDL test needs. That file is compiled
+  on its own against the layouts in `awdl/io80211`; struct sizes come from the
+  request lengths the Family's ioctl handlers check, never from a guess.
 
 ## Testing on hardware
 
