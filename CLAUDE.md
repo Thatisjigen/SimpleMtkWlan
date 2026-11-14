@@ -68,7 +68,9 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   code. Per-packet logging visibly cut throughput and evicted useful history.
 - `MtkMwx::debugPoll()` runs from the watchdog every second on the main gate:
   periodic `poll`/`stats` lines, TX stall descriptor dump, automatic hard reset
-  (firmware reload) if a DMA ring stops moving.
+  (firmware reload) if a DMA ring stops moving, or if the data RX ring stays
+  silent for 30 s while frames go out (without a link: while scans end). Wi-Fi
+  off and on keeps the firmware and does not recover a deaf chip.
 - In zsh, `log` is a builtin; use `/usr/bin/log`.
 
 ## Hardware lessons (do not regress)

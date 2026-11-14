@@ -9876,6 +9876,65 @@ MtkMwx::debugPoll()
 		    sta & sc->sc_intr_mask);
 		mwx_intr(sc);
 	}
+
+	/*
+	 * Reception stall. The data RX ring can stop for good while the MCU
+	 * ring and TX keep working, which the check above does not see; Wi-Fi
+	 * off and on does not bring it back, a firmware reload does. Seen on
+	 * an MT7920 with AWDL windows running, 14 minutes into a link on a DFS
+	 * channel: every MCU command still succeeded, frames kept leaving, and
+	 * nothing reached the ring again, scans included, until the next boot.
+	 * Silent for 30 s while 32 frames went out, or, without a link, while
+	 * two scans ended (a background scan of a few channels may rightly
+	 * find nothing), is a stall: the same hard reset as a DMA stall, the
+	 * next one no sooner than 1, 2, 4, then 8 minutes later while it
+	 * keeps coming back.
+	 */
+	{
+		static uint32_t rx_last = 0xffffffff, rx_tx_last = 0xffffffff;
+		static uint32_t rx_sent, rx_scans, rx_resets;
+		static uint64_t rx_moved_ms, rx_reset_ms;
+		static int rx_was_scanning;
+		uint32_t rq_dma = mwx_read(sc, sc->sc_rxq.mq_regbase + MT_DMA_DMA_IDX);
+		uint32_t n = sc->sc_txq.mq_count;
+		int scanning = (sc->sc_flags &
+		    (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) != 0;
+		uint64_t now_ns = 0, now_ms, gap;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+		now_ms = now_ns / 1000000;
+		if (rq_dma != rx_last || !(ic->ic_if.if_flags & IFF_RUNNING)) {
+			if (rx_resets != 0 && now_ms - rx_reset_ms > 600000)
+				rx_resets = 0;
+			rx_last = rq_dma;
+			rx_moved_ms = now_ms;
+			rx_sent = rx_scans = 0;
+		} else {
+			if (n != 0 && tq_dma < n && rx_tx_last < n)
+				rx_sent += (tq_dma + n - rx_tx_last) % n;
+			if (rx_was_scanning && !scanning)
+				rx_scans++;
+		}
+		rx_tx_last = tq_dma;
+		rx_was_scanning = scanning;
+		gap = 60000ULL << (rx_resets == 0 ? 0 : rx_resets - 1 < 3 ?
+		    rx_resets - 1 : 3);
+		if (now_ms - rx_moved_ms >= 30000 && (rx_sent >= 32 ||
+		    (ic->ic_state != IEEE80211_S_RUN && rx_scans >= 2)) &&
+		    (rx_resets == 0 || now_ms - rx_reset_ms >= gap)) {
+			MWX_DEV_LOG(sc,
+			    "RX stall detected: nothing received for %llu s while %u frames went out and %u scans ended, hard reset\n",
+			    (unsigned long long)((now_ms - rx_moved_ms) / 1000),
+			    rx_sent, rx_scans);
+			rx_reset_ms = now_ms;
+			rx_resets++;
+			rx_last = 0xffffffff;
+			rx_moved_ms = now_ms;
+			rx_sent = rx_scans = 0;
+			sc->sc_hard_reset = 1;
+			mwx_reset(sc);
+		}
+	}
 }
 
 #ifdef MTK_AWDL
