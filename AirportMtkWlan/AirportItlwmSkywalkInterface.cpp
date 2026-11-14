@@ -7,6 +7,9 @@
 //
 #include "AirportItlwmV2.hpp"
 #include "AirportItlwmSkywalkInterface.hpp"
+#ifdef MTK_AWDL
+#include "awdl/MtkAwdl.h"
+#endif
 #include <sys/CTimeout.hpp>
 #include <libkern/c++/OSMetaClass.h>
 #include <crypto/sha1.h>
@@ -1089,5 +1092,20 @@ IOReturn AirportItlwmSkywalkInterface::setMacAddress(mloAddrArray &addresses)
 IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
 {
     return kIOReturnUnsupported;
+}
+#endif
+
+#ifdef MTK_AWDL
+static_assert(APPLE80211_VIF_AWDL == 6, "wifip2pd asks for the AWDL interface with role 6");
+
+IOReturn AirportItlwmSkywalkInterface::
+setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
+{
+    if (data == NULL)
+        return kIOReturnBadArgument;
+    if (!mtkAwdlEnabled() || data->role != APPLE80211_VIF_AWDL)
+        return kIOReturnUnsupported;
+    return mtkAwdlCreateInterface(instance, data->mac, fHalService->get80211Controller()->ic_myaddr,
+                                  (char *)data->bsd_name, sizeof(data->bsd_name) - 1);
 }
 #endif

@@ -80,6 +80,7 @@ KMOD
 	"$clang" -target x86_64-apple-macos10.12 -mkernel -fno-builtin -fno-common -nostdlib -DKERNEL \
 		-I "$sdkhdr" -c "$obj/kmod_info.c" -o "$obj/kmod_info.o"
 	objects+=("$obj/kmod_info.o")
+	[[ -e "$out/obj-awdl/MtkAwdlInterface.o" && "$name" == AirportMtkWlan ]] && objects+=("$out/obj-awdl/MtkAwdlInterface.o")
 	"$ld64" -arch x86_64 -kext -static -macos_version_min 10.12 -undefined dynamic_lookup \
 		-o "$bundle/Contents/MacOS/$name" "${objects[@]}" "$libkmod"
 	python3 -I - "$here/$plist" "$bundle/Contents/Info.plist" "$version" "$name" "$bundleid" <<'PY'
@@ -116,7 +117,16 @@ if [[ "$product" == all || "$product" == AirportMtkWlan ]] && [[ -d "$here/Airpo
 	esac
 	out="$here/build/$config/${AIRPORT_OS:-tahoe}"
 	mkdir -p "$out"
+	# The AWDL interface is Tahoe only, and is compiled on its own against its own layouts of Apple's classes.
+	awdl_define=()
+	if [[ "$target" == __MAC_26_0 ]]; then
+		awdl_define=(-DMTK_AWDL)
+		mkdir -p "$out/obj-awdl"
+		"$clangxx" -target x86_64-apple-macos10.12 -x c++ -std=c++17 -mkernel -fapple-kext -fno-rtti -fno-exceptions -fno-builtin \
+			-fno-common -nostdlib -fno-use-cxa-atexit -fno-asynchronous-unwind-tables -DKERNEL "${opt[@]}" \
+			-I "$sdkhdr" -Wno-everything -Werror=return-type -c "$here/AirportMtkWlan/awdl/MtkAwdlInterface.cpp" -o "$out/obj-awdl/MtkAwdlInterface.o"
+	fi
 	build AirportMtkWlan com.flxxxxddd.AirportMtkWlan AirportMtkWlan/WCL/Info.plist \
-		-DAIRPORT -DAIRPORT_WCL "-D__IO80211_TARGET=$target" -DIO80211FAMILY_V2 -- "${common_sources[@]}" \
+		-DAIRPORT -DAIRPORT_WCL "-D__IO80211_TARGET=$target" -DIO80211FAMILY_V2 ${awdl_define[@]+"${awdl_define[@]}"} -- "${common_sources[@]}" \
 		$(cd "$here" && ls AirportMtkWlan/*.cpp AirportMtkWlan/WCL/*.cpp 2>/dev/null)
 fi
