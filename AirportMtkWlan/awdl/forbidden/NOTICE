@@ -1,0 +1,9 @@
+The headers in this folder are taken from ForbiddenItlwm
+(https://github.com/retropineaple/ForbiddenItlwm, include/, commit 4a5491a6ed800ce693a72864e86a9a6a2e9cc5c6),
+by retropineaple and contributors, licensed under the GNU General Public License, version 2, like this driver
+(see LICENSE in the root of this repository).
+
+They are the chip-independent AWDL pieces of that driver: action and data frame parsing and building, the
+synchronization parameters TLV, the fixed local schedule, the master indication TLVs and the receive metadata the
+Family's peer manager wants. The only change is the include style: "AWDL*.hpp" with quotes instead of <AWDL*.hpp>,
+so the AWDL interface, which is compiled on its own, needs no extra include path.
