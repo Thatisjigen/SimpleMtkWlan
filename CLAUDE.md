@@ -172,7 +172,23 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   touches nothing until awdl0 starts it. The interface keeps the AWDL timeline,
   posts the availability window events, builds the synchronization and master
   indication frames, hands received action frames to the Family's peer manager
-  and carries awdl0's data, A-MSDUs included. Until a peer is heard the schedule
+  and carries awdl0's data, A-MSDUs included. Block Ack: a peer in an agreement
+  gets a station record in the firmware, on a BSS of AWDL's own on OMAC 1 (a P2P
+  device that is not connected; WCIDs 15-17 for the peers, 18 for the BSS's
+  group record). With the three taken, a record goes only from a peer quiet for
+  3 s, after a DELBA for each of its agreements; a peer moving data keeps its
+  own and the newcomer stays on the single-frame path. A peer's ADDBA request is
+  answered once the receive agreement is in the WTBL and STA_REC_BA, so the MAC
+  answers its A-MPDUs; the hardware
+  then splits its A-MSDUs and the tap removes the two alignment bytes, and the
+  interface keeps a 64-frame duplicate window per sender and TID (no
+  reordering). To a peer we send many unicast frames to on the station's
+  channel we ask for an agreement ourselves: its data then goes as QoS TID 0 in
+  the station's best-effort queue under the peer's record, at HT MCS 4-7, and
+  the MAC aggregates it. Away from the station's channel, or when the first
+  aggregated frames do not come back, frames take the single-frame path on
+  ALTX0. `-mtkawdlnoba` leaves all of it out; `awdl: radio ba` and
+  `awdl: rx qos` in the log count it. Until a peer is heard the schedule
   visits the social channels 6, 44 and 149; a device that names itself master is
   followed. After 60 s with no peer, no data and nothing asked by the Family, the
   timeline stops and the radio goes back to the station, as with awdl0 down; the

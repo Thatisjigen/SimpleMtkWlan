@@ -1187,7 +1187,8 @@ void		 mt7921_mcu_sta_key_delete(struct mwx_softc *,
 			    struct ieee80211_node *, struct ieee80211_key *);
 #ifdef MTK_AWDL
 /* The AWDL radio, at the end of this file. Each of these is called only when sc_awdl is set. */
-static bool	mwx_awdl_rx_tap(struct mwx_softc *, struct mbuf *, const struct ieee80211_rxinfo *);
+static bool	mwx_awdl_rx_tap(struct mwx_softc *, struct mbuf *, const struct ieee80211_rxinfo *, uint8_t);
+static uint8_t	mwx_awdl_rx_subframe(struct mbuf *, uint16_t);
 static bool	mwx_awdl_mcu_event(struct mwx_softc *, uint8_t, uint8_t, uint8_t, struct mbuf *);
 static bool	mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
 static void	mwx_awdl_quiesce(struct mwx_softc *);
@@ -2538,10 +2539,22 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 	MtkRxDescriptorMeta descriptor = {};
 	int aggregate = 0, rv;
 	uint32_t rx_epoch = 0;
+#ifdef MTK_AWDL
+	uint8_t awdl_part = 0;
+#endif
 
 	/* Opt-in until hardware-format and throughput validation is complete. */
 	if (sc->sc_rx_amsdu_enabled) {
 		aggregate = mtkRxAmsduReadDescriptor(m, descriptor);
+#ifdef MTK_AWDL
+		/*
+		 * A subframe of an A-MSDU the hardware split, sent by an AWDL peer: the hardware splits them once the
+		 * peer has a station record. It is no station frame (no FromDS); the AWDL tap takes it below.
+		 */
+		if (aggregate < 0 && sc->sc_awdl != NULL &&
+		    (awdl_part = mwx_awdl_rx_subframe(m, descriptor.hdr_gap)) != 0)
+			aggregate = 0;
+#endif
 		if (aggregate != 0 && !mwx_rx_amsdu_snapshot(sc, &rx_epoch)) {
 			m_freem(m);
 			return;
@@ -2563,6 +2576,10 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 			return;
 		}
 	}
+#ifdef MTK_AWDL
+	else if (sc->sc_awdl != NULL)
+		awdl_part = mwx_awdl_rx_subframe(m, 0);
+#endif
 	rv = mt7921_mac_fill_rx(sc, m, &rxi, &sec);
 	if (rv != 0) {
 		if (aggregate)
@@ -2579,7 +2596,7 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 	}
 #ifdef MTK_AWDL
 	/* AWDL frames go to awdl0; while other devices' frames may arrive, the station's filter runs here. */
-	if (sc->sc_awdl != NULL && mwx_awdl_rx_tap(sc, m, &rxi)) {
+	if (sc->sc_awdl != NULL && mwx_awdl_rx_tap(sc, m, &rxi, awdl_part)) {
 		m_freem(m);
 		return;
 	}
@@ -10104,6 +10121,36 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_RATE_START	8	/* 24 Mb/s */
 #define MWX_AWDL_RATE_MAX	11	/* 54 Mb/s */
 
+/*
+ * Block Ack agreements with AWDL peers. A peer in an agreement gets a station record in the firmware, which lets the
+ * MAC answer its A-MPDUs with a Block Ack and aggregate the frames sent to it. The records live in a BSS of AWDL's own
+ * on OMAC 1, awdl0's address, kept apart from the station's BSS: the station's teardown and power save never touch
+ * them. The station's records use WCIDs 1-14 and 19 (MWX_WTBL_RESERVED); the peers take 15-17 and the BSS 18, the
+ * entries mt76 leaves to a second interface. -mtkawdlnoba leaves all of it out.
+ */
+#define MWX_AWDL_BSS_IDX	1
+#define MWX_AWDL_BSS_WCID	(MWX_WTBL_RESERVED - 1)
+#define MWX_AWDL_STA_SLOTS	3
+#define MWX_AWDL_STA_IDLE_MS	3000	/* a peer with no data either way for this long may give its record up */
+#define MWX_AWDL_BA_WINSIZE	64	/* HT's largest window, also the receive window answered */
+#define MWX_AWDL_BA_BURST	16	/* unicast frames to a peer in one second that call for an agreement */
+#define MWX_AWDL_ADDBA_WAIT_MS	1000	/* for the peer's answer to our request */
+#define MWX_AWDL_BA_PROBE	8	/* a new agreement's frames that must come back before more go out */
+#define MWX_AWDL_BA_PROBE_MS	1000	/* how long they may take; then the agreement is given up */
+#define MWX_AWDL_BAQ		8	/* Block Ack action frames heard, waiting for the radio thread */
+#define MWX_AWDL_BAQ_BYTES	36	/* the header and every field of an ADDBA request, response or DELBA */
+#define MWX_AWDL_TXI_AGG	0x40	/* in txinfo[]: a frame of the aggregated path */
+#define MWX_AWDL_TXI_5GHZ	0x80	/* in txinfo[]: sent on 5 GHz */
+
+/*
+ * Rates of the aggregated path, as the TXD6 rate field takes them: HT MCS 4 to 7, one stream, 20 MHz, long GI. An
+ * A-MPDU needs an HT or later PPDU; the per-frame path keeps the OFDM ladder below.
+ */
+static const uint16_t mwx_awdl_ht_rates[] = {
+	(MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 4, (MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 5,
+	(MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 6, (MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 7,
+};
+
 static const uint8_t mwx_awdl_bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
 
 struct mwx_awdl_tx_slot {
@@ -10113,12 +10160,45 @@ struct mwx_awdl_tx_slot {
 	uint8_t		data[MWX_AWDL_FRAME_MAX];
 };
 
-/* The rate of the unicast frames to one address, moved by the hardware's report of each frame. */
+/* Our side of a transmit agreement with a peer. */
+enum {
+	MWX_AWDL_TXBA_NONE,
+	MWX_AWDL_TXBA_ASKED,		/* our ADDBA request is out, waiting for the answer */
+	MWX_AWDL_TXBA_ON,		/* in force: unicast data on the station's channel goes aggregated */
+};
+
+/*
+ * One unicast address: the rate of the frames to it, moved by the hardware's report of each frame, and, while it takes
+ * part in a Block Ack agreement, its station record. Radio thread and main work loop, both inside the main gate.
+ */
 struct mwx_awdl_peer {
 	uint8_t		addr[6];
 	uint8_t		rate;
 	uint8_t		good;
 	uint32_t	used;
+	uint16_t	wcid;		/* its station record; 0 = none */
+	uint8_t		ch;		/* where its last frame was heard, or our last one sent */
+	uint8_t		rx_tids;	/* receive agreements in force, one bit per TID */
+	uint8_t		tx_state;	/* MWX_AWDL_TXBA_* */
+	uint8_t		tx_token;
+	uint8_t		tx_tries;	/* requests left unanswered in a row */
+	uint8_t		ba_rate;	/* index in mwx_awdl_ht_rates */
+	uint8_t		ba_good;
+	uint16_t	tx_sn;		/* next sequence number of TID 0 on the aggregated path */
+	uint16_t	tx_ssn;
+	uint16_t	tx_win;
+	uint16_t	ba_out;		/* aggregated-path frames handed over and not reported yet */
+	uint16_t	ba_ok, ba_fail;	/* reported, since the agreement started */
+	uint32_t	data_n;		/* unicast data frames handed over in the second that began at data_us */
+	uint64_t	data_us, last_us, tx_asked_us, tx_retry_us, ba_first_us;
+	uint64_t	rx_us;		/* its last data frame heard (receive tap) */
+};
+
+/* A Block Ack action frame heard, for the radio thread. */
+struct mwx_awdl_baq {
+	uint8_t		len;
+	uint8_t		ch;
+	uint8_t		frame[MWX_AWDL_BAQ_BYTES];
 };
 
 struct mwx_awdl {
@@ -10176,6 +10256,21 @@ struct mwx_awdl {
 	uint8_t			txinfo[MWX_TXWI_MAX];	/* per TXWI: 0 not ours, 1 group or action, 2 + peer */
 	struct mwx_awdl_peer	peers[MWX_AWDL_PEERS];
 	uint32_t		peer_clock;
+	/* Block Ack */
+	bool			ba_off;		/* -mtkawdlnoba */
+	bool			bss_on;		/* AWDL's BSS and its group record are in the firmware */
+	bool			bss_failed;	/* refused: no records until the firmware starts again */
+	bool			win_onch;	/* the window in progress is on the station's channel */
+	uint8_t			sta_used;	/* bit per station record slot */
+	uint16_t		mgmt_sn;
+	struct mwx_awdl_baq	baq[MWX_AWDL_BAQ];	/* main work loop adds, radio thread takes; both gated */
+	uint32_t		baq_head, baq_count;
+	uint32_t		c_sta_add, c_sta_del, c_sta_fail, c_sta_busy, c_baq_full, c_split;
+	uint32_t		c_ba_heard, c_ba_skip, c_mgmt_other;	/* for the log's first lines */
+	uint32_t		c_rxba_ok, c_rxba_no, c_rxba_del;
+	uint32_t		c_txba_ask, c_txba_ok, c_txba_no, c_txba_late, c_txba_del, c_txba_drop;
+	uint32_t		c_ba_ok, c_ba_fail, c_ba_hold;
+	uint32_t		c_agg[16];	/* the MAC's A-MPDU length bins, read around windows that aggregated */
 	uint8_t			txbuf[MWX_AWDL_FRAME_MAX];	/* radio thread only */
 	uint8_t			rxbuf[MWX_AWDL_RX_MAX];	/* main work loop only */
 	/* counters */
@@ -10650,25 +10745,462 @@ mwx_awdl_country(struct mwx_softc *sc)
 }
 
 static struct mwx_awdl_peer *
-mwx_awdl_peer(struct mwx_awdl *a, const uint8_t *addr, int *slot)
+mwx_awdl_peer_find(struct mwx_awdl *a, const uint8_t *addr, int *slot)
 {
-	int i, old = 0;
+	int i;
 
 	for (i = 0; i < MWX_AWDL_PEERS; i++) {
 		if (a->peers[i].rate != 0 && memcmp(a->peers[i].addr, addr, 6) == 0) {
-			old = i;
-			goto found;
+			if (slot != NULL)
+				*slot = i;
+			return &a->peers[i];
 		}
-		if (a->peers[i].used < a->peers[old].used)
-			old = i;
 	}
-	memcpy(a->peers[old].addr, addr, 6);
-	a->peers[old].rate = MWX_AWDL_RATE_START;
-	a->peers[old].good = 0;
-found:
-	a->peers[old].used = ++a->peer_clock;
-	*slot = old;
-	return &a->peers[old];
+	return NULL;
+}
+
+/*
+ * The entry of an address, made when there is none. The one that goes is the least recently used among those without
+ * a station record: a record is only given up by mwx_awdl_sta_free(), which tells the firmware.
+ */
+static struct mwx_awdl_peer *
+mwx_awdl_peer(struct mwx_awdl *a, const uint8_t *addr, int *slot)
+{
+	struct mwx_awdl_peer *p = mwx_awdl_peer_find(a, addr, slot);
+	int i, old = -1;
+
+	if (p == NULL) {
+		for (i = 0; i < MWX_AWDL_PEERS; i++) {
+			if (a->peers[i].wcid == 0 && (old < 0 || a->peers[i].used < a->peers[old].used))
+				old = i;
+		}
+		if (old < 0)
+			old = 0;	/* not reached: MWX_AWDL_STA_SLOTS < MWX_AWDL_PEERS */
+		p = &a->peers[old];
+		memset(p, 0, sizeof(*p));
+		memcpy(p->addr, addr, 6);
+		p->rate = MWX_AWDL_RATE_START;
+		p->ba_rate = nitems(mwx_awdl_ht_rates) - 1;
+		*slot = old;
+	}
+	p->used = ++a->peer_clock;
+	return p;
+}
+
+/*
+ * A command of the Block Ack part, built in an mbuf (consumed), with its answer waited for as mwx_awdl_mcu() waits.
+ * Radio thread only. 0 only when the firmware answered with status 0; a stop path that cuts the wait short gives
+ * ECANCELED, a missing answer counts as a fault of the radio (mwx_awdl_fault()).
+ */
+static int
+mwx_awdl_mcu_sync(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint64_t until;
+	int rv, seq = 0;
+
+	if (m == NULL)
+		return ENOBUFS;
+	if (mwx_awdl_fw_gone(sc) || a->paused || a->dying || a->off) {
+		m_freem(m);
+		return ECANCELED;
+	}
+	rv = mwx_mcu_send_mbuf(sc, cmd, m, &seq);
+	if (rv != 0) {
+		a->c_cmd_err++;
+		return rv;
+	}
+	a->c_cmd++;
+	a->seq_status[seq] = 0;
+	a->seq_done[seq] = false;
+	a->seq_gen[seq] = sc->sc_mcu_seq;
+	a->seq_cmd[seq] = cmd;
+	until = mtkAwdlUptimeUs() + MWX_AWDL_MCU_MS * 1000ULL;
+	while (!a->seq_done[seq] && a->seq_cmd[seq] == cmd && !a->paused && !a->dying) {
+		uint64_t now = mtkAwdlUptimeUs();
+
+		if (now >= until)
+			break;
+		tsleep_nsec(&a->seq_cmd[seq], 0, "mwxawdl", (until - now) * 1000);
+	}
+	if (!a->seq_done[seq]) {
+		if (a->paused || a->dying)
+			return ECANCELED;
+		mwx_awdl_fault(sc, cmd);
+		return ETIMEDOUT;
+	}
+	a->faults = 0;
+	return a->seq_status[seq] != 0 ? EIO : 0;
+}
+
+/*
+ * AWDL's BSS, the BSS_INFO half of mt76_connac_mcu_uni_add_dev() for OMAC 1 (mwx_awdl_omac() is the DEV_INFO half). A
+ * P2P device that is not connected, AP | P2P with conn_state 1, as mt76 builds one for NL80211_IFTYPE_P2P_DEVICE: the
+ * firmware gives it no channel and no beacon, only the peers' records hang on it. MtkWireless found an IBSS refused by
+ * the MT7921 firmware and this type taken. It shares the station's EDCA set, whose queues the aggregated path uses.
+ */
+static int
+mwx_awdl_bss_cmd(struct mwx_softc *sc, bool on)
+{
+	struct {
+		struct {
+			uint8_t		bss_idx;
+			uint8_t		pad[3];
+		} __packed hdr;
+		struct mt76_connac_bss_basic_tlv basic;
+	} __packed req;
+	struct mbuf *m;
+
+	memset(&req, 0, sizeof(req));
+	req.hdr.bss_idx = MWX_AWDL_BSS_IDX;
+	req.basic.tag = htole16(UNI_BSS_INFO_BASIC);
+	req.basic.len = htole16(sizeof(req.basic));
+	req.basic.active = on;
+	req.basic.omac_idx = 1;
+	req.basic.hw_bss_idx = 1;
+	req.basic.band_idx = sc->sc_vif.band_idx;
+	req.basic.conn_type = htole32(STA_TYPE_AP | NETWORK_P2P);
+	req.basic.conn_state = 1;
+	req.basic.wmm_idx = sc->sc_vif.wmm_idx;
+	req.basic.bmc_tx_wlan_idx = htole16(MWX_AWDL_BSS_WCID);
+	req.basic.sta_idx = htole16(MWX_AWDL_BSS_WCID);
+	if ((m = mwx_mcu_alloc_msg(sizeof(req))) == NULL)
+		return ENOBUFS;
+	memcpy(mtod(m, caddr_t), &req, sizeof(req));
+	return mwx_awdl_mcu_sync(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, m);
+}
+
+/*
+ * A station record on AWDL's BSS, or its removal: for a peer, or with addr NULL the BSS's group record. STA_REC_BASIC
+ * and the WTBL entry the MAC finds the peer by, its address against OMAC 1 (muar_idx 1), as
+ * mt76_connac_mcu_sta_basic_tlv() and mt76_connac_mcu_wtbl_generic_tlv() fill them. A peer is a QoS station that takes
+ * A-MPDUs of up to 64 KB with no MPDU spacing, as every AWDL device, and its frames keep their 802.11 header. Its type
+ * is CONNECTION_INFRA_STA: mt76 gives this chip no P2P station types, and MtkWireless runs its AWDL peers so.
+ */
+static int
+mwx_awdl_sta_cmd(struct mwx_softc *sc, uint16_t wcid, const uint8_t *addr, bool add)
+{
+	struct mbuf *m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	struct sta_rec_basic *basic;
+	struct sta_rec_wtbl *wtbl;
+	struct mwx_vif v;
+	uint16_t tlvnum = 0, wnum = 0;
+	int wlen = 0;
+
+	if (m == NULL)
+		return ENOBUFS;
+	basic = (struct sta_rec_basic *)mwx_append_tlv(m, &tlvnum, STA_REC_BASIC, sizeof(*basic));
+	basic->conn_type = htole32(addr == NULL ? STA_TYPE_BC | NETWORK_INFRA : STA_TYPE_STA | NETWORK_INFRA);
+	basic->conn_state = add ? CONN_STATE_PORT_SECURE : CONN_STATE_DISCONNECT;
+	basic->extra_info = htole16(EXTRA_INFO_VER | (add ? EXTRA_INFO_NEW : 0));
+	basic->qos = add && addr != NULL;
+	if (addr == NULL)
+		memset(basic->peer_addr, 0xff, IEEE80211_ADDR_LEN);
+	else
+		memcpy(basic->peer_addr, addr, IEEE80211_ADDR_LEN);
+	wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum, STA_REC_WTBL, sizeof(*wtbl));
+	wtbl->wlan_idx_lo = wcid & 0xff;
+	wtbl->wlan_idx_hi = wcid >> 8;
+	wtbl->operation = WTBL_RESET_AND_SET;
+	if (add) {
+		struct wtbl_generic *generic = (struct wtbl_generic *)mwx_append_tlv(m, &wnum, WTBL_GENERIC,
+		    sizeof(*generic));
+		struct wtbl_rx *rx;
+
+		if (addr == NULL) {
+			memset(generic->peer_addr, 0xff, IEEE80211_ADDR_LEN);
+			generic->muar_idx = 0xe;
+		} else {
+			memcpy(generic->peer_addr, addr, IEEE80211_ADDR_LEN);
+			generic->muar_idx = 1;
+			generic->qos = 1;
+		}
+		rx = (struct wtbl_rx *)mwx_append_tlv(m, &wnum, WTBL_RX, sizeof(*rx));
+		rx->rca1 = rx->rca2 = rx->rv = 1;
+		wlen = sizeof(*generic) + sizeof(*rx);
+		if (addr != NULL) {
+			struct wtbl_hdr_trans *htr = (struct wtbl_hdr_trans *)mwx_append_tlv(m, &wnum, WTBL_HDR_TRANS,
+			    sizeof(*htr));
+			struct wtbl_ht *ht = (struct wtbl_ht *)mwx_append_tlv(m, &wnum, WTBL_HT, sizeof(*ht));
+
+			htr->no_rx_trans = 1;
+			ht->ht = 1;
+			ht->af = 3;		/* 2^(13 + 3) - 1 = 65535 bytes */
+			wlen += sizeof(*htr) + sizeof(*ht);
+		}
+	}
+	wtbl->tlv_num = htole16(wnum);
+	wtbl->len = htole16(sizeof(*wtbl) + wlen);
+	memset(&v, 0, sizeof(v));
+	v.idx = MWX_AWDL_BSS_IDX;
+	return mwx_awdl_mcu_sync(sc, MCU_UNI_CMD_STA_REC_UPDATE, mwx_fill_sta_req_hdr(m, &v, 1, wcid, tlvnum));
+}
+
+/*
+ * A record made anew. A record that is still in a firmware the interface stop did not reload answers the add with an
+ * error (MtkWireless saw 0x10003 for a second add): it is removed and made again once.
+ */
+static int
+mwx_awdl_sta_add(struct mwx_softc *sc, uint16_t wcid, const uint8_t *addr)
+{
+	int rv = mwx_awdl_sta_cmd(sc, wcid, addr, true);
+
+	if (rv == EIO) {
+		(void)mwx_awdl_sta_cmd(sc, wcid, addr, false);
+		rv = mwx_awdl_sta_cmd(sc, wcid, addr, true);
+	}
+	if (rv == 0)
+		mwx_mac_wtbl_update(sc, wcid);	/* as mt7921_mac_sta_add(): the entry's counters start at 0 */
+	return rv;
+}
+
+/* AWDL's BSS and its group record, made before the first peer record. Radio thread. */
+static bool
+mwx_awdl_bss_up(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	int rv;
+
+	if (a->bss_on)
+		return true;
+	if (a->bss_failed || !a->omac_on)
+		return false;
+	rv = mwx_awdl_bss_cmd(sc, true);
+	if (rv == 0 && (rv = mwx_awdl_sta_add(sc, MWX_AWDL_BSS_WCID, NULL)) != 0 && rv != ECANCELED)
+		(void)mwx_awdl_bss_cmd(sc, false);
+	if (rv != 0) {
+		if (rv != ECANCELED) {
+			a->bss_failed = true;
+			MWX_DEV_LOG(sc, "awdl: Block Ack off until the firmware starts again: AWDL's BSS refused (%d)\n",
+			    rv);
+		}
+		return false;
+	}
+	a->bss_on = true;
+	MWX_DEV_LOG(sc, "awdl: BSS %u on own MAC 1, group record %u\n", MWX_AWDL_BSS_IDX, MWX_AWDL_BSS_WCID);
+	return true;
+}
+
+/* Gives a peer's station record back, and with it its agreements. Radio thread. */
+static void
+mwx_awdl_sta_free(struct mwx_softc *sc, struct mwx_awdl_peer *p)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint16_t wcid = p->wcid;
+
+	if (wcid == 0)
+		return;
+	if (!mwx_awdl_fw_gone(sc))
+		(void)mwx_awdl_sta_cmd(sc, wcid, p->addr, false);
+	a->sta_used &= (uint8_t)~(1U << (wcid - MWX_WTBL_STA));
+	p->wcid = 0;
+	p->rx_tids = 0;
+	p->tx_state = MWX_AWDL_TXBA_NONE;
+	p->ba_out = 0;
+	a->c_sta_del++;
+	MWX_DEV_LOG(sc, "awdl: station record %u of %s given back\n", wcid, ether_sprintf(p->addr));
+}
+
+static bool mwx_awdl_delba(struct mwx_awdl *, const struct mwx_awdl_peer *, uint8_t, bool);
+
+/*
+ * The peer's station record, made when it has none. With every record taken, a peer that has moved no data either way
+ * for MWX_AWDL_STA_IDLE_MS and has no aggregated frame out gives its own back, the least recently used of them, after
+ * a DELBA for each of its agreements; a peer still moving data keeps its record, and the new one stays on the
+ * single-frame path. 0; EBUSY when every record belongs to a peer moving data; another errno. Radio thread: p stays
+ * valid across the waits, because only this thread makes or drops peer entries.
+ */
+static int
+mwx_awdl_sta_get(struct mwx_softc *sc, struct mwx_awdl_peer *p)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	int i, rv;
+
+	if (p->wcid != 0)
+		return 0;
+	if (!mwx_awdl_bss_up(sc))
+		return ENODEV;
+	if (a->sta_used == (1U << MWX_AWDL_STA_SLOTS) - 1) {
+		struct mwx_awdl_peer *v = NULL;
+		uint64_t now = mtkAwdlUptimeUs();
+
+		for (i = 0; i < MWX_AWDL_PEERS; i++) {
+			struct mwx_awdl_peer *q = &a->peers[i];
+			uint64_t last = q->last_us > q->rx_us ? q->last_us : q->rx_us;	/* rx_us: the receive path's */
+
+			if (q->wcid == 0 || q == p || q->ba_out != 0 ||
+			    (last != 0 && (last > now || now - last < MWX_AWDL_STA_IDLE_MS * 1000ULL)))
+				continue;
+			if (v == NULL || q->used < v->used)
+				v = q;
+		}
+		if (v == NULL) {
+			a->c_sta_busy++;
+			return EBUSY;
+		}
+		for (i = 0; i < 8; i++) {
+			if (v->rx_tids & (1U << i))
+				(void)mwx_awdl_delba(a, v, (uint8_t)i, false);
+		}
+		if (v->tx_state == MWX_AWDL_TXBA_ON)
+			(void)mwx_awdl_delba(a, v, 0, true);
+		mwx_awdl_sta_free(sc, v);
+	}
+	for (i = 0; i < MWX_AWDL_STA_SLOTS && (a->sta_used & (1U << i)); i++)
+		;
+	if (i == MWX_AWDL_STA_SLOTS)
+		return ENOSPC;
+	if (mwx_awdl_stop_asked(sc))
+		return ECANCELED;
+	rv = mwx_awdl_sta_add(sc, (uint16_t)(MWX_WTBL_STA + i), p->addr);
+	if (rv != 0) {
+		a->c_sta_fail++;
+		if (rv != ECANCELED && a->c_sta_fail <= 8)
+			MWX_DEV_LOG(sc, "awdl: station record %u for %s refused (%d)\n", MWX_WTBL_STA + i,
+			    ether_sprintf(p->addr), rv);
+		return rv;
+	}
+	a->sta_used |= (uint8_t)(1U << i);
+	p->wcid = (uint16_t)(MWX_WTBL_STA + i);
+	p->rx_tids = 0;
+	p->tx_state = MWX_AWDL_TXBA_NONE;
+	a->c_sta_add++;
+	MWX_DEV_LOG(sc, "awdl: station record %u for %s\n", p->wcid, ether_sprintf(p->addr));
+	return 0;
+}
+
+/*
+ * An agreement in the firmware for a peer with a record, as mwx_mcu_sta_ba() sets one up with the station's access
+ * point (mt76_connac_mcu_sta_ba()): the WTBL first, then STA_REC_BA, here on AWDL's BSS. tx: we are the originator.
+ */
+static int
+mwx_awdl_ba_cmd(struct mwx_softc *sc, const struct mwx_awdl_peer *p, uint8_t tid, uint16_t ssn, uint16_t win,
+    bool amsdu, bool tx, bool on)
+{
+	struct sta_rec_ba *sba;
+	struct mwx_vif v;
+	struct mbuf *m;
+	uint16_t tlvnum = 0;
+	int rv;
+
+	memset(&v, 0, sizeof(v));
+	v.idx = MWX_AWDL_BSS_IDX;
+	if (sc->sc_wtbl_ba) {
+		struct sta_rec_wtbl *wtbl;
+		struct wtbl_ba *ba;
+		uint16_t wnum = 0;
+
+		if ((m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr))) == NULL)
+			return ENOBUFS;
+		wtbl = (struct sta_rec_wtbl *)mwx_append_tlv(m, &tlvnum, STA_REC_WTBL, sizeof(*wtbl));
+		wtbl->wlan_idx_lo = p->wcid & 0xff;
+		wtbl->wlan_idx_hi = p->wcid >> 8;
+		wtbl->operation = WTBL_SET;
+		ba = (struct wtbl_ba *)mwx_append_tlv(m, &wnum, WTBL_BA, sizeof(*ba));
+		ba->tid = tid;
+		ba->ba_type = tx ? MT_BA_TYPE_ORIGINATOR : MT_BA_TYPE_RECIPIENT;
+		ba->ba_winsize = on ? htole16(win) : 0;
+		if (tx) {
+			ba->sn = on ? htole16(ssn) : 0;
+			ba->ba_en = on;
+		} else {
+			memcpy(ba->peer_addr, p->addr, IEEE80211_ADDR_LEN);
+			ba->rst_ba_tid = tid;
+			ba->rst_ba_sel = RST_BA_MAC_TID_MATCH;
+			ba->rst_ba_sb = 1;
+		}
+		wtbl->tlv_num = htole16(wnum);
+		wtbl->len = htole16(sizeof(*wtbl) + sizeof(*ba));
+		rv = mwx_awdl_mcu_sync(sc, MCU_UNI_CMD_STA_REC_UPDATE, mwx_fill_sta_req_hdr(m, &v, 1, p->wcid, tlvnum));
+		if (rv != 0)
+			return rv;
+		tlvnum = 0;
+	}
+	if ((m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr))) == NULL)
+		return ENOBUFS;
+	sba = (struct sta_rec_ba *)mwx_append_tlv(m, &tlvnum, STA_REC_BA, sizeof(*sba));
+	sba->tid = tid;
+	sba->ba_type = tx ? MT_BA_TYPE_ORIGINATOR : MT_BA_TYPE_RECIPIENT;
+	sba->amsdu = on && amsdu;
+	sba->ba_en = on ? (uint8_t)(1U << tid) : 0;
+	sba->ssn = htole16(on ? ssn : 0);
+	sba->winsize = htole16(on ? win : 0);
+	return mwx_awdl_mcu_sync(sc, MCU_UNI_CMD_STA_REC_UPDATE, mwx_fill_sta_req_hdr(m, &v, 1, p->wcid, tlvnum));
+}
+
+/* Queues a frame of ours for the next window on `ch`, as mtkAwdlRadioQueue() queues the interface's. */
+static bool
+mwx_awdl_queue(struct mwx_awdl *a, const uint8_t *frame, uint32_t len, uint8_t ch)
+{
+	bool ok = false;
+
+	IOLockLock(a->lock);
+	if (a->tx_count < MWX_AWDL_TX_SLOTS) {
+		struct mwx_awdl_tx_slot *s = &a->tx[(a->tx_head + a->tx_count) % MWX_AWDL_TX_SLOTS];
+
+		memcpy(s->data, frame, len);
+		s->len = (uint16_t)len;
+		s->ch = ch;
+		s->deadline_us = mtkAwdlUptimeUs() + 500000ULL;
+		a->tx_count++;
+		ok = true;
+	} else {
+		a->c_tx_full++;
+	}
+	IOLockUnlock(a->lock);
+	if (ok && a->rx_open)
+		wakeup(&a->wake);
+	return ok;
+}
+
+/* A Block Ack action frame of ours to a peer (IEEE80211_CATEG_BA), its fields after the action code. */
+static bool
+mwx_awdl_ba_action(struct mwx_awdl *a, const struct mwx_awdl_peer *p, uint8_t action, const uint8_t *fields,
+    uint32_t n)
+{
+	uint8_t f[24 + 2 + 7];
+	uint16_t sc = (uint16_t)((a->mgmt_sn++ & 0xfff) << 4);
+
+	if (n > sizeof(f) - 26)
+		return false;
+	memset(f, 0, 24);
+	f[0] = IEEE80211_FC0_TYPE_MGT | IEEE80211_FC0_SUBTYPE_ACTION;
+	memcpy(f + 4, p->addr, IEEE80211_ADDR_LEN);
+	memcpy(f + 10, a->addr, IEEE80211_ADDR_LEN);
+	memcpy(f + 16, mwx_awdl_bssid, IEEE80211_ADDR_LEN);
+	f[22] = sc & 0xff;
+	f[23] = sc >> 8;
+	f[24] = IEEE80211_CATEG_BA;
+	f[25] = action;
+	memcpy(f + 26, fields, n);
+	return mwx_awdl_queue(a, f, 26 + n, p->ch);
+}
+
+/* ADDBA request: TID 0, immediate, our window, no A-MSDU, no timeout; the sequence numbers start at tx_sn. */
+static bool
+mwx_awdl_addba_req(struct mwx_awdl *a, struct mwx_awdl_peer *p)
+{
+	uint16_t params = 0x2 | (MWX_AWDL_BA_WINSIZE << 6), ssc = (uint16_t)(p->tx_sn << 4);
+	uint8_t v[7];
+
+	v[0] = ++p->tx_token;
+	v[1] = params & 0xff;
+	v[2] = params >> 8;
+	v[3] = v[4] = 0;
+	v[5] = ssc & 0xff;
+	v[6] = ssc >> 8;
+	p->tx_ssn = p->tx_sn;
+	return mwx_awdl_ba_action(a, p, IEEE80211_ACTION_ADDBA_REQ, v, sizeof(v));
+}
+
+/* DELBA, reason 37 (the mechanism is not used any more); initiator: the agreement is one we send in. */
+static bool
+mwx_awdl_delba(struct mwx_awdl *a, const struct mwx_awdl_peer *p, uint8_t tid, bool initiator)
+{
+	uint16_t params = (initiator ? 0x0800 : 0) | (uint16_t)(tid << 12);
+	uint8_t v[4] = { (uint8_t)(params & 0xff), (uint8_t)(params >> 8), 37, 0 };
+
+	return mwx_awdl_ba_action(a, p, IEEE80211_ACTION_DELBA, v, sizeof(v));
 }
 
 /*
@@ -10678,6 +11210,99 @@ found:
  * action and group frames, and for unicast data the rate the peer's acknowledgements allow; the frame comes
  * from OMAC 1 once that carries awdl0's address, so that the MAC matches the peer's acknowledgement.
  */
+/*
+ * A unicast data frame to a peer we have a transmit agreement with, in a window on the station's channel: QoS data of
+ * TID 0 with the agreement's own sequence numbers, in the best-effort queue of the station's EDCA set under the peer's
+ * record, so that the MAC may gather the frames into A-MPDUs; a fixed HT rate, since an A-MPDU needs an HT PPDU. The
+ * sequence number goes in the descriptor too (SN_VALID), as MtkWireless sends its AWDL frames. Only on the station's
+ * channel: there the radio does not move, so nothing is left in that queue when a window ends elsewhere; frames for a
+ * window away from it keep the single-frame path. The rest as mwx_awdl_tx().
+ */
+static int
+mwx_awdl_tx_agg(struct mwx_softc *sc, struct mwx_awdl_peer *p, int slot, const uint8_t *frame, size_t len)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct mwx_txwi *mt;
+	struct mt76_txwi *txp;
+	struct mbuf *m;
+	size_t qlen = len + 2;
+	uint32_t val, rate = mwx_awdl_ht_rates[p->ba_rate];
+	uint16_t sn = p->tx_sn;
+	uint8_t *q;
+	int rv;
+
+	if (len < 24 || qlen > MCLBYTES)
+		return EINVAL;
+	m = MCLGETL(NULL, M_DONTWAIT, qlen);
+	if (m == NULL)
+		return ENOMEM;
+	if (mbuf_next(m) != NULL) {
+		m_freem(m);
+		return ENOMEM;
+	}
+	mbuf_setlen(m, qlen);
+	mbuf_pkthdr_setlen(m, qlen);
+	q = mtod(m, uint8_t *);
+	memcpy(q, frame, 24);
+	q[0] = IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_QOS;
+	q[22] = (uint8_t)(sn << 4);
+	q[23] = (uint8_t)(sn >> 4);
+	q[24] = 0;		/* TID 0, normal acknowledgement: inside an A-MPDU the implicit Block Ack request */
+	q[25] = 0;
+	memcpy(q + 26, frame + 24, len - 24);
+	if ((mt = mwx_txwi_get(sc)) == NULL) {
+		m_freem(m);
+		return ENOBUFS;
+	}
+	txp = mt->mt_desc;
+	memset(txp, 0, sizeof(*txp));
+	val = ((qlen + MT_TXD_SIZE) & MT_TXD0_TX_BYTES_MASK) | MT_TX_TYPE_CT |
+	    MT_TXD0_Q_IDX(sc->sc_vif.wmm_idx * MWX_MAX_WMM_SETS + MT_LMAC_AC01);
+	txp->txwi[0] = htole32(val);
+	val = MT_TXD1_LONG_FORMAT | (p->wcid & MT_TXD1_WLAN_IDX_MASK) |
+	    ((1U << MT_TXD1_OWN_MAC_SHIFT) & MT_TXD1_OWN_MAC_MASK) |
+	    MT_HDR_FORMAT_802_11 | MT_TXD1_HDR_INFO(26 / 2) | MT_TXD1_TID(0);
+	if (sc->sc_vif.band_idx)
+		val |= MT_TXD1_TGID;
+	txp->txwi[1] = htole32(val);
+	txp->txwi[2] = htole32(MT_TXD2_FRAME_TYPE(IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT) |
+	    MT_TXD2_SUB_TYPE(IEEE80211_FC0_SUBTYPE_QOS >> IEEE80211_FC0_SUBTYPE_SHIFT) | MT_TXD2_FIX_RATE |
+	    MT_TXD2_HTC_VLD);
+	txp->txwi[3] = htole32((8U << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_SN_VALID |
+	    (((uint32_t)sn << 16) & MT_TXD3_SEQ));
+	txp->txwi[5] = htole32(MT_PACKET_ID_NO_SKB & MT_TXD5_PID);
+	txp->txwi[6] = htole32(MT_TXD6_FIXED_BW | ((rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK));
+	txp->txwi[7] = htole32(MT_TXD7_TYPE(IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT) |
+	    MT_TXD7_SUB_TYPE(IEEE80211_FC0_SUBTYPE_QOS >> IEEE80211_FC0_SUBTYPE_SHIFT));
+
+	/* From here on the error paths are those of mwx_tx(). */
+	rv = mwx_txwi_enqueue(sc, mt, m);
+	if (rv != 0) {
+		m_freem(m);
+		mwx_txwi_put(sc, mt);
+		return rv;
+	}
+	if (mt->mt_idx < nitems(a->txinfo)) {
+		a->txinfo[mt->mt_idx] = (uint8_t)(MWX_AWDL_TXI_AGG | (2 + slot) |
+		    (a->rx_ch > 14 ? MWX_AWDL_TXI_5GHZ : 0));
+		a->tx_inflight++;
+	}
+	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
+	if (rv != 0) {
+		if (mt->mt_idx < nitems(a->txinfo) && a->txinfo[mt->mt_idx] != 0) {
+			a->txinfo[mt->mt_idx] = 0;
+			a->tx_inflight--;
+		}
+		mwx_txwi_put(sc, mt);
+		return rv;
+	}
+	p->tx_sn = (sn + 1) & 0xfff;
+	p->ba_out++;
+	if (p->ba_first_us == 0)
+		p->ba_first_us = mtkAwdlUptimeUs();
+	return 0;
+}
+
 static int
 mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 {
@@ -10701,6 +11326,20 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 			hdrlen = 26;
 		if (!(frame[4] & 1)) {
 			struct mwx_awdl_peer *p = mwx_awdl_peer(a, frame + 4, &slot);
+			uint64_t now = mtkAwdlUptimeUs();
+
+			if (now - p->data_us > 1000000ULL) {
+				p->data_us = now;
+				p->data_n = 0;
+			}
+			p->data_n++;
+			p->last_us = now;
+			p->ch = a->rx_ch;
+			if (p->tx_state == MWX_AWDL_TXBA_ON && a->win_onch && hdrlen == 24) {
+				if (p->ba_ok >= MWX_AWDL_BA_PROBE || p->ba_out < MWX_AWDL_BA_PROBE)
+					return mwx_awdl_tx_agg(sc, p, slot, frame, len);
+				a->c_ba_hold++;		/* the agreement's first frames are not back yet */
+			}
 			ridx = p->rate;
 			info = (uint8_t)(2 + slot);
 			count = 8;
@@ -10755,7 +11394,7 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 		return rv;
 	}
 	if (mt->mt_idx < nitems(a->txinfo)) {
-		a->txinfo[mt->mt_idx] = (uint8_t)(info | (a->rx_ch > 14 ? 0x80 : 0));
+		a->txinfo[mt->mt_idx] = (uint8_t)(info | (a->rx_ch > 14 ? MWX_AWDL_TXI_5GHZ : 0));
 		a->tx_inflight++;
 	}
 	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
@@ -10787,15 +11426,40 @@ mwx_awdl_tx_done(struct mwx_softc *sc, uint16_t msdu, uint32_t txval)
 	a->txinfo[msdu] = 0;
 	if (a->tx_inflight != 0 && --a->tx_inflight == 0)
 		wakeup(&a->tx_inflight);
-	if ((info & 0x7f) >= 2 && (info & 0x7f) < 2 + MWX_AWDL_PEERS) {
-		struct mwx_awdl_peer *p = &a->peers[(info & 0x7f) - 2];
-		int band = (info & 0x80) ? 1 : 0;
+	if ((info & 0x3f) >= 2 && (info & 0x3f) < 2 + MWX_AWDL_PEERS) {
+		struct mwx_awdl_peer *p = &a->peers[(info & 0x3f) - 2];
+		int band = (info & MWX_AWDL_TXI_5GHZ) ? 1 : 0;
 
 		if (failed)
 			a->c_tx_uc_fail[band]++;
 		else
 			a->c_tx_uc_ok[band]++;
-		if (failed || count > 3) {
+		if (info & MWX_AWDL_TXI_AGG) {
+			/* The aggregated path: its own HT ladder, and the counts that tell if the agreement works. */
+			if (p->ba_out != 0)
+				p->ba_out--;
+			if (failed) {
+				a->c_ba_fail++;
+				if (p->ba_fail < 0xffff)
+					p->ba_fail++;
+			} else {
+				a->c_ba_ok++;
+				if (p->ba_ok < 0xffff)
+					p->ba_ok++;
+			}
+			if (failed || count > 3) {
+				if (p->ba_rate > 0)
+					p->ba_rate--;
+				p->ba_good = 0;
+			} else if (count <= 1) {
+				if (++p->ba_good >= 10 && p->ba_rate + 1 < nitems(mwx_awdl_ht_rates)) {
+					p->ba_rate++;
+					p->ba_good = 0;
+				}
+			} else {
+				p->ba_good = 0;
+			}
+		} else if (failed || count > 3) {
 			if (p->rate > MWX_AWDL_RATE_MIN)
 				p->rate--;
 			p->good = 0;
@@ -10855,6 +11519,281 @@ mwx_awdl_tx_flush(struct mwx_softc *sc, uint8_t ch)
 			a->c_tx_err++;
 		else if (a->txbuf[4] & 1 || (a->txbuf[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA)
 			a->c_tx_group++;
+	}
+}
+
+/* Our transmit agreement with a peer ends; tell: a DELBA tells the peer. Radio thread. */
+static void
+mwx_awdl_txba_end(struct mwx_softc *sc, struct mwx_awdl_peer *p, const char *why, uint64_t retry_us, bool tell)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	if (p->tx_state == MWX_AWDL_TXBA_ON) {
+		if (p->wcid != 0)
+			(void)mwx_awdl_ba_cmd(sc, p, 0, 0, 0, false, true, false);
+		if (tell)
+			(void)mwx_awdl_delba(a, p, 0, true);
+	}
+	p->tx_state = MWX_AWDL_TXBA_NONE;
+	p->tx_retry_us = mtkAwdlUptimeUs() + retry_us;
+	MWX_DEV_LOG(sc, "awdl: transmit agreement with %s ended: %s (frames back %u, failed %u, out %u)\n",
+	    ether_sprintf(p->addr), why, p->ba_ok, p->ba_fail, p->ba_out);
+}
+
+/*
+ * One Block Ack action frame a peer sent to awdl0. An ADDBA request is answered once the firmware holds the receive
+ * agreement on the peer's record, so that its A-MPDUs get their Block Ack; without a record it is declined (37). The
+ * answer to our own request starts the transmit agreement; a DELBA ends either. Radio thread.
+ */
+static void
+mwx_awdl_ba_frame(struct mwx_softc *sc, const struct mwx_awdl_baq *q)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	const uint8_t *f = q->frame;
+	struct mwx_awdl_peer *p;
+	uint16_t params, status;
+	uint8_t tid, v[7];
+	int slot;
+
+	/* The first ones in the log, fields as they came: whether a peer takes part in Block Ack at all. */
+	if (q->len >= 26 && a->c_ba_heard++ < 16) {
+		char fields[3 * 8 + 1];
+		uint32_t i, k = 0;
+
+		for (i = 26; i < q->len && i < 26 + 8; i++)
+			k += (uint32_t)snprintf(fields + k, sizeof(fields) - k, " %02x", f[i]);
+		fields[k] = 0;
+		MWX_DEV_LOG(sc, "awdl: Block Ack action %u from %s on %u:%s\n", f[25], ether_sprintf(f + 10), q->ch,
+		    fields);
+	}
+	switch (q->len >= 26 ? f[25] : 0xff) {
+	case IEEE80211_ACTION_ADDBA_REQ: {
+		uint16_t timeout, ssn, win;
+		bool amsdu;
+
+		if (q->len < 33)
+			return;
+		params = (uint16_t)(f[27] | f[28] << 8);
+		timeout = (uint16_t)(f[29] | f[30] << 8);
+		ssn = (uint16_t)((f[31] | f[32] << 8) >> 4);
+		tid = (params >> 2) & 0xf;
+		win = params >> 6;
+		amsdu = params & 1;
+		if (win == 0 || win > MWX_AWDL_BA_WINSIZE)
+			win = MWX_AWDL_BA_WINSIZE;
+		p = mwx_awdl_peer(a, f + 10, &slot);
+		if (q->ch != 0)
+			p->ch = q->ch;
+		status = IEEE80211_STATUS_REFUSED;
+		/* Immediate Block Ack only; A-MSDUs inside are fine, whole or split by the hardware. */
+		if (tid < 8 && (params & 0x2) && mwx_awdl_sta_get(sc, p) == 0 &&
+		    mwx_awdl_ba_cmd(sc, p, tid, ssn, win, amsdu, false, true) == 0) {
+			status = 0;
+			p->rx_tids |= (uint8_t)(1U << tid);
+			params = (uint16_t)((amsdu ? 1 : 0) | 0x2 | (tid << 2) | (win << 6));
+			a->c_rxba_ok++;
+		} else {
+			a->c_rxba_no++;
+		}
+		if (a->c_rxba_ok + a->c_rxba_no <= 16)
+			MWX_DEV_LOG(sc, "awdl: %s asks to send aggregated: tid %u ssn %u win %u amsdu %d -> %s\n",
+			    ether_sprintf(p->addr), tid, ssn, win, amsdu, status == 0 ? "accepted" : "declined");
+		if (mwx_awdl_stop_asked(sc))
+			return;
+		v[0] = f[26];
+		v[1] = status & 0xff;
+		v[2] = status >> 8;
+		v[3] = params & 0xff;
+		v[4] = params >> 8;
+		v[5] = timeout & 0xff;
+		v[6] = timeout >> 8;
+		(void)mwx_awdl_ba_action(a, p, IEEE80211_ACTION_ADDBA_RESP, v, sizeof(v));
+		break;
+	}
+	case IEEE80211_ACTION_ADDBA_RESP: {
+		uint16_t win;
+
+		if (q->len < 33)
+			return;
+		status = (uint16_t)(f[27] | f[28] << 8);
+		params = (uint16_t)(f[29] | f[30] << 8);
+		p = mwx_awdl_peer_find(a, f + 10, &slot);
+		if (p == NULL || p->tx_state != MWX_AWDL_TXBA_ASKED || f[26] != p->tx_token || ((params >> 2) & 0xf) != 0) {
+			/* An answer to no request of ours in progress: late, another token or another TID. */
+			if (a->c_ba_skip++ < 8)
+				MWX_DEV_LOG(sc, "awdl: answer from %s left aside: token %u of %u, state %u, tid %u, status %u\n",
+				    ether_sprintf(f + 10), f[26], p != NULL ? p->tx_token : 0,
+				    p != NULL ? p->tx_state : 0xff, (params >> 2) & 0xf, status);
+			return;
+		}
+		win = params >> 6;
+		if (win == 0 || win > MWX_AWDL_BA_WINSIZE)
+			win = MWX_AWDL_BA_WINSIZE;
+		p->tx_tries = 0;
+		p->tx_state = MWX_AWDL_TXBA_NONE;
+		if (status != 0) {
+			a->c_txba_no++;
+			p->tx_retry_us = mtkAwdlUptimeUs() + 60000000ULL;
+			MWX_DEV_LOG(sc, "awdl: %s declined our transmit agreement (%u)\n", ether_sprintf(p->addr),
+			    status);
+			return;
+		}
+		if (p->wcid == 0 || mwx_awdl_ba_cmd(sc, p, 0, p->tx_ssn, win, false, true, true) != 0) {
+			/* the peer holds the agreement: it is told it ended */
+			p->tx_retry_us = mtkAwdlUptimeUs() + 60000000ULL;
+			if (!mwx_awdl_stop_asked(sc))
+				(void)mwx_awdl_delba(a, p, 0, true);
+			a->c_txba_drop++;
+			return;
+		}
+		p->tx_state = MWX_AWDL_TXBA_ON;
+		p->tx_win = win;
+		p->ba_ok = p->ba_fail = p->ba_out = 0;
+		p->ba_first_us = 0;
+		p->ba_good = 0;
+		a->c_txba_ok++;
+		MWX_DEV_LOG(sc, "awdl: transmit agreement with %s: ssn %u win %u\n", ether_sprintf(p->addr), p->tx_ssn,
+		    win);
+		break;
+	}
+	case IEEE80211_ACTION_DELBA:
+		if (q->len < 30 || (p = mwx_awdl_peer_find(a, f + 10, &slot)) == NULL)
+			return;
+		params = (uint16_t)(f[26] | f[27] << 8);
+		tid = params >> 12;
+		if (params & 0x0800) {
+			/* from the originator: its sending to us in that agreement ends */
+			if (p->wcid != 0 && (p->rx_tids & (1U << tid))) {
+				(void)mwx_awdl_ba_cmd(sc, p, tid, 0, 0, false, false, false);
+				p->rx_tids &= (uint8_t)~(1U << tid);
+			}
+			a->c_rxba_del++;
+		} else if (tid == 0 && p->tx_state != MWX_AWDL_TXBA_NONE) {
+			mwx_awdl_txba_end(sc, p, "the peer ended it", 30000000ULL, false);
+			a->c_txba_del++;
+		}
+		break;
+	}
+}
+
+/*
+ * The Block Ack part of the radio thread, run between windows: the frames the peers sent, our own requests to the
+ * peers we send many frames to on the station's channel, and the agreements to give up. A transmit agreement ends when
+ * frames handed over stay unreported MWX_AWDL_BA_PROBE_MS after its first one while fewer than MWX_AWDL_BA_PROBE came
+ * back (a queue the firmware does not serve), or when it loses more than half of its first frames: they then take the
+ * single-frame path again, for ten minutes. At most MWX_AWDL_BA_PROBE frames are out until the first ones are back.
+ */
+static void
+mwx_awdl_ba_work(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint64_t now;
+	uint8_t home;
+	int i, rv;
+
+	if (a->ba_off || !a->armed)
+		return;
+	while (a->baq_count != 0 && !mwx_awdl_stop_asked(sc)) {
+		struct mwx_awdl_baq q = a->baq[a->baq_head];
+
+		a->baq_head = (a->baq_head + 1) % MWX_AWDL_BAQ;
+		a->baq_count--;
+		mwx_awdl_ba_frame(sc, &q);
+	}
+	home = mwx_awdl_home(sc, NULL, NULL);
+	for (i = 0; i < MWX_AWDL_PEERS && !mwx_awdl_stop_asked(sc); i++) {
+		struct mwx_awdl_peer *p = &a->peers[i];
+
+		if (p->rate == 0)
+			continue;
+		now = mtkAwdlUptimeUs();
+		switch (p->tx_state) {
+		case MWX_AWDL_TXBA_ASKED:
+			if (now - p->tx_asked_us < MWX_AWDL_ADDBA_WAIT_MS * 1000ULL)
+				break;
+			a->c_txba_late++;
+			p->tx_state = MWX_AWDL_TXBA_NONE;
+			p->tx_retry_us = now + (++p->tx_tries >= 3 ? 30000000ULL : 1000000ULL);
+			break;
+		case MWX_AWDL_TXBA_ON:
+			if (p->ba_out != 0 && p->ba_ok < MWX_AWDL_BA_PROBE && p->ba_first_us != 0 &&
+			    now - p->ba_first_us > MWX_AWDL_BA_PROBE_MS * 1000ULL) {
+				mwx_awdl_txba_end(sc, p, "its first frames did not come back", 600000000ULL, true);
+				a->c_txba_drop++;
+			} else if (p->ba_ok + p->ba_fail >= 16 && p->ba_ok + p->ba_fail <= 256 &&
+			    p->ba_fail * 2 > p->ba_ok + p->ba_fail) {
+				mwx_awdl_txba_end(sc, p, "most of its frames failed", 600000000ULL, true);
+				a->c_txba_drop++;
+			}
+			break;
+		default:
+			if (p->data_n < MWX_AWDL_BA_BURST || now - p->data_us > 1000000ULL || now < p->tx_retry_us ||
+			    home == 0 || p->ch != home)
+				break;
+			if ((rv = mwx_awdl_sta_get(sc, p)) != 0) {
+				/* Every record with a peer moving data: asked again once one of them may be quiet. */
+				p->tx_retry_us = mtkAwdlUptimeUs() +
+				    (rv == EBUSY ? MWX_AWDL_STA_IDLE_MS * 1000ULL : 60000000ULL);
+				break;
+			}
+			if (mwx_awdl_stop_asked(sc) || !mwx_awdl_addba_req(a, p))
+				break;
+			p->tx_state = MWX_AWDL_TXBA_ASKED;
+			p->tx_asked_us = mtkAwdlUptimeUs();
+			a->c_txba_ask++;
+			break;
+		}
+	}
+}
+
+/*
+ * Every record and agreement, and AWDL's BSS. With the firmware still there they are removed from it, before OMAC 1
+ * goes; after a reload of the firmware only forgotten here. The peers keep their agreements until they find out.
+ */
+static void
+mwx_awdl_ba_down(struct mwx_softc *sc, bool firmware)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	int i;
+
+	for (i = 0; i < MWX_AWDL_PEERS; i++) {
+		struct mwx_awdl_peer *p = &a->peers[i];
+
+		if (p->wcid != 0) {
+			if (firmware)
+				mwx_awdl_sta_free(sc, p);
+			p->wcid = 0;
+		}
+		p->rx_tids = 0;
+		p->tx_state = MWX_AWDL_TXBA_NONE;
+		p->ba_out = 0;
+	}
+	a->sta_used = 0;
+	if (a->bss_on && firmware && !mwx_awdl_fw_gone(sc)) {
+		(void)mwx_awdl_sta_cmd(sc, MWX_AWDL_BSS_WCID, NULL, false);
+		(void)mwx_awdl_bss_cmd(sc, false);
+		MWX_DEV_LOG(sc, "awdl: BSS %u removed\n", MWX_AWDL_BSS_IDX);
+	}
+	a->bss_on = false;
+	a->baq_count = 0;
+}
+
+/* The MAC's A-MPDU length bins (reading clears them, mt7921_mac_reset_counters()), kept around aggregating windows. */
+static void
+mwx_awdl_agg_bins(struct mwx_softc *sc, bool keep)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		uint32_t v = mwx_read(sc, MT_TX_AGG_CNT(0, i)), v2 = mwx_read(sc, MT_TX_AGG_CNT2(0, i));
+
+		if (!keep)
+			continue;
+		a->c_agg[2 * i] += v & 0xffff;
+		a->c_agg[2 * i + 1] += v >> 16;
+		a->c_agg[8 + 2 * i] += v2 & 0xffff;
+		a->c_agg[8 + 2 * i + 1] += v2 >> 16;
 	}
 }
 
@@ -10923,9 +11862,10 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	struct mwx_awdl *a = sc->sc_awdl;
 	uint8_t bw = CMD_CBW_20MHZ, center = 0;
 	uint8_t home = mwx_awdl_home(sc, &bw, &center);
-	bool onch = home != 0 && home == w->channel;
+	bool onch = home != 0 && home == w->channel, agg;
 	uint64_t now = mtkAwdlUptimeUs(), start = w->startUs, end, roc_deadline = 0, t;
 	uint32_t lead = onch ? 5000 : a->lead_us, dwell = w->dwellMs;
+	int i;
 
 	if (a->off || mwx_awdl_fw_gone(sc)) {
 		a->c_gone++;
@@ -11069,6 +12009,13 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	a->rx_open = true;
 	a->c_win++;
 	a->c_win_ch[mwx_awdl_bucket(w->channel)]++;
+	/* Aggregated frames only where the radio stays: see mwx_awdl_tx_agg(). */
+	a->win_onch = onch && !a->ba_off;
+	agg = false;
+	for (i = 0; a->win_onch && i < MWX_AWDL_PEERS; i++)
+		agg |= a->peers[i].tx_state == MWX_AWDL_TXBA_ON;
+	if (agg)
+		mwx_awdl_agg_bins(sc, false);
 
 	for (;;) {
 		now = mtkAwdlUptimeUs();
@@ -11092,6 +12039,9 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 		a->c_drain++;
 		a->tx_inflight = 0;		/* not carried into the next window */
 	}
+	if (agg && !mwx_awdl_fw_gone(sc))
+		mwx_awdl_agg_bins(sc, true);
+	a->win_onch = false;
 	a->rx_open = false;
 
 	/* The next window on the station's channel right after this one keeps the reception open. */
@@ -11134,6 +12084,8 @@ mwx_awdl_run_gated(OSObject *, void *arg, void *, void *, void *)
 		return kIOReturnSuccess;
 	a->running = true;
 	for (;;) {
+		if (!mwx_awdl_stop_asked(sc))
+			mwx_awdl_ba_work(sc);
 		IOLockLock(a->lock);
 		have = a->armed && !a->paused && !a->dying && a->next_valid;
 		if (have) {
@@ -11149,7 +12101,12 @@ mwx_awdl_run_gated(OSObject *, void *arg, void *, void *, void *)
 		mwx_awdl_close(sc);
 		if (!a->armed && !a->paused) {
 			mwx_awdl_fullpwr(sc, false);
-			/* AWDL is off: the chip stops acknowledging frames for awdl0's address. */
+			/*
+			 * AWDL is off: the peers' records and AWDL's BSS go, then the chip stops acknowledging
+			 * frames for awdl0's address.
+			 */
+			if (!mwx_awdl_fw_gone(sc))
+				mwx_awdl_ba_down(sc, true);
 			if (a->omac_on && !mwx_awdl_fw_gone(sc) && mwx_awdl_omac(sc, 0) == 0)
 				a->omac_on = false;
 		}
@@ -11163,6 +12120,8 @@ mwx_awdl_run_gated(OSObject *, void *arg, void *, void *, void *)
 		mtkAwdlRadioSummary(line, sizeof(line));
 		MWX_DEV_LOG(sc, "awdl: radio %s\n", line);
 		mtkAwdlRadioChannels(line, sizeof(line));
+		MWX_DEV_LOG(sc, "awdl: radio %s\n", line);
+		mtkAwdlRadioBlockAck(line, sizeof(line));
 		MWX_DEV_LOG(sc, "awdl: radio %s\n", line);
 	}
 	a->running = false;
@@ -11189,6 +12148,48 @@ mwx_awdl_timer(OSObject *, IOTimerEventSource *)
 }
 
 /*
+ * From mwx_rx() before mt7921_mac_fill_rx(): the receive descriptor's payload format (kMtkAwdl*Part) when the frame is
+ * QoS data of AWDL (no DS bits, the AWDL BSSID) that the hardware split out of an A-MSDU, else 0. The hardware splits
+ * the A-MSDUs of peers that have a station record. hdr_gap: where the 802.11 header starts, 0 to work it out from the
+ * descriptor's groups as mtkRxAmsduReadDescriptor() does.
+ */
+static uint8_t
+mwx_awdl_rx_subframe(struct mbuf *m, uint16_t hdr_gap)
+{
+	const uint8_t *d = mtod(m, const uint8_t *);
+	size_t off = hdr_gap;
+	uint32_t rxd1, rxd2, rxd4;
+
+	if (mbuf_len(m) < 24)
+		return 0;
+	rxd1 = mtkRxAmsduLe32(d + 4);
+	rxd2 = mtkRxAmsduLe32(d + 8);
+	rxd4 = mtkRxAmsduLe32(d + 16);
+	if ((rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT) == 0)
+		return 0;
+	if (off == 0) {
+		off = 24;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_4)
+			off += 16;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_1)
+			off += 16;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_2)
+			off += 8;
+		if (rxd1 & MT_RXD1_NORMAL_GROUP_3)
+			off += (rxd1 & MT_RXD1_NORMAL_GROUP_5) ? 80 : 8;
+		off += 2 * ((rxd2 & MT_RXD2_NORMAL_HDR_OFFSET_MASK) >> MT_RXD2_NORMAL_HDR_OFFSET_SHIFT);
+	}
+	if (mbuf_len(m) < off + 26 + 2)
+		return 0;
+	d += off;
+	if ((d[0] & (IEEE80211_FC0_TYPE_MASK | IEEE80211_FC0_SUBTYPE_QOS)) !=
+	    (IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_QOS) || (d[1] & IEEE80211_FC1_DIR_MASK) != 0 ||
+	    memcmp(d + 16, mwx_awdl_bssid, 6) != 0)
+		return 0;
+	return (uint8_t)(rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT);
+}
+
+/*
  * Receive tap, from mwx_rx() after mt7921_mac_fill_rx(): m starts with the 802.11 header. True when the
  * frame is not for net80211.
  *
@@ -11200,7 +12201,7 @@ mwx_awdl_timer(OSObject *, IOTimerEventSource *)
  * numbers.
  */
 static bool
-mwx_awdl_rx_tap(struct mwx_softc *sc, struct mbuf *m, const struct ieee80211_rxinfo *rxi)
+mwx_awdl_rx_tap(struct mwx_softc *sc, struct mbuf *m, const struct ieee80211_rxinfo *rxi, uint8_t part)
 {
 	struct mwx_awdl *a = sc->sc_awdl;
 	struct ieee80211com *ic = &sc->sc_ic;
@@ -11208,6 +12209,7 @@ mwx_awdl_rx_tap(struct mwx_softc *sc, struct mbuf *m, const struct ieee80211_rxi
 	uint8_t h[30];
 	const uint8_t *bssid;
 	bool filter = a->tap_filter;
+	struct mwx_awdl_peer *p;
 
 	if (!filter && a->tap_grace) {
 		if (mtkAwdlUptimeUs() < a->tap_grace_until_us)
@@ -11236,6 +12238,28 @@ mwx_awdl_rx_tap(struct mwx_softc *sc, struct mbuf *m, const struct ieee80211_rxi
 			a->c_rx_long++;
 			return true;
 		}
+		if (part != kMtkAwdlWhole && h[0] != 0xd0) {
+			/*
+			 * A subframe of an A-MSDU the hardware split: the two alignment bytes it leaves after the
+			 * 802.11 header go, as mt76 removes them (mt7921_mac_fill_rx()), and the frame reads as an
+			 * A-MSDU of one subframe.
+			 */
+			size_t hl = 26 + ((h[1] & IEEE80211_FC1_ORDER) ? 4 : 0);
+
+			if (len < hl + 2 + 14) {
+				a->c_rx_long++;
+				return true;
+			}
+			memmove(a->rxbuf + hl, a->rxbuf + hl + 2, len - hl - 2);
+			len -= 2;
+			a->c_split++;
+		}
+		if ((p = mwx_awdl_peer_find(a, h + 10, NULL)) != NULL) {
+			if (rxi->rxi_chan || a->rx_ch)
+				p->ch = (uint8_t)(rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch);
+			if (h[0] != 0xd0)
+				p->rx_us = mtkAwdlUptimeUs();
+		}
 		if (h[0] == 0xd0) {
 			uint8_t ch = rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch;
 			int b = mwx_awdl_bucket(ch);
@@ -11253,9 +12277,38 @@ mwx_awdl_rx_tap(struct mwx_softc *sc, struct mbuf *m, const struct ieee80211_rxi
 				a->c_rx_uc++;
 		}
 		mtkAwdlInput(a->rxbuf, (uint32_t)len, rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch,
-		    rssi < 0 && rssi > -128 ? rssi : 0, mtkAwdlUptimeUs());
+		    rssi < 0 && rssi > -128 ? rssi : 0, mtkAwdlUptimeUs(), h[0] == 0xd0 ? kMtkAwdlWhole : part);
 		return true;
 	}
+	/* A Block Ack action frame a peer sent to awdl0, for the radio thread, which answers it (mwx_awdl_ba_frame()) */
+	if (!a->ba_off && n >= 25 && h[0] == (IEEE80211_FC0_TYPE_MGT | IEEE80211_FC0_SUBTYPE_ACTION) &&
+	    h[24] == IEEE80211_CATEG_BA && memcmp(h + 16, mwx_awdl_bssid, 6) == 0 && memcmp(h + 4, a->addr, 6) == 0) {
+		if (!a->armed)
+			return true;
+		if (a->baq_count < MWX_AWDL_BAQ) {
+			struct mwx_awdl_baq *q = &a->baq[(a->baq_head + a->baq_count) % MWX_AWDL_BAQ];
+
+			q->len = (uint8_t)(len < sizeof(q->frame) ? len : sizeof(q->frame));
+			if (mbuf_copydata(m, 0, q->len, q->frame) == 0) {
+				q->ch = (uint8_t)(rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch);
+				a->baq_count++;
+				if (a->timer != NULL && !a->dying)
+					a->timer->setTimeoutUS(1);
+			}
+		} else {
+			a->c_baq_full++;
+		}
+		return true;
+	}
+	/*
+	 * Any other management frame sent to awdl0 is taken by nothing here; the first ones go to the log. A Block Ack
+	 * frame of a peer with a BSSID other than AWDL's would end up here.
+	 */
+	if (n >= 26 && (h[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_MGT && memcmp(h + 4, a->addr, 6) == 0 &&
+	    a->c_mgmt_other++ < 16)
+		MWX_DEV_LOG(sc, "awdl: management frame %02x for awdl0 not taken: category %u action %u, BSSID "
+		    "%02x:%02x:%02x:%02x:%02x:%02x, from %s\n", h[0], h[24], h[25], h[16], h[17], h[18], h[19], h[20],
+		    h[21], ether_sprintf(h + 10));
 	if (!filter)
 		return false;
 
@@ -11321,6 +12374,9 @@ mwx_awdl_firmware_reset(struct mwx_softc *sc)
 	memset(a->seq_cmd, 0, sizeof(a->seq_cmd));
 	a->faults = 0;
 	a->off = false;
+	mwx_awdl_ba_down(sc, false);
+	a->bss_failed = false;
+	a->win_onch = false;
 }
 
 /*
@@ -11339,6 +12395,12 @@ mwx_awdl_resume(struct mwx_softc *sc)
 		mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE);
 	a->sniffer_on = a->filter_open = a->roc_active = false;
 	a->omac_on = a->omac_failed = false;	/* the interface was registered again */
+	/*
+	 * Records and the BSS are made again when needed; one the firmware still holds is removed and made anew then
+	 * (mwx_awdl_sta_add()).
+	 */
+	mwx_awdl_ba_down(sc, false);
+	a->win_onch = false;
 	a->rx_open = false;
 	a->roc_want = a->roc_granted = false;
 	a->tap_grace_until_us = mtkAwdlUptimeUs() + MWX_AWDL_TAP_GRACE_MS * 1000ULL;
@@ -11418,6 +12480,11 @@ mtkAwdlRadioStart(const uint8_t *address)
 		a->wl = IOWorkLoop::workLoop();
 		a->timer = IOTimerEventSource::timerEventSource(gMwxHal, mwx_awdl_timer);
 		a->lead_us = 30000;
+		{
+			int off = 0;
+
+			a->ba_off = PE_parse_boot_argn("-mtkawdlnoba", &off, sizeof(off));
+		}
 		if (a->lock == NULL || a->tx == NULL || a->wl == NULL || a->timer == NULL ||
 		    a->wl->addEventSource(a->timer) != kIOReturnSuccess) {
 			if (a->timer != NULL)
@@ -11442,7 +12509,8 @@ mtkAwdlRadioStart(const uint8_t *address)
 	a->tx_count = 0;
 	IOLockUnlock(a->lock);
 	a->armed = true;
-	MWX_DEV_LOG(sc, "awdl: radio started for %s\n", ether_sprintf((uint8_t *)a->addr));
+	MWX_DEV_LOG(sc, "awdl: radio started for %s%s\n", ether_sprintf((uint8_t *)a->addr),
+	    a->ba_off ? ", Block Ack off (-mtkawdlnoba)" : "");
 	return 0;
 }
 
@@ -11585,5 +12653,46 @@ mtkAwdlRadioChannels(char *buffer, size_t length)
 	snprintf(buffer, length, "win/af/other ch6=%u/%u/%u ch44=%u/%u/%u ch149=%u/%u/%u chx=%u/%u/%u",
 	    a->c_win_ch[0], a->c_af_ch[0], a->c_other_ch[0], a->c_win_ch[1], a->c_af_ch[1], a->c_other_ch[1],
 	    a->c_win_ch[2], a->c_af_ch[2], a->c_other_ch[2], a->c_win_ch[3], a->c_af_ch[3], a->c_other_ch[3]);
+}
+
+/*
+ * Block Ack, a line of its own: records made/given back/refused; receive agreements accepted/declined/ended by the
+ * peer; transmit agreements asked/accepted/declined/unanswered/ended by the peer/given up; aggregated-path frames
+ * reported sent/failed and held back while an agreement was young; A-MSDU subframes split by the hardware; then each
+ * peer with a record (WCID, receive TIDs, transmit state, HT rung) and the A-MPDU length bins that are not zero.
+ */
+void
+mtkAwdlRadioBlockAck(char *buffer, size_t length)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+	size_t n;
+	int i;
+
+	if (buffer == NULL || length == 0)
+		return;
+	if (a == NULL) {
+		snprintf(buffer, length, "not started");
+		return;
+	}
+	n = (size_t)snprintf(buffer, length,
+	    "ba off=%d bss=%d%s sta=%u/%u/%u/%u rx=%u/%u/%u tx=%u/%u/%u/%u/%u/%u frames=%u/%u hold=%u split=%u qfull=%u",
+	    a->ba_off, a->bss_on, a->bss_failed ? "!" : "", a->c_sta_add, a->c_sta_del, a->c_sta_fail, a->c_sta_busy,
+	    a->c_rxba_ok,
+	    a->c_rxba_no, a->c_rxba_del, a->c_txba_ask, a->c_txba_ok, a->c_txba_no, a->c_txba_late, a->c_txba_del,
+	    a->c_txba_drop, a->c_ba_ok, a->c_ba_fail, a->c_ba_hold, a->c_split, a->c_baq_full);
+	for (i = 0; i < MWX_AWDL_PEERS && n < length; i++) {
+		const struct mwx_awdl_peer *p = &a->peers[i];
+
+		if (p->wcid != 0)
+			n += (size_t)snprintf(buffer + n, length - n, " %u:rx%02x/tx%u/ht%u", p->wcid, p->rx_tids,
+			    p->tx_state, p->ba_rate);
+	}
+	if (n < length)
+		n += (size_t)snprintf(buffer + n, length - n, " agg");
+	for (i = 0; i < 16 && n < length; i++) {
+		if (a->c_agg[i] != 0)
+			n += (size_t)snprintf(buffer + n, length - n, " %d:%u", i, a->c_agg[i]);
+	}
 }
 #endif /* MTK_AWDL */

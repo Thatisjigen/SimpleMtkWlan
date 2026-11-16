@@ -58,13 +58,22 @@ void mtkAwdlRadioSummary(char *buffer, size_t length);
 // Windows, AWDL frames and other frames heard, by social channel (6, 44, 149, others).
 void mtkAwdlRadioChannels(char *buffer, size_t length);
 
+// Block Ack agreements with the peers, for the driver log.
+void mtkAwdlRadioBlockAck(char *buffer, size_t length);
+
+// How a received data frame arrived: whole, or as one subframe of an A-MSDU the hardware split, which it does for a peer
+// with a station record (the receive descriptor's payload format: first 3, middle 2, last 1). The radio removes the two
+// alignment bytes the hardware leaves after the 802.11 header, so a split subframe reads as an A-MSDU of one subframe;
+// all the subframes of one A-MSDU carry its sequence number.
+enum : uint8_t { kMtkAwdlWhole = 0, kMtkAwdlLastPart = 1, kMtkAwdlMiddlePart = 2, kMtkAwdlFirstPart = 3 };
+
 // Provided by the AWDL interface. Both are called on the main work loop with its command gate held, never with a lock
 // of the radio held, and must not wait.
 // Right before a frame leaves: stamps the fields that only hold at that moment (the synchronization parameters'
 // counters and the action header's transmit times).
 void mtkAwdlStampFrame(uint8_t *frame, uint32_t length, uint64_t nowUs);
 // One AWDL frame heard (an action frame or a data frame), 802.11 header first, no FCS. rssi is in dBm, 0 when the
-// hardware gave none. The bytes are only valid during the call.
-void mtkAwdlInput(const uint8_t *frame, uint32_t length, uint32_t channel, int32_t rssi, uint64_t timeUs);
+// hardware gave none; part is one of kMtkAwdl*Part for a data frame. The bytes are only valid during the call.
+void mtkAwdlInput(const uint8_t *frame, uint32_t length, uint32_t channel, int32_t rssi, uint64_t timeUs, uint8_t part);
 // Room was made in the frame queue after it had been full: the interface can hand over more.
 void mtkAwdlRadioRoomFreed();
