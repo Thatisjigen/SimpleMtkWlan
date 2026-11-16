@@ -10146,7 +10146,9 @@ MtkMwx::debugPoll()
  *  - acknowledging frames sent to awdl0: its address on a second own MAC, OMAC 1, with the DEV_INFO_UPDATE
  *    that mt76_connac_mcu_uni_add_dev sends for a second interface;
  *  - sending: the normal TX path with the 802.11 header kept (mt76_connac2_mac_write_txwi), on ALTX0, the
- *    queue mt76 uses for frames sent outside the station's schedule, at a fixed OFDM rate on either band;
+ *    queue mt76 uses for frames sent outside the station's schedule, at a fixed OFDM rate on either band, or at
+ *    VHT for unicast data on the station's channel when the link is 80 MHz wide (mwx_awdl_vht_rates), there with
+ *    the frames queued for one peer gathered into A-MSDUs (mwx_awdl_amsdu());
  *  - the regulatory country: the access point's Country element, as cfg80211 hands it to
  *    mt7921_regd_notifier. With the world domain the firmware sends on the access point's own 5 GHz channel
  *    only (thanhnndev, mt7925-macos-wifi af60e21).
@@ -10207,8 +10209,14 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_BA_PROBE_MS	1000	/* how long they may take; then the agreement is given up */
 #define MWX_AWDL_BAQ		8	/* Block Ack action frames heard, waiting for the radio thread */
 #define MWX_AWDL_BAQ_BYTES	36	/* the header and every field of an ADDBA request, response or DELBA */
+#define MWX_AWDL_TXI_PEER	0x1f	/* in txinfo[]: 1 group or action, 2 + the peer's entry */
+#define MWX_AWDL_TXI_VHT	0x20	/* in txinfo[]: sent at a VHT rate */
 #define MWX_AWDL_TXI_AGG	0x40	/* in txinfo[]: a frame of the aggregated path */
 #define MWX_AWDL_TXI_5GHZ	0x80	/* in txinfo[]: sent on 5 GHz */
+#define MWX_AWDL_VHT_HOLD_MS	2000	/* after VHT failed down to 54 Mb/s, before it is tried again */
+#define MWX_AWDL_VHT_SLOW	5	/* transmissions of one frame beyond which its VHT step goes down */
+#define MWX_AWDL_AMSDU_MAX	3839	/* an A-MSDU we send: the largest every HT receiver takes */
+#define MWX_AWDL_AMSDU_FRAME	(26 + MWX_AWDL_AMSDU_MAX)	/* with its QoS data header */
 
 /*
  * Rates of the aggregated path, as the TXD6 rate field takes them: HT MCS 4 to 7, one stream, 20 MHz, long GI. An
@@ -10217,6 +10225,22 @@ MtkMwx::debugPoll()
 static const uint16_t mwx_awdl_ht_rates[] = {
 	(MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 4, (MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 5,
 	(MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 6, (MT_PHY_TYPE_HT << MT_TX_RATE_MODE_SHIFT) | 7,
+};
+
+/*
+ * Above 54 Mb/s on the per-frame path, for unicast data in a window on the station's channel while the link is 80 MHz
+ * wide: there the radio stays at the link's width and a peer that sends VHT at 80 MHz, as a phone does, hears it too.
+ * VHT at 80 MHz, long GI: one stream MCS 4 and 7, then two streams MCS 7 and 9. A ladder of its own (vht in the peer's
+ * entry, 0 = not in use), entered from 54 Mb/s as the OFDM ladder goes up. A frame that fails, or needs more than
+ * MWX_AWDL_VHT_SLOW transmissions, takes its step down one, and the first one back to 54 Mb/s for MWX_AWDL_VHT_HOLD_MS;
+ * a frame that needs a few only keeps the ladder from climbing. An A-MSDU of two frames at these rates, sent again
+ * a few times, still takes less air than one frame at 54 Mb/s. In any other window a frame keeps its OFDM rate.
+ */
+static const uint16_t mwx_awdl_vht_rates[] = {
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 4,
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 7,
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | (1 << MT_TX_RATE_NSS_SHIFT) | 7,
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | (1 << MT_TX_RATE_NSS_SHIFT) | 9,
 };
 
 static const uint8_t mwx_awdl_bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
@@ -10260,6 +10284,8 @@ struct mwx_awdl_peer {
 	uint32_t	data_n;		/* unicast data frames handed over in the second that began at data_us */
 	uint64_t	data_us, last_us, tx_asked_us, tx_retry_us, ba_first_us;
 	uint64_t	rx_us;		/* its last data frame heard (receive tap) */
+	uint8_t		vht, vht_good;	/* step of mwx_awdl_vht_rates + 1, 0 = OFDM; first tries in a row there */
+	uint64_t	vht_hold_us;	/* no VHT before this */
 };
 
 /* A Block Ack action frame heard, for the radio thread. */
@@ -10331,17 +10357,20 @@ struct mwx_awdl {
 	bool			bss_on;		/* AWDL's BSS and its group record are in the firmware */
 	bool			bss_failed;	/* refused: no records until the firmware starts again */
 	bool			win_onch;	/* the window in progress is on the station's channel */
+	bool			win_vht;	/* ... and that is 80 MHz wide: unicast data may go at VHT rates */
 	uint8_t			sta_used;	/* bit per station record slot */
 	uint16_t		mgmt_sn;
 	struct mwx_awdl_baq	baq[MWX_AWDL_BAQ];	/* main work loop adds, radio thread takes; both gated */
 	uint32_t		baq_head, baq_count;
 	uint32_t		c_sta_add, c_sta_del, c_sta_fail, c_sta_busy, c_baq_full, c_split;
 	uint32_t		c_ba_heard, c_ba_skip, c_mgmt_other;	/* for the log's first lines */
+	uint32_t		c_vht_ok, c_vht_fail, c_amsdu, c_amsdu_sub;
 	uint32_t		c_rxba_ok, c_rxba_no, c_rxba_del;
 	uint32_t		c_txba_ask, c_txba_ok, c_txba_no, c_txba_late, c_txba_del, c_txba_drop;
 	uint32_t		c_ba_ok, c_ba_fail, c_ba_hold;
 	uint32_t		c_agg[16];	/* the MAC's A-MPDU length bins, read around windows that aggregated */
 	uint8_t			txbuf[MWX_AWDL_FRAME_MAX];	/* radio thread only */
+	uint8_t			amsdu[MWX_AWDL_AMSDU_FRAME];	/* radio thread only: mwx_awdl_amsdu() */
 	uint8_t			rxbuf[MWX_AWDL_RX_MAX];	/* main work loop only */
 	/* counters */
 	uint32_t		c_win, c_onch, c_late, c_busy, c_share, c_badch, c_gone;
@@ -11280,8 +11309,9 @@ mwx_awdl_delba(struct mwx_awdl *a, const struct mwx_awdl_peer *p, uint8_t tid, b
  * One frame on the air, as mt7921_mac_write_txwi() and mt7921_mac_write_txwi_80211() above describe a
  * management frame, with these differences: the queue is ALTX0; the rate is a fixed OFDM one whatever the
  * station's band (the station's basic rate is CCK on 2.4 GHz, which a 5 GHz window cannot send): 6 Mb/s for
- * action and group frames, and for unicast data the rate the peer's acknowledgements allow; the frame comes
- * from OMAC 1 once that carries awdl0's address, so that the MAC matches the peer's acknowledgement.
+ * action and group frames, and for unicast data the rate the peer's acknowledgements allow, VHT at 80 MHz included
+ * where the link is that wide (mwx_awdl_vht_rates); the frame comes from OMAC 1 once that carries awdl0's address,
+ * so that the MAC matches the peer's acknowledgement.
  */
 /*
  * A unicast data frame to a peer we have a transmit agreement with, in a window on the station's channel: QoS data of
@@ -11384,11 +11414,12 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 	struct mt76_txwi *txp;
 	struct mbuf *m;
 	uint32_t val, rate, mode;
-	uint8_t type, subtype, omac, info = 1, ridx = MWX_AWDL_RATE_MIN, count = 15;
+	uint16_t vht = 0;
+	uint8_t type, subtype, omac, info = 1, ridx = MWX_AWDL_RATE_MIN, count = 15, bw = CMD_CBW_20MHZ;
 	u_int hdrlen = 24;
 	int rv, slot;
 
-	if (len < 24 || len > MWX_AWDL_FRAME_MAX)
+	if (len < 24 || len > MWX_AWDL_AMSDU_FRAME)
 		return EINVAL;
 	if (!mwx_tx_has_room(sc, 1))
 		return ENOBUFS;
@@ -11414,6 +11445,8 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 				a->c_ba_hold++;		/* the agreement's first frames are not back yet */
 			}
 			ridx = p->rate;
+			if (p->vht != 0 && a->win_vht)
+				vht = mwx_awdl_vht_rates[p->vht - 1];
 			info = (uint8_t)(2 + slot);
 			count = 8;
 		}
@@ -11438,9 +11471,15 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 	memset(txp, 0, sizeof(*txp));
 
 	omac = a->omac_on ? 1 : sc->sc_vif.omac_idx;
-	rate = mt76_rates[ridx].hw_value;
-	mode = (rate >> 8) << MT_TX_RATE_MODE_SHIFT;
-	rate = (rate & MT_TX_RATE_IDX_MASK) | (mode & MT_TX_RATE_MODE_MASK);
+	if (vht != 0) {
+		rate = vht;
+		bw = CMD_CBW_80MHZ;
+		info |= MWX_AWDL_TXI_VHT;
+	} else {
+		rate = mt76_rates[ridx].hw_value;
+		mode = (rate >> 8) << MT_TX_RATE_MODE_SHIFT;
+		rate = (rate & MT_TX_RATE_IDX_MASK) | (mode & MT_TX_RATE_MODE_MASK);
+	}
 
 	val = ((len + MT_TXD_SIZE) & MT_TXD0_TX_BYTES_MASK) | MT_TX_TYPE_CT | MT_TXD0_Q_IDX(MT_LMAC_ALTX0);
 	txp->txwi[0] = htole32(val);
@@ -11456,7 +11495,8 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 	txp->txwi[2] = htole32(val);
 	txp->txwi[3] = htole32(((uint32_t)count << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE);
 	txp->txwi[5] = htole32(MT_PACKET_ID_NO_SKB & MT_TXD5_PID);
-	txp->txwi[6] = htole32(MT_TXD6_FIXED_BW | ((rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK));
+	txp->txwi[6] = htole32(MT_TXD6_FIXED_BW | (bw & MT_TXD6_BW) |
+	    ((rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK));
 	txp->txwi[7] = htole32(MT_TXD7_TYPE(type) | MT_TXD7_SUB_TYPE(subtype));
 
 	/* From here on the error paths are those of mwx_tx(). */
@@ -11499,8 +11539,8 @@ mwx_awdl_tx_done(struct mwx_softc *sc, uint16_t msdu, uint32_t txval)
 	a->txinfo[msdu] = 0;
 	if (a->tx_inflight != 0 && --a->tx_inflight == 0)
 		wakeup(&a->tx_inflight);
-	if ((info & 0x3f) >= 2 && (info & 0x3f) < 2 + MWX_AWDL_PEERS) {
-		struct mwx_awdl_peer *p = &a->peers[(info & 0x3f) - 2];
+	if ((info & MWX_AWDL_TXI_PEER) >= 2 && (info & MWX_AWDL_TXI_PEER) < 2 + MWX_AWDL_PEERS) {
+		struct mwx_awdl_peer *p = &a->peers[(info & MWX_AWDL_TXI_PEER) - 2];
 		int band = (info & MWX_AWDL_TXI_5GHZ) ? 1 : 0;
 
 		if (failed)
@@ -11532,13 +11572,39 @@ mwx_awdl_tx_done(struct mwx_softc *sc, uint16_t msdu, uint32_t txval)
 			} else {
 				p->ba_good = 0;
 			}
+		} else if (info & MWX_AWDL_TXI_VHT) {
+			/* The VHT ladder: down one on a failure or a frame sent too many times, from its first step back to 54 Mb/s
+			 * for a while; a frame sent again a few times only stops the climb. */
+			if (failed)
+				a->c_vht_fail++;
+			else
+				a->c_vht_ok++;
+			if (failed || count > MWX_AWDL_VHT_SLOW) {
+				p->vht_good = 0;
+				if (p->vht > 1) {
+					p->vht--;
+				} else if (p->vht == 1) {
+					p->vht = 0;
+					p->vht_hold_us = mtkAwdlUptimeUs() + MWX_AWDL_VHT_HOLD_MS * 1000ULL;
+				}
+			} else if (count <= 1) {
+				if (++p->vht_good >= 10 && p->vht != 0 && p->vht < nitems(mwx_awdl_vht_rates)) {
+					p->vht++;
+					p->vht_good = 0;
+				}
+			} else {
+				p->vht_good = 0;
+			}
 		} else if (failed || count > 3) {
 			if (p->rate > MWX_AWDL_RATE_MIN)
 				p->rate--;
 			p->good = 0;
 		} else if (count <= 1) {
-			if (++p->good >= 10 && p->rate < MWX_AWDL_RATE_MAX) {
-				p->rate++;
+			if (++p->good >= 10) {
+				if (p->rate < MWX_AWDL_RATE_MAX)
+					p->rate++;
+				else if (p->vht == 0 && mtkAwdlUptimeUs() >= p->vht_hold_us)
+					p->vht = 1;	/* VHT from the next window on the station's channel */
 				p->good = 0;
 			}
 		} else {
@@ -11550,6 +11616,69 @@ mwx_awdl_tx_done(struct mwx_softc *sc, uint16_t msdu, uint32_t txval)
 	return true;
 }
 
+/* One A-MSDU subframe at offset `at` of the body: the frame's destination, source and MSDU length, then the MSDU, all
+ * that follows its 24-byte header. Returns where the subframe ends. */
+static uint32_t
+mwx_awdl_amsdu_sub(uint8_t *b, uint32_t at, const uint8_t *f, uint32_t len)
+{
+	uint32_t msdu = len - 24;
+
+	memcpy(b + at, f + 4, IEEE80211_ADDR_LEN);
+	memcpy(b + at + 6, f + 10, IEEE80211_ADDR_LEN);
+	b[at + 12] = (uint8_t)(msdu >> 8);
+	b[at + 13] = (uint8_t)msdu;
+	memcpy(b + at + 14, f + 24, msdu);
+	return at + 14 + msdu;
+}
+
+/*
+ * The unicast data frame in txbuf and those right behind it in the queue to the same peer, as one A-MSDU in amsdu: QoS
+ * data of TID 0 with the A-MSDU bit, the first frame's header, each frame a subframe, 4-byte aligned. Only for a peer
+ * whose frames go at VHT in this window (mwx_awdl_tx()), with no transmit agreement: an A-MSDU travels in an HT or later
+ * PPDU, and at VHT the preamble, the wait and the acknowledgement take most of a single frame's air time. At most
+ * MWX_AWDL_AMSDU_MAX: two frames of awdl0's MTU. Its length, or 0 when no frame joined the first. awdl->lock held: the
+ * frames that join leave the queue.
+ */
+static uint32_t
+mwx_awdl_amsdu(struct mwx_softc *sc, uint8_t ch, uint64_t now, uint32_t len)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	const struct mwx_awdl_peer *p;
+	uint8_t *b = a->amsdu + 26;
+	uint32_t at, end, n = 0;
+
+	if (len < 32 || a->txbuf[0] != IEEE80211_FC0_TYPE_DATA || a->txbuf[1] != 0 || (a->txbuf[4] & 1) ||
+	    !a->win_vht || (p = mwx_awdl_peer_find(a, a->txbuf + 4, NULL)) == NULL || p->vht == 0 ||
+	    p->tx_state == MWX_AWDL_TXBA_ON)
+		return 0;
+	end = mwx_awdl_amsdu_sub(b, 0, a->txbuf, len);
+	while (a->tx_count != 0) {
+		const struct mwx_awdl_tx_slot *s = &a->tx[a->tx_head];
+
+		at = (end + 3) & ~3U;
+		if (s->deadline_us < now || (s->ch != ch && s->ch != 0) || s->len < 32 ||
+		    s->data[0] != IEEE80211_FC0_TYPE_DATA || s->data[1] != 0 ||
+		    memcmp(s->data + 4, a->txbuf + 4, IEEE80211_ADDR_LEN) != 0 ||
+		    memcmp(s->data + 10, a->txbuf + 10, IEEE80211_ADDR_LEN) != 0 ||
+		    at + 14 + (s->len - 24) > MWX_AWDL_AMSDU_MAX)
+			break;
+		memset(b + end, 0, at - end);
+		end = mwx_awdl_amsdu_sub(b, at, s->data, s->len);
+		a->tx_head = (a->tx_head + 1) % MWX_AWDL_TX_SLOTS;
+		a->tx_count--;
+		n++;
+	}
+	if (n == 0)
+		return 0;
+	memcpy(a->amsdu, a->txbuf, 24);
+	a->amsdu[0] = IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_QOS;
+	a->amsdu[24] = IEEE80211_QOS_AMSDU;	/* TID 0 */
+	a->amsdu[25] = 0;
+	a->c_amsdu++;
+	a->c_amsdu_sub += n + 1;
+	return 26 + end;
+}
+
 /* Sends the queued frames for `ch`; the ones for another channel or too old are dropped. Radio thread. */
 static void
 mwx_awdl_tx_flush(struct mwx_softc *sc, uint8_t ch)
@@ -11558,7 +11687,7 @@ mwx_awdl_tx_flush(struct mwx_softc *sc, uint8_t ch)
 	int budget;
 
 	for (budget = MWX_AWDL_TX_SLOTS; budget > 0; budget--) {
-		uint32_t len = 0;
+		uint32_t len = 0, amsdu = 0;
 		uint64_t now = mtkAwdlUptimeUs();
 		bool freed = false;
 
@@ -11578,6 +11707,8 @@ mwx_awdl_tx_flush(struct mwx_softc *sc, uint8_t ch)
 			if (len)
 				break;
 		}
+		if (len != 0)
+			amsdu = mwx_awdl_amsdu(sc, ch, now, len);
 		if (a->tx_was_full && a->tx_count <= MWX_AWDL_TX_SLOTS / 2) {
 			a->tx_was_full = false;
 			freed = true;
@@ -11587,6 +11718,11 @@ mwx_awdl_tx_flush(struct mwx_softc *sc, uint8_t ch)
 			mtkAwdlRadioRoomFreed();
 		if (!len)
 			return;
+		if (amsdu != 0) {
+			if (mwx_awdl_tx(sc, a->amsdu, amsdu) != 0)
+				a->c_tx_err++;
+			continue;
+		}
 		mtkAwdlStampFrame(a->txbuf, len, mtkAwdlUptimeUs());
 		if (mwx_awdl_tx(sc, a->txbuf, len) != 0)
 			a->c_tx_err++;
@@ -12105,8 +12241,9 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	a->rx_open = true;
 	a->c_win++;
 	a->c_win_ch[mwx_awdl_bucket(w->channel)]++;
-	/* Aggregated frames only where the radio stays: see mwx_awdl_tx_agg(). */
+	/* Aggregated frames only where the radio stays: see mwx_awdl_tx_agg(). VHT at the link's 80 MHz there. */
 	a->win_onch = onch && !a->ba_off;
+	a->win_vht = onch && bw == CMD_CBW_80MHZ;
 	agg = false;
 	for (i = 0; a->win_onch && i < MWX_AWDL_PEERS; i++)
 		agg |= a->peers[i].tx_state == MWX_AWDL_TXBA_ON;
@@ -12138,6 +12275,7 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	if (agg && !mwx_awdl_fw_gone(sc))
 		mwx_awdl_agg_bins(sc, true);
 	a->win_onch = false;
+	a->win_vht = false;
 	a->rx_open = false;
 
 	/*
@@ -12541,6 +12679,7 @@ mwx_awdl_firmware_reset(struct mwx_softc *sc)
 	mwx_awdl_ba_down(sc, false);
 	a->bss_failed = false;
 	a->win_onch = false;
+	a->win_vht = false;
 }
 
 /*
@@ -12566,6 +12705,7 @@ mwx_awdl_resume(struct mwx_softc *sc)
 	 */
 	mwx_awdl_ba_down(sc, false);
 	a->win_onch = false;
+	a->win_vht = false;
 	a->rx_open = false;
 	a->roc_want = a->roc_granted = false;
 	a->tap_grace_until_us = mtkAwdlUptimeUs() + MWX_AWDL_TAP_GRACE_MS * 1000ULL;
@@ -12861,9 +13001,12 @@ mtkAwdlRadioBlockAck(char *buffer, size_t length)
 		const struct mwx_awdl_peer *p = &a->peers[i];
 
 		if (p->wcid != 0)
-			n += (size_t)snprintf(buffer + n, length - n, " %u:rx%02x/tx%u/ht%u", p->wcid, p->rx_tids,
-			    p->tx_state, p->ba_rate);
+			n += (size_t)snprintf(buffer + n, length - n, " %u:rx%02x/tx%u/ht%u/r%u/v%u", p->wcid, p->rx_tids,
+			    p->tx_state, p->ba_rate, p->rate, p->vht);
 	}
+	if (n < length)
+		n += (size_t)snprintf(buffer + n, length - n, " vht=%u/%u amsdu=%u/%u", a->c_vht_ok, a->c_vht_fail,
+		    a->c_amsdu, a->c_amsdu_sub);
 	if (n < length)
 		n += (size_t)snprintf(buffer + n, length - n, " agg");
 	for (i = 0; i < 16 && n < length; i++) {
