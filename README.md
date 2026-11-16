@@ -132,7 +132,8 @@ Optional boot-args:
 
 * `-mtknohe` — turn 802.11ax off (on by default on MT7920 and MT7922).
 * `-mtk160` — experimental 160 MHz operation on MT7922.
-* `-mtkrxamsdu` — enable RX A-MSDU decapsulation.
+* `-mtknorxamsdu` — refuse A-MSDUs inside received A-MPDUs (accepted and
+  decapsulated by default).
 * `-mtknoamsdu` — disable hardware TX A-MSDU.
 * `-mtkallowaspm` — keep PCIe ASPM (L0s, L1) and the L1 substates on; by
   default attach turns them off on the card and the port above it, as Linux

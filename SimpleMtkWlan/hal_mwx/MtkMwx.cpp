@@ -3344,8 +3344,13 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	    IEEE80211_C_TX_AMPDU;	/* TX A-MPDU, BA set up in firmware */
 
 	{
-		int on = 0;
-		sc->sc_rx_amsdu_enabled = PE_parse_boot_argn("-mtkrxamsdu", &on, sizeof(on));
+		int off = 0;
+		/*
+		 * A-MSDUs inside received A-MPDUs are accepted unless -mtknorxamsdu:
+		 * refusing them in the ADDBA answer kept an MT7921 near 40 Mbps
+		 * (Arxusion's 485d6a8 turns them on in the BA agreement).
+		 */
+		sc->sc_rx_amsdu_enabled = !PE_parse_boot_argn("-mtknorxamsdu", &off, sizeof(off));
 		if (sc->sc_rx_amsdu_enabled)
 			ic->ic_caps |= IEEE80211_C_AMSDU_IN_AMPDU;
 		MWX_DEV_LOG(sc, "RX A-MSDU reassembly enabled=%d max_body=3839\n",
