@@ -168,7 +168,9 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   and runs AWDL on the radio; AirDrop works both ways with a Pixel's Quick Share.
   The hardware layer (`MtkMwx.cpp`, under `MTK_AWDL`) takes remain-on-channel
   windows, opens the sniffer and the RX filter for other devices (at 80 MHz on
-  44 and 149), sends on ALTX0 from OMAC 1, which holds awdl0's address (unicast
+  44 and 149; on the station's channel not while a peer has a record on AWDL's
+  BSS, which carries AWDL's BSSID), sends on ALTX0 from OMAC 1, which holds
+  awdl0's address (unicast
   data from 6 to 54 Mb/s, and on the station's channel at 80 MHz on up to VHT80
   two streams MCS 9, there as A-MSDUs of up to 3839 bytes), and touches nothing
   until awdl0 starts it. The interface keeps the AWDL timeline,
