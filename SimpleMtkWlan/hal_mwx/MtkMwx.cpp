@@ -467,7 +467,12 @@ struct mwx_queue {
 	struct mbuf		*mq_rx_tail;
 	u_int				mq_rx_bytes;
 	u_int				mq_rx_segments;
+	u_int				mq_rx_wait_idx; /* slot waited for until DMA_DONE shows */
+	uint64_t			mq_rx_wait_ns;  /* since when; 0 none */
 };
+
+/* How long a slot the DMA index has passed is waited for until DMA_DONE shows in it (mwx_dma_rx_dequeue()). */
+#define MWX_RX_DONE_WAIT_NS	2000000ULL
 
 /* RXD byte count is 16 bits; MCU event len excludes the RXD (up to 32
  * bytes on connac3). Keep malformed streams bounded without limiting an
@@ -668,6 +673,8 @@ struct mwx_softc {
 	bool			sc_rx_amsdu_enabled;
 	uint32_t		sc_rx_dma_max_batch;
 	uint32_t		sc_rx_dma_bad_len;
+	uint64_t		sc_rx_dma_notdone;	/* slots found without DMA_DONE behind the DMA index */
+	uint64_t		sc_rx_dma_done_missing;	/* ... still without it after MWX_RX_DONE_WAIT_NS */
 	uint64_t		sc_rx_dma_chain_completed;
 	uint64_t		sc_rx_dma_chain_resumed;
 	uint64_t		sc_rx_dma_chain_dropped;
@@ -2762,7 +2769,7 @@ mwx_intr(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
 	struct mbuf_list mlout = MBUF_LIST_INITIALIZER();
-	uint32_t intr, intr_sw;
+	uint32_t intr, intr_sw, waiting;
 	uint32_t mask = sc->sc_intr_mask;
 	static uint32_t intr_log_count;
 	static uint32_t intr_unhandled_log_count;
@@ -2781,7 +2788,11 @@ mwx_intr(void *arg)
 	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
 	if (intr == 0xffffffff)
 		return 0;
-	if (intr == 0) {
+	/* A ring stopped at a slot still without DMA_DONE is read again although nothing new was signalled. */
+	waiting = (sc->sc_rxq.mq_rx_wait_ns != 0 ? MT_INT_RX_DONE_DATA : 0) |
+	    (sc->sc_rxmcuq.mq_rx_wait_ns != 0 ? MT_INT_RX_DONE_WM2 : 0) |
+	    (sc->sc_rxfwdlq.mq_rx_wait_ns != 0 ? MT_INT_RX_DONE_WM : 0);
+	if (intr == 0 && waiting == 0) {
 		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);
 		return 0;
 	}
@@ -2803,6 +2814,7 @@ mwx_intr(void *arg)
 	/* ack interrupts */
 	intr &= mask;
 	mwx_write(sc, MT_WFDMA0_HOST_INT_STA, intr);
+	intr |= waiting & mask;
 
 	if (intr & MT_INT_MCU_CMD) {
 		intr_sw = mwx_read(sc, MT_MCU_CMD);
@@ -3943,6 +3955,7 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 	m_freem(q->mq_rx_head);
 	q->mq_rx_head = q->mq_rx_tail = NULL;
 	q->mq_rx_bytes = q->mq_rx_segments = 0;
+	q->mq_rx_wait_ns = 0;
 
 	/* clear descriptors */
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
@@ -4668,6 +4681,7 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 	struct mbuf *m;
 	int idx, last;
 	u_int consumed = 0;
+	bool waiting = false;
 
 	sc->sc_rx_dma_batches++;
 	idx = q->mq_cons;
@@ -4701,9 +4715,38 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 			break;
 		}
 
+		/*
+		 * A slot is the hardware's until DMA_DONE shows in it, as
+		 * mt76_dma_dequeue() checks; the DMA index can run ahead of the
+		 * descriptor's write-back. Read before that, the slot still holds
+		 * the refill's full length and LAST_SEC0: a whole buffer of stale
+		 * bytes taken for a frame, the next segment of a long frame taken
+		 * for a new packet with a header of payload bytes, and the slot
+		 * armed again while the hardware still completes it. Such a slot
+		 * is waited for through an interrupt rescheduled until DMA_DONE
+		 * shows; one that never shows it is taken as before after
+		 * MWX_RX_DONE_WAIT_NS, and counted.
+		 */
+		uint32_t ctrl = le32toh(desc->ctrl);
+		if (!(ctrl & MT_DMA_CTL_DMA_DONE)) {
+			uint64_t now_ns = 0;
+
+			absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+			if (q->mq_rx_wait_ns == 0 || q->mq_rx_wait_idx != (u_int)idx) {
+				q->mq_rx_wait_idx = idx;
+				q->mq_rx_wait_ns = now_ns;
+				sc->sc_rx_dma_notdone++;
+			}
+			if (now_ns - q->mq_rx_wait_ns < MWX_RX_DONE_WAIT_NS) {
+				waiting = true;
+				break;
+			}
+			sc->sc_rx_dma_done_missing++;
+		}
+		q->mq_rx_wait_ns = 0;
+
 		/* Validate descriptor lengths and aggregate bounds before copying
 		 * payload from a bounce buffer or changing an mbuf's bounds. */
-		const uint32_t ctrl = le32toh(desc->ctrl);
 		const size_t len = MT_DNA_CTL_SD_GET_LEN0(ctrl);
 		const bool last_segment = (ctrl & MT_DMA_CTL_LAST_SEC0) != 0;
 		bool valid = len != 0 && len <= md->md_map->dm_mapsize &&
@@ -4798,7 +4841,7 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 	sc->sc_rx_dma_desc += consumed;
 	if (consumed > sc->sc_rx_dma_max_batch)
 		sc->sc_rx_dma_max_batch = consumed;
-	return idx != last;
+	return idx != last || waiting;
 }
 
 bool
@@ -9924,7 +9967,7 @@ MtkMwx::debugPoll()
 		    ic->ic_stats.is_ht_tx_ba_agreements, sc->sc_tx_amsdu);
 	if (polls % 30 == 0) {
 		MWX_DEV_LOG(sc,
-		    "rxdma cumulative bytes=%llu copy_bytes=%llu copy_saved=%llu batches=%llu desc=%llu max_batch=%u bad_len=%u refill_fail=%u refill_recover=%u pending=%u/%u/%u\n",
+		    "rxdma cumulative bytes=%llu copy_bytes=%llu copy_saved=%llu batches=%llu desc=%llu max_batch=%u bad_len=%u refill_fail=%u refill_recover=%u pending=%u/%u/%u notdone=%llu donemissing=%llu\n",
 		    (unsigned long long)sc->sc_rx_dma_bytes,
 		    (unsigned long long)sc->sc_rx_dma_copy_bytes,
 		    (unsigned long long)sc->sc_rx_dma_copy_saved,
@@ -9932,7 +9975,8 @@ MtkMwx::debugPoll()
 		    (unsigned long long)sc->sc_rx_dma_desc,
 		    sc->sc_rx_dma_max_batch, sc->sc_rx_dma_bad_len, sc->sc_rx_refill_fail,
 		    sc->sc_rx_refill_recover, sc->sc_rxq.mq_refill_pending,
-		    sc->sc_rxmcuq.mq_refill_pending, sc->sc_rxfwdlq.mq_refill_pending);
+		    sc->sc_rxmcuq.mq_refill_pending, sc->sc_rxfwdlq.mq_refill_pending,
+		    (unsigned long long)sc->sc_rx_dma_notdone, (unsigned long long)sc->sc_rx_dma_done_missing);
 		MWX_DEV_LOG(sc,
 		    "rxpool disabled=%u total=%u free=%u allocs=%u exhausted=%u fallbacks=%u returned=%u\n",
 		    sc->sc_rx_pool_disabled, sc->sc_rx_pool_total,
