@@ -85,39 +85,39 @@ IOService* SimpleMtkWlan::probe(IOService *provider, SInt32 *score)
 
 IOService* SimpleMtkWlan::probeImpl(IOService *provider, SInt32 *score)
 {
-    bool isMatch = false;
     super::probe(provider, score);
-    UInt8 msiCap;
-    UInt8 msixCap;
     IOPCIDevice* device = OSDynamicCast(IOPCIDevice, provider);
-    if (!device) {
+    if (!device || !MtkMwx::mwx_match(device)) {
         return NULL;
     }
-    if (MtkMwx::mwx_match(device)) {
-        isMatch = true;
-        fHalService = new MtkMwx;
+    /*
+     * findPCICapability() reports the offset only for a capability the card
+     * has: start both at 0 and keep an offset only when the lookup finds it.
+     */
+    UInt8 msixCap = 0, msiCap = 0;
+    if (device->findPCICapability(PCI_CAP_ID_MSIX, &msixCap) == 0) {
+        msixCap = 0;
     }
-    if (isMatch) {
-        device->findPCICapability(PCI_CAP_ID_MSIX, &msixCap);
-        if (msixCap) {
-            pciMsiXClearAndSet(device, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);
-        }
-        device->findPCICapability(PCI_CAP_ID_MSI, &msiCap);
-        /*
-         * Do not set the MSI enable bit by hand: nothing has programmed the
-         * MSI address/data yet, and with MSI enabled the device stops raising
-         * INTx. IOPCIFamily enables MSI when the PCIMessaged vector is
-         * registered (see pci_intr_establish).
-         */
-        if (!msiCap && !msixCap) {
-            XYLog("%s No MSI cap\n", __FUNCTION__);
-            fHalService->release();
-            fHalService = NULL;
-            return NULL;
-        }
-        return this;
+    if (device->findPCICapability(PCI_CAP_ID_MSI, &msiCap) == 0) {
+        msiCap = 0;
     }
-    return NULL;
+    if (msixCap) {
+        pciMsiXClearAndSet(device, msixCap, PCI_MSIX_FLAGS_ENABLE, 0);
+    }
+    /*
+     * Do not set the MSI enable bit by hand: nothing has programmed the
+     * MSI address/data yet, and with MSI enabled the device stops raising
+     * INTx. IOPCIFamily enables MSI when the PCIMessaged vector is
+     * registered (see pci_intr_establish).
+     */
+    if (!msiCap && !msixCap) {
+        XYLog("%s No MSI cap\n", __FUNCTION__);
+        return NULL;
+    }
+    if (fHalService == NULL && (fHalService = new MtkMwx) == NULL) {
+        return NULL;
+    }
+    return this;
 }
 
 bool SimpleMtkWlan::configureInterface(IONetworkInterface *netif)
