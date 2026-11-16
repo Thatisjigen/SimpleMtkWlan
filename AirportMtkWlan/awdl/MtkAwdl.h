@@ -53,6 +53,9 @@ uint32_t mtkAwdlRadioRoom();
 uint8_t mtkAwdlRadioHomeChannel();
 // True when the radio may use `channel` (in the chip's channel list, not passive).
 bool mtkAwdlRadioChannelAllowed(uint8_t channel);
+// The station's data frames with its access point, either way, counted since the radio was started: packets and their
+// bytes (an A-MSDU counts once). The interface rates the access point's traffic from them.
+void mtkAwdlRadioStationTraffic(uint64_t *packets, uint64_t *bytes);
 // Counters for the driver log.
 void mtkAwdlRadioSummary(char *buffer, size_t length);
 // Windows, AWDL frames and other frames heard, by social channel (6, 44, 149, others).

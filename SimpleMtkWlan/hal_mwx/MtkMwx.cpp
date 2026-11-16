@@ -1191,6 +1191,7 @@ static bool	mwx_awdl_rx_tap(struct mwx_softc *, struct mbuf *, const struct ieee
 static uint8_t	mwx_awdl_rx_subframe(struct mbuf *, uint16_t);
 static bool	mwx_awdl_mcu_event(struct mwx_softc *, uint8_t, uint8_t, uint8_t, struct mbuf *);
 static bool	mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
+static void	mwx_awdl_sta_traffic(struct mwx_softc *, struct mbuf *, bool);
 static void	mwx_awdl_quiesce(struct mwx_softc *);
 static void	mwx_awdl_firmware_reset(struct mwx_softc *);
 static void	mwx_awdl_resume(struct mwx_softc *);
@@ -2415,6 +2416,10 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	wcl_ac = ieee80211_has_qos(wcl_wh) ?
 	    ieee80211_wcl_ac(ieee80211_get_qos(wcl_wh) & IEEE80211_QOS_TID) : EDCA_AC_BE;
 #endif
+#ifdef MTK_AWDL
+	if (sc->sc_awdl != NULL)
+		mwx_awdl_sta_traffic(sc, m, false);
+#endif
 	rv = mwx_txwi_enqueue(sc, mt, m);
 	if (rv != 0) {
 		/* Mapping failed before ownership reached the TXWI. */
@@ -2724,6 +2729,10 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml, uint8_t rxque
 	if (ic->ic_max_rssi && rxi.rxi_rssi < 0)
 		rxi.rxi_rssi = mwx_dbm_to_rssi(rxi.rxi_rssi);
 
+#ifdef MTK_AWDL
+	if (sc->sc_awdl != NULL)
+		mwx_awdl_sta_traffic(sc, m, true);
+#endif
 	/* send the frame to the 802.11 layer */
 	ieee80211_inputm(ifp, m, ni, &rxi, ml);
 
@@ -10111,6 +10120,7 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_ROC_BACKOFF_MS	2000	/* after a request that was never granted */
 #define MWX_AWDL_ROC_SPARE_MS	95	/* asked on top of the dwell: grant, drain and abort have to fit */
 #define MWX_AWDL_ROC_STOP_MS	40	/* the dwell ends this long before the firmware ends the period itself */
+#define MWX_AWDL_HOME_MIN_MS	20	/* on the station's channel at least this long between two windows away */
 #define MWX_AWDL_TX_GUARD_MS	10	/* nothing new for the hardware this close to the end of a window */
 #define MWX_AWDL_DRAIN_MS	25	/* for the frames handed to the hardware to leave */
 #define MWX_AWDL_FAULT_MAX	3	/* unanswered commands in a row before the radio stays off */
@@ -10284,6 +10294,8 @@ struct mwx_awdl {
 	uint8_t			first_af;	/* bit per bucket: the first AWDL frame there was logged */
 	uint32_t		c_log;
 	uint64_t		late_us, off_us, log_us;
+	/* the station's data frames with its access point, sent [0] and received [1] (mwx_awdl_sta_traffic()) */
+	uint64_t		sta_pkts[2], sta_bytes[2];
 };
 
 static struct mwx_softc *gMwxAwdlSc;
@@ -11877,14 +11889,17 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 		return;
 	}
 	/*
-	 * The access point keeps the radio until home_until_us. The interface's schedule leaves it whole EAWs, and
-	 * this window is picked up right when the one before it ended: what counts is when its setup will begin.
+	 * The access point keeps the radio until home_until_us, MWX_AWDL_HOME_MIN_MS after the last window away. Which
+	 * EAWs are left to it is the interface's schedule (Apple's rows, by state), and this window is picked up right
+	 * when the one before it ended: what counts is when its setup will begin, which waits instead.
 	 */
 	if (!onch && home != 0 &&
 	    (start == 0 ? now : start > lead ? start - lead : 0) < a->home_until_us) {
 		a->c_share++;
-		mwx_awdl_close(sc);
-		return;
+		mwx_awdl_sleep_until(sc, a->home_until_us, false);
+		now = mtkAwdlUptimeUs();
+		if (mwx_awdl_stop_asked(sc))
+			return;
 	}
 	if (!mwx_awdl_channel_ok(sc, w->channel)) {
 		a->c_badch++;
@@ -12064,8 +12079,8 @@ abort:
 		a->roc_active = false;
 		now = mtkAwdlUptimeUs();
 		a->off_us += now - a->off_since_us;
-		/* The access point gets the radio back for at least a third of the time it was away. */
-		a->home_until_us = now + (now - a->off_since_us) / 3;
+		/* The access point gets the radio back, at least for what it kept while the radio was away. */
+		a->home_until_us = now + MWX_AWDL_HOME_MIN_MS * 1000ULL;
 	}
 fail:
 	mwx_awdl_close(sc);
@@ -12187,6 +12202,31 @@ mwx_awdl_rx_subframe(struct mbuf *m, uint16_t hdr_gap)
 	    memcmp(d + 16, mwx_awdl_bssid, 6) != 0)
 		return 0;
 	return (uint8_t)(rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT);
+}
+
+/*
+ * One data frame of the station with its access point, for the interface's rating of the access point's traffic
+ * (mtkAwdlRadioStationTraffic()): from mwx_tx() before the frame is handed over, and from mwx_rx() for what goes to
+ * net80211, of which only what the access point sent counts. Each direction has its own counters, written by its own
+ * path only.
+ */
+static void
+mwx_awdl_sta_traffic(struct mwx_softc *sc, struct mbuf *m, bool rx)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	struct ieee80211com *ic = &sc->sc_ic;
+	const struct ieee80211_frame *wh;
+
+	if (mbuf_len(m) < sizeof(*wh))
+		return;
+	wh = mtod(m, const struct ieee80211_frame *);
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA ||
+	    (wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_NODATA))
+		return;
+	if (rx && (ic->ic_bss == NULL || !IEEE80211_ADDR_EQ(wh->i_addr2, ic->ic_bss->ni_bssid)))
+		return;
+	a->sta_pkts[rx]++;
+	a->sta_bytes[rx] += mbuf_pkthdr_len(m);
 }
 
 /*
@@ -12612,6 +12652,16 @@ mtkAwdlRadioChannelAllowed(uint8_t channel)
 	struct mwx_softc *sc = gMwxAwdlSc;
 
 	return sc != NULL && mwx_awdl_channel_ok(sc, channel);
+}
+
+void
+mtkAwdlRadioStationTraffic(uint64_t *packets, uint64_t *bytes)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+
+	*packets = a != NULL ? a->sta_pkts[0] + a->sta_pkts[1] : 0;
+	*bytes = a != NULL ? a->sta_bytes[0] + a->sta_bytes[1] : 0;
 }
 
 void

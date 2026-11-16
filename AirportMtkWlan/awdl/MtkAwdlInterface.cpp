@@ -732,9 +732,11 @@ IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedM
 // ends: IO80211AWDLPeerManager::sanityCheckAWEnd takes end minus start in TU and wants one EAW, 64 TU within 10.
 //
 // Presence. The radio is where the schedule in our frames says it is, and nowhere else: TLV 4 and TLV 18 advertise
-// exactly the EAWs the radio will spend on an AWDL channel, and 00 00 for the EAWs left to the access point. Off the
-// access point's channel a run is at most 2 EAWs, followed by at least 2 EAWs at home; with nobody heard for 30 s the
-// radio visits one EAW per sequence (about 6% of the time away; thanhnndev 95c9a84: 47% away killed the link).
+// exactly the EAWs the radio will spend on an AWDL channel, and 00 00 for the EAWs left to the access point. On the
+// access point's channel the radio does not move: every EAW while AWDL is in use, the Family's sequence at rest. Off
+// it the EAWs left to the access point are those of Apple's own schedule for the state AWDL and the access point are
+// in (buildPresence()), and a run away is one remain-on-channel period; the firmware tells the access point about each
+// absence. With nobody heard for 30 s the radio visits one EAW per sequence.
 //
 // Stillness. The Family keeps AWDL enabled for the whole boot and at rest still asks for 3 EAWs per sequence on AWDL
 // channels (52 0 149 0 0 0 0 0 6 0 149 0 0 0 0 0 with the access point on 52). Apple's firmware makes those visits on its
@@ -769,6 +771,26 @@ const uint64_t kActiveUs = 30000000, kPeerStaleUs = 8000000;
 // With nothing of that, and nothing the Family asks for, for this long the timeline stops and the radio stays with the
 // station, as with awdl0 down (see noteActivity()).
 const uint64_t kStillUs = 60000000;
+// Off the access point's channel, the EAWs left to it (1) in each state, as Apple's IO80211Family builds its sequence
+// from the rows of _channelSeqSlotTypes (Tahoe 26.7, read by zheznanohana for ForbiddenItlwm):
+//  - no AWDL data: 6, 7, 14 and 15. Apple also turns the radio off in 3-5 and 11-13: here that is time at home;
+//  - AWDL data, access point idle: none in Apple's row. 15 stays at home, as in ForbiddenItlwm: a radio that
+//    switches channels by remain-on-channel requests needs one way back per sequence;
+//  - AWDL data, access point with data: 4, 5 and 12-15;
+//  - AWDL data, access point streaming: 4, 5 and 11-15.
+// AWDL data: a unicast data frame either way in the last kUcHoldUs. Every row ends at home, so a run never wraps. A
+// master that is on AWDL in none of the idle row's EAWs is met in 3-5 and 11-13 as well (kHomeIdleWide, ForbiddenItlwm
+// keeps listening there) rather than lost.
+const uint8_t kHomeIdle[16] = { 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1 };
+const uint8_t kHomeIdleWide[16] = { 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1 };
+const uint8_t kHomeDataApIdle[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+const uint8_t kHomeDataApData[16] = { 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1 };
+const uint8_t kHomeDataApStream[16] = { 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1 };
+const uint64_t kUcHoldUs = 3000000;
+// The access point's traffic as Apple rates it (currentInfraTrafficType): streaming when its packets average at least
+// kApStreamBytes (and at least 6 came), data with more than kApDataPps packets a second, otherwise idle.
+enum : uint8_t { kApIdle, kApData, kApStream };
+const uint64_t kApStreamBytes = 1401, kApDataPps = 100;
 const uint8_t kBssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
 // What ended a still period, for the driver log.
 enum : uint8_t { kWakeNone, kWakeSeq, kWakeTemplate, kWakeFrame, kWakeTraffic, kWakeData };
@@ -871,6 +893,10 @@ struct Engine {
     uint16_t seqNo, dataSeq;
     Peer peers[kPeers];
     uint64_t peerHeardUs, dataUs;
+    uint64_t ucUs;                  // the last unicast data frame, either way
+    // the access point's traffic, sampled once a sequence (rateAccessPoint())
+    uint64_t apPkts, apBytes, apSampleUs;
+    uint8_t apClass;
     RxDup dup[8];
     uint32_t dupNext;
     RxWin win[8];
@@ -1010,6 +1036,36 @@ bool quietFor(uint64_t now)
     return !gE.famBusy && !gE.onceLen && last < now && now - last > kStillUs;
 }
 
+// The access point's traffic class (kApIdle...), from the station's data frames either way, at most once every half
+// second: buildPresence() runs once a sequence. Lock held.
+void rateAccessPoint(uint64_t now)
+{
+    uint64_t pkts = 0, bytes = 0;
+    if (gE.apSampleUs && now - gE.apSampleUs < 500000) return;
+    mtkAwdlRadioStationTraffic(&pkts, &bytes);
+    if (gE.apSampleUs && pkts >= gE.apPkts && bytes >= gE.apBytes) {
+        uint64_t dp = pkts - gE.apPkts, db = bytes - gE.apBytes, el = now - gE.apSampleUs;
+        gE.apClass = (dp >= 6 && db / dp >= kApStreamBytes) ? kApStream : dp * 1000000 > kApDataPps * el ? kApData : kApIdle;
+    }
+    gE.apPkts = pkts;
+    gE.apBytes = bytes;
+    gE.apSampleUs = now;
+}
+
+// The schedule from where the radio would be in each EAW (cand) and the EAWs left to the access point (row[i] set):
+// present on the access point's channel whatever the row, since being there costs nothing; never two different AWDL
+// channels back to back. Lock held.
+void placeRuns(const uint8_t *cand, const uint8_t *row, uint8_t home)
+{
+    uint8_t prev = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        uint8_t c = cand[i];
+        if (!(c && c == home) && (!c || row[i] || (prev && prev != c))) c = 0;
+        gE.pres[i] = c;
+        prev = (c && c != home) ? c : 0;
+    }
+}
+
 // The schedule for the next 16 EAWs (see the top). Lock held.
 void buildPresence(uint64_t now)
 {
@@ -1017,11 +1073,14 @@ void buildPresence(uint64_t now)
     uint8_t cand[16] = {};
     bool active = (gE.peerHeardUs && now - gE.peerHeardUs < kActiveUs) || (gE.dataUs && now - gE.dataUs < kActiveUs) ||
                   (gE.actUs && now - gE.actUs < kActiveUs) || gE.famBusy;
+    rateAccessPoint(now);
     bzero(gE.pres, sizeof(gE.pres));
     if (!ch) return;
     if (home && home == ch) {
-        // The access point is on the AWDL channel: being there costs nothing, as long as the Family's sequence uses it.
-        for (uint32_t i = 0; i < 16; i++) gE.pres[i] = (!gE.famSet || gE.famCh[i] == ch) ? ch : 0;
+        // The access point is on the AWDL channel: being there costs nothing. At rest the schedule is the Family's
+        // sequence; while AWDL is in use, every EAW. The Family keeps its idle sequence during a transfer (3 EAWs in 16
+        // on the channel), peers send only in the EAWs we advertise, and our frames go out only in them.
+        for (uint32_t i = 0; i < 16; i++) gE.pres[i] = (active || !gE.famSet || gE.famCh[i] == ch) ? ch : 0;
         return;
     }
     uint8_t soc[4];
@@ -1033,7 +1092,8 @@ void buildPresence(uint64_t now)
     }
     const Peer *m = gE.role == 2 ? findPeer(gE.master) : nullptr;
     if (!m && gE.followUs && now - gE.followUs < kPeerStaleUs) m = findPeer(gE.follow);
-    if (m && m->n && now - m->lastUs < kPeerStaleUs) {
+    bool synced = m && m->n && now - m->lastUs < kPeerStaleUs;
+    if (synced) {
         // Synchronized to the master: its present EAWs are ours, its empty ones are our time at home.
         for (uint32_t i = 0; i < 16; i++) {
             uint8_t c = m->ch[i % m->n];
@@ -1045,32 +1105,18 @@ void buildPresence(uint64_t now)
         // channel: the peer came and went every second and unicast frames went unanswered).
         for (uint32_t i = 0; i < 16; i++) cand[i] = gE.peerCh;
     } else {
-        // Looking for peers: two EAWs on each social channel in turn, two at home in between.
-        for (uint32_t i = 0; i < 16; i++)
-            cand[i] = ((i / 2) % 2) == 0 ? (nsoc ? soc[(gE.discoIdx + i / 4) % nsoc] : ch) : 0;
-        gE.discoIdx++;
+        // Looking for peers: the first half's AWDL EAWs on one social channel, the second half's on the next.
+        for (uint32_t i = 0; i < 16; i++) cand[i] = nsoc ? soc[(gE.discoIdx + i / 8) % nsoc] : ch;
+        gE.discoIdx += 2;
     }
-    // At most 2 EAWs away in a row, then at least 2 at home; never two different AWDL channels back to back. While data
-    // flows with a device we follow (a transfer), 3 away and 1 at home: the transfer gets three quarters of the time
-    // and the access point still hears us every 4 EAWs; back to half as soon as the data stops for 2 s.
-    bool bulk = m && m->n && now - m->lastUs < kPeerStaleUs && gE.dataUs && now - gE.dataUs < 2000000;
-    uint32_t maxRun = bulk ? 3 : 2, minRest = bulk ? 1 : 2;
-    uint32_t run = 0, rest = minRest;
-    uint8_t prev = 0;
-    for (uint32_t i = 0; i < 16; i++) {
-        uint8_t c = cand[i];
-        if (c && c == home) { gE.pres[i] = c; run = 0; rest = minRest; prev = 0; continue; }
-        if (c && run > 0 && run < maxRun && c == prev) { gE.pres[i] = c; run++; continue; }
-        if (c && run == 0 && rest >= minRest) { gE.pres[i] = c; run = 1; rest = 0; prev = c; continue; }
-        run = 0;
-        prev = 0;
-        rest++;
-    }
-    // The sequence repeats: after a run at its end, slots 0 and 1 stay at home.
-    if (gE.pres[15] && gE.pres[15] != home) {
-        if (gE.pres[0] != home) gE.pres[0] = 0;
-        if (gE.pres[1] != home) gE.pres[1] = 0;
-    }
+    // The EAWs left to the access point: Apple's row for the state (see kHomeIdle).
+    bool data = gE.ucUs && now - gE.ucUs < kUcHoldUs;
+    placeRuns(cand, !data ? kHomeIdle : gE.apClass == kApStream ? kHomeDataApStream :
+              gE.apClass == kApData ? kHomeDataApData : kHomeDataApIdle, home);
+    // A master that is on AWDL in none of the idle row's EAWs is met where Apple's radio is off too (kHomeIdleWide).
+    bool met = false;
+    for (uint32_t i = 0; i < 16; i++) met = met || gE.pres[i];
+    if (!data && synced && !met) placeRuns(cand, kHomeIdleWide, home);
 }
 
 // TLV 4, the synchronization parameters (73 value bytes; thanhnndev d4b9008, seemoo-lab owl's layout). The counters at
@@ -1196,11 +1242,12 @@ void logState(uint64_t now)
     }
     pres[16] = 0;
     mtkAwdlRadioSummary(radio, sizeof(radio));
-    // pres: one character per EAW, a = 6, b = 44, c = 149, h = the access point's channel, x = another, . = at home
-    mtk_dbg_log("awdl: tl role=%u ch=%u pres=%s eaws=%u posted=%u/%u end=%u late=%u syncs=%u "
+    // pres: one character per EAW, a = 6, b = 44, c = 149, h = the access point's channel, x = another, . = at home;
+    // ap: the access point's traffic, i(dle), d(ata) or s(treaming)
+    mtk_dbg_log("awdl: tl role=%u ch=%u pres=%s ap=%c eaws=%u posted=%u/%u end=%u late=%u syncs=%u "
                 "frames=%u/%u rx af=%u/%u norssi=%u data=%u/%u/%u amsdu=%u/%u dup=%u notus=%u tx in=%u q=%u full=%u bad=%u "
                 "early=%u still=%u/%us\n",
-                gE.role, gE.awdlCh, pres, gE.eaws, gE.posted, gE.postFail, gE.ended, gE.late, gE.syncs,
+                gE.role, gE.awdlCh, pres, "ids"[gE.apClass % 3], gE.eaws, gE.posted, gE.postFail, gE.ended, gE.late, gE.syncs,
                 gE.frames, gE.framesFail, gE.rxAf, gE.rxAfFail, gE.rxNoRssi, gE.rxData, gE.rxDataUp, gE.rxDataFail,
                 gE.rxAmsdu, gE.rxSub, gE.rxDup,
                 gE.rxNotUs, gE.txIn, gE.txQueued, gE.txFull, gE.txBad, gE.txEarly, gE.stills, gE.stillS);
@@ -1323,13 +1370,14 @@ void tlTick()
         ev.channel = fam;
         ev.chFlags = chFlags(fam);
     }
-    // The radio's next window, one EAW ahead, covering a run of present EAWs on one channel.
+    // The radio's next window, one EAW ahead, covering a run of present EAWs on one channel: away from the access point
+    // the whole run, one remain-on-channel period; on its channel up to 3 EAWs, each window chained to the next.
     uint32_t ns = (slot + 1) & 15;
     uint64_t nextStart = awS + kEawUs;
     uint8_t nch = gE.pres[ns];
     if (nch && nextStart >= gE.plannedUntilUs) {
-        uint32_t run = 1;
-        while (run < 3 && gE.pres[(ns + run) & 15] == nch) run++;
+        uint32_t run = 1, most = nch == mtkAwdlRadioHomeChannel() ? 3 : 15;
+        while (run < most && gE.pres[(ns + run) & 15] == nch) run++;
         w.channel = nch;
         w.dwellMs = (uint16_t)(run * kEawUs / 1000 - 2);
         w.startUs = nextStart;
@@ -1799,8 +1847,13 @@ uint32_t MtkAwdlInterface::submitData(IOSkywalkPacket *const *packets, uint32_t 
             }
             gE.txIn++;
             gE.dataSeq++;
-            if (rv == 0) { gE.txQueued++; gE.dataUs = mtkAwdlUptimeUs(); }
-            else gE.txBad++;
+            if (rv == 0) {
+                gE.txQueued++;
+                gE.dataUs = mtkAwdlUptimeUs();
+                if (!(e[0] & 1)) gE.ucUs = gE.dataUs;
+            } else {
+                gE.txBad++;
+            }
         } else {
             gE.txBad++;
         }
@@ -1857,6 +1910,7 @@ void MtkAwdlInterface::deliverData(const uint8_t *f, uint32_t len, uint8_t part)
     const uint8_t *pl = f + hl;
     uint32_t plen = len - hl;
     gE.dataUs = now;
+    if (!(da[0] & 1)) gE.ucUs = now;
     if (!(qos && (f[24] & 0x80))) {
         deliverMsdu(da, sa, pl, plen);
         return;
