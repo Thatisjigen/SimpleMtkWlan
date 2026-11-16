@@ -187,8 +187,15 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   the MAC aggregates it. Away from the station's channel, or when the first
   aggregated frames do not come back, frames take the single-frame path on
   ALTX0. `-mtkawdlnoba` leaves all of it out; `awdl: radio ba` and
-  `awdl: rx qos` in the log count it. Until a peer is heard the schedule
-  visits the social channels 6, 44 and 149; a device that names itself master is
+  `awdl: rx qos` in the log count it. With the access point on the AWDL channel
+  the schedule covers every EAW while AWDL is in use (the Family keeps its idle
+  sequence, 3 EAWs in 16, during a transfer). Off it, the EAWs left to the
+  access point are those of Apple's rows by state (`kHome*` in the interface:
+  AWDL data in the last 3 s, and the access point idle, with data or streaming
+  as Apple rates it from the station's frames); a run away is one
+  remain-on-channel period and the radio stays at least 20 ms home between two.
+  Until a peer is heard the schedule visits the social channels 6, 44 and 149;
+  a device that names itself master is
   followed. After 60 s with no peer, no data and nothing asked by the Family, the
   timeline stops and the radio goes back to the station, as with awdl0 down; the
   Family's next browse or advertisement (a denser channel sequence, a template of
