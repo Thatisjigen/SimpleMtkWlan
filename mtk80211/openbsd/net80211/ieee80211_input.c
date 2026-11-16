@@ -2938,6 +2938,22 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
                         IEEE80211_FC0_SUBTYPE_ASSOC_RESP);
 }
 
+/*
+ * A station takes a deauthentication or a disassociation only from the BSS it
+ * is joining or has joined, whose identifier is in addr3. One from another
+ * network (a neighbour's broadcast, or a frame meant for an older
+ * association) would otherwise tear the link down and be reported to the
+ * system as the access point's own.
+ */
+static int
+ieee80211_mgmt_from_other_bss(struct ieee80211com *ic,
+                              const struct ieee80211_frame *wh)
+{
+    return ic->ic_opmode == IEEE80211_M_STA &&
+        ic->ic_state >= IEEE80211_S_AUTH && ic->ic_bss != NULL &&
+        !IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid);
+}
+
 /*-
  * Deauthentication frame format:
  * [2] Reason code
@@ -2961,6 +2977,15 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     
     reason = LE_READ_2(frm);
 
+    if (ieee80211_mgmt_from_other_bss(ic, wh)) {
+        static int logged;
+        if (logged < 32) {
+            logged++;
+            XYLog("Deauth from another BSS ignored, reason %d\n", reason);
+        }
+        ic->ic_stats.is_rx_wrongbss++;
+        return;
+    }
     XYLog("Deauth received, reason %d\n", reason);
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
@@ -3027,6 +3052,15 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
     
     reason = LE_READ_2(frm);
     
+    if (ieee80211_mgmt_from_other_bss(ic, wh)) {
+        static int logged;
+        if (logged < 32) {
+            logged++;
+            XYLog("Disassoc from another BSS ignored, reason %d\n", reason);
+        }
+        ic->ic_stats.is_rx_wrongbss++;
+        return;
+    }
     XYLog("Disassoc received, reason %d\n", reason);
     
     ic->ic_stats.is_rx_disassoc++;
