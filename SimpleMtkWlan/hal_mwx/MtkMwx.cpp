@@ -10121,6 +10121,8 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_ROC_SPARE_MS	95	/* asked on top of the dwell: grant, drain and abort have to fit */
 #define MWX_AWDL_ROC_STOP_MS	40	/* the dwell ends this long before the firmware ends the period itself */
 #define MWX_AWDL_HOME_MIN_MS	20	/* on the station's channel at least this long between two windows away */
+#define MWX_AWDL_RX_REFRESH_MS	2000	/* reception settings sent again although unchanged, at most this often */
+#define MWX_AWDL_CHAIN_WAIT_MS	80	/* for the next window on the station's channel, before the reception closes */
 #define MWX_AWDL_TX_GUARD_MS	10	/* nothing new for the hardware this close to the end of a window */
 #define MWX_AWDL_DRAIN_MS	25	/* for the frames handed to the hardware to leave */
 #define MWX_AWDL_FAULT_MAX	3	/* unanswered commands in a row before the radio stays off */
@@ -10230,6 +10232,8 @@ struct mwx_awdl {
 	bool			omac_failed;
 	bool			sniffer_on;
 	bool			filter_open;	/* RX filter with FIF_OTHER_BSS */
+	uint32_t		sniff_cfg;	/* channel, width and center the sniffer was last given; 0 none */
+	uint64_t		rx_cfg_us;	/* when the filter and the sniffer were last sent although unchanged */
 	bool			fullpwr;	/* deep sleep taken away from a station that had asked for it */
 	bool			roc_active;
 	volatile bool		tap_filter;	/* sniffer_on || filter_open */
@@ -10285,6 +10289,7 @@ struct mwx_awdl {
 	uint8_t			rxbuf[MWX_AWDL_RX_MAX];	/* main work loop only */
 	/* counters */
 	uint32_t		c_win, c_onch, c_late, c_busy, c_share, c_badch, c_gone;
+	uint32_t		c_chain_wait, c_chain_miss;	/* the next window waited for: came, did not */
 	uint32_t		c_roc_ok, c_roc_fail, c_roc_late, c_roc_stray, c_roc_clip, c_cmd, c_cmd_err;
 	uint32_t		c_tx_group, c_tx_uc_ok[2], c_tx_uc_fail[2], c_tx_err, c_tx_stale, c_tx_full;
 	uint32_t		c_rx_af, c_rx_data, c_rx_long, c_rx_echo, c_rx_other, c_drain;
@@ -11850,8 +11855,10 @@ mwx_awdl_close(struct mwx_softc *sc)
 	a->rx_open = false;
 	if ((!a->sniffer_on && !a->filter_open) || mwx_awdl_fw_gone(sc))
 		return;
-	if (a->sniffer_on && mwx_awdl_sniffer(sc, 0, MWX_AWDL_MCU_MS) == 0)
+	if (a->sniffer_on && mwx_awdl_sniffer(sc, 0, MWX_AWDL_MCU_MS) == 0) {
 		a->sniffer_on = false;
+		a->sniff_cfg = 0;
+	}
 	if (a->filter_open && !a->sniffer_on && mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE) == 0) {
 		mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
 		a->filter_open = false;
@@ -11877,6 +11884,7 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	bool onch = home != 0 && home == w->channel, agg;
 	uint64_t now = mtkAwdlUptimeUs(), start = w->startUs, end, roc_deadline = 0, t;
 	uint32_t lead = onch ? 5000 : a->lead_us, dwell = w->dwellMs;
+	bool refresh;
 	int i;
 
 	if (a->off || mwx_awdl_fw_gone(sc)) {
@@ -11933,11 +11941,19 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	if (home == 0)
 		mwx_awdl_fullpwr(sc, true);
 
-	/* Other devices' frames, from before the radio moves. */
+	/*
+	 * Other devices' frames, from before the radio moves. A window right after one on the station's channel finds the
+	 * reception as that one left it, the dense schedule's case: the filter and the sniffer's channel go to the firmware
+	 * again only when they change, or every MWX_AWDL_RX_REFRESH_MS. Before, every window sent both, ten identical
+	 * commands a second, and the data RX ring has been seen to stop for good after some hundreds of windows.
+	 */
+	refresh = now >= a->rx_cfg_us + MWX_AWDL_RX_REFRESH_MS * 1000ULL;
 	a->tap_filter = true;
-	a->filter_open = true;
-	if (mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE | MWX_AWDL_FILTER_OTHER_BSS) != 0)
-		goto fail;
+	if (!a->filter_open || refresh) {
+		a->filter_open = true;
+		if (mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE | MWX_AWDL_FILTER_OTHER_BSS) != 0)
+			goto fail;
+	}
 	if (!a->sniffer_on) {
 		a->sniffer_on = true;
 		if (mwx_awdl_sniffer(sc, 1, 0) != 0)
@@ -11998,6 +12014,8 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	{
 		uint8_t sbw = CMD_CBW_20MHZ, sctr = w->channel;
 
+		uint32_t cfg;
+
 		if (onch) {
 			sbw = bw;
 			sctr = center;
@@ -12005,8 +12023,15 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 			sbw = CMD_CBW_80MHZ;
 			sctr = w->channel == 44 ? 42 : 155;
 		}
-		if (mwx_awdl_sniffer_config(sc, w->channel, sbw, sctr) != 0)
-			goto abort;
+		cfg = 1U << 24 | (uint32_t)sctr << 16 | (uint32_t)sbw << 8 | w->channel;
+		if (cfg != a->sniff_cfg || refresh) {
+			a->sniff_cfg = 0;
+			if (mwx_awdl_sniffer_config(sc, w->channel, sbw, sctr) != 0)
+				goto abort;
+			a->sniff_cfg = cfg;
+		}
+		if (refresh)
+			a->rx_cfg_us = mtkAwdlUptimeUs();
 	}
 	if (mtkAwdlUptimeUs() < start)
 		mwx_awdl_sleep_until(sc, start, false);
@@ -12059,14 +12084,34 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	a->win_onch = false;
 	a->rx_open = false;
 
-	/* The next window on the station's channel right after this one keeps the reception open. */
+	/*
+	 * The next window on the station's channel right after this one keeps the reception open. The interface posts it
+	 * one EAW ahead from the controller's work loop, which received data can hold up: then it is waited for, up to
+	 * MWX_AWDL_CHAIN_WAIT_MS, rather than turning the sniffer and the filter off and on again while frames come in.
+	 * Both reception stalls seen with their commands came right after such a change under load.
+	 */
 	if (onch && !mwx_awdl_stop_asked(sc) && !mwx_awdl_station_busy(sc)) {
-		bool chained;
-		IOLockLock(a->lock);
-		chained = a->next_valid && a->next.channel == w->channel && a->next.startUs <= end + 10000;
-		IOLockUnlock(a->lock);
-		if (chained)
-			return;
+		uint64_t until = mtkAwdlUptimeUs() + MWX_AWDL_CHAIN_WAIT_MS * 1000ULL;
+		bool chained, posted, waited = false;
+
+		for (;;) {
+			IOLockLock(a->lock);
+			posted = a->next_valid;
+			chained = posted && a->next.channel == w->channel && a->next.startUs <= end + 10000;
+			IOLockUnlock(a->lock);
+			if (chained) {
+				if (waited)
+					a->c_chain_wait++;
+				return;
+			}
+			if (posted || mtkAwdlUptimeUs() >= until || mwx_awdl_stop_asked(sc) ||
+			    mwx_awdl_station_busy(sc))
+				break;
+			waited = true;
+			mwx_awdl_sleep_until(sc, until, true);
+		}
+		if (waited)
+			a->c_chain_miss++;
 	}
 abort:
 	if (a->roc_active) {
@@ -12406,6 +12451,7 @@ mwx_awdl_firmware_reset(struct mwx_softc *sc)
 		return;
 	a->omac_on = a->omac_failed = false;
 	a->sniffer_on = a->filter_open = a->fullpwr = a->roc_active = false;
+	a->sniff_cfg = 0;
 	a->rx_open = false;
 	a->roc_want = a->roc_granted = false;
 	a->tap_filter = false;
@@ -12434,6 +12480,7 @@ mwx_awdl_resume(struct mwx_softc *sc)
 	if (a->filter_open)
 		mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE);
 	a->sniffer_on = a->filter_open = a->roc_active = false;
+	a->sniff_cfg = 0;
 	a->omac_on = a->omac_failed = false;	/* the interface was registered again */
 	/*
 	 * Records and the BSS are made again when needed; one the firmware still holds is removed and made anew then
@@ -12677,10 +12724,11 @@ mtkAwdlRadioSummary(char *buffer, size_t length)
 		return;
 	}
 	snprintf(buffer, length,
-	    "win=%u onch=%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
+	    "win=%u onch=%u chain=%u/%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
 	    "badch=%u gone=%u cmd=%u/%u tx grp=%u uc2=%u/%u uc5=%u/%u err=%u stale=%u full=%u drain=%u "
 	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d",
-	    a->c_win, a->c_onch, a->c_roc_ok, a->c_roc_fail, a->c_roc_late, a->c_roc_stray, a->c_roc_clip, a->lead_us,
+	    a->c_win, a->c_onch, a->c_chain_wait, a->c_chain_miss, a->c_roc_ok, a->c_roc_fail, a->c_roc_late,
+	    a->c_roc_stray, a->c_roc_clip, a->lead_us,
 	    a->c_late, a->late_us / 1000, a->off_us / 1000, a->c_busy, a->c_share, a->c_badch, a->c_gone, a->c_cmd,
 	    a->c_cmd_err, a->c_tx_group, a->c_tx_uc_ok[0], a->c_tx_uc_fail[0], a->c_tx_uc_ok[1], a->c_tx_uc_fail[1],
 	    a->c_tx_err, a->c_tx_stale, a->c_tx_full, a->c_drain, a->c_rx_af, a->c_rx_data, a->c_rx_uc, a->c_rx_echo,
