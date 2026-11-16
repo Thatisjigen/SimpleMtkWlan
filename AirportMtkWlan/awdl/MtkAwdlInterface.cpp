@@ -155,7 +155,7 @@ public:
     // The data path (end of this file).
     uint32_t submitData(IOSkywalkPacket *const *packets, uint32_t count);
     void serviceData();
-    void deliverData(const uint8_t *frame, uint32_t len);
+    void deliverData(const uint8_t *frame, uint32_t len, uint8_t part);
     void deliverMsdu(const uint8_t *da, const uint8_t *sa, const uint8_t *pl, uint32_t plen);
     void enableData();
 
@@ -806,9 +806,24 @@ struct Peer {
     uint64_t lastUs;
     uint8_t masterIs;        // the master its synchronization parameters name: 1 itself, 2 us, 3 another device
     uint32_t heard, logged;  // frames heard from it, and when it was last logged
+    uint8_t capsLogged;      // its HT (bit 0) and VHT (bit 1) capability TLVs, once in the log
 };
 
 struct RxDup { uint8_t sa[6]; uint16_t sc; bool valid; };
+
+// The QoS data of one sender and TID. Under a Block Ack agreement a frame the peer sends again comes in a later A-MPDU,
+// behind newer ones, so the last sequence number is not enough: hi is the newest number delivered and bit i of seen is
+// hi - i, as a recipient's window of 64 (IEEE 802.11 duplicate detection with a scoreboard). There is no reordering:
+// a late frame goes up as it comes, and TCP puts it in place. part: the subframes the hardware split out of one A-MSDU
+// share its number, so the first decides and the others follow it (cur, curOk).
+struct RxWin {
+    uint8_t sa[6];
+    uint8_t tid;
+    bool valid, curOk;
+    uint16_t hi, cur;
+    uint64_t seen, lastUs;
+    uint8_t old;              // frames older than the window in a row: the sender started again
+};
 
 struct Engine {
     IOLock *lock;
@@ -842,12 +857,15 @@ struct Engine {
     // the Family's TLVs
     uint8_t psf[kTlvMax], mi[kTlvMax], once[kTlvMax];
     uint32_t psfLen, miLen, onceLen;
+    uint8_t ownCapsLogged;          // our HT and VHT capability TLVs (bits 0 and 1), once in the log
     uint8_t onceDa[6];
     uint16_t seqNo, dataSeq;
     Peer peers[kPeers];
     uint64_t peerHeardUs, dataUs;
     RxDup dup[8];
     uint32_t dupNext;
+    RxWin win[8];
+    uint32_t winNext;
     // data path
     bool dpOn, txBlocked;
     IOSkywalkPacket *txDone[64];
@@ -860,6 +878,7 @@ struct Engine {
     uint32_t eaws, posted, postFail, ended, late, syncs, frames, framesFail, windows;
     uint32_t rxAf, rxAfFail, rxNoRssi, rxData, rxDataUp, rxDataFail, rxDup, rxNotUs;
     uint32_t txIn, txQueued, txFull, txBad, txEarly, rxAmsdu, rxSub, stills, stillS;
+    uint32_t rxQos, rxQosDup, rxQosLate, rxQosOld, rxQosRestart, rxParts, rxPartsDropped;
     uint64_t logUs;
 };
 Engine gE;
@@ -1171,6 +1190,12 @@ void logState(uint64_t now)
     mtk_dbg_log("awdl: radio %s\n", radio);
     mtkAwdlRadioChannels(radio, sizeof(radio));
     mtk_dbg_log("awdl: radio %s\n", radio);
+    mtkAwdlRadioBlockAck(radio, sizeof(radio));
+    mtk_dbg_log("awdl: radio %s\n", radio);
+    // QoS data received: delivered, sent again (dropped), late inside the window (delivered), older than the window
+    // (dropped), windows started again; subframes split by the hardware, and those dropped with their A-MSDU
+    mtk_dbg_log("awdl: rx qos=%u dup=%u late=%u old=%u restart=%u parts=%u/%u\n", gE.rxQos, gE.rxQosDup, gE.rxQosLate,
+                gE.rxQosOld, gE.rxQosRestart, gE.rxParts, gE.rxPartsDropped);
 }
 
 // One EAW boundary of the timeline. Controller work loop.
@@ -1313,6 +1338,29 @@ void tlTick()
 
 void tlTimerFired(OSObject *, IOTimerEventSource *) { tlTick(); }
 
+// The HT (7) and VHT (17) capability TLVs among `tlvs`, in the driver log: what a device says about aggregation, the
+// A-MPDU parameters and the largest A-MSDU it takes. Only those not in `done` (bit 0 HT, bit 1 VHT); returns the bits of
+// those logged. Never waits, so it can run with the lock held.
+uint8_t logCapTlvs(const char *who, const uint8_t *tlvs, uint32_t len, uint8_t done)
+{
+    uint8_t logged = 0;
+    for (uint32_t pos = 0; pos + 3 <= len;) {
+        uint32_t l = rd16(tlvs + pos + 1);
+        if (pos + 3 + l > len) break;
+        uint8_t bit = tlvs[pos] == 7 ? 1 : tlvs[pos] == 17 ? 2 : 0;
+        if (bit && !(done & bit)) {
+            char hex[3 * 24 + 1];
+            uint32_t k = 0;
+            for (uint32_t i = 0; i < l && i < 24; i++) k += (uint32_t)snprintf(hex + k, sizeof(hex) - k, " %02x", tlvs[pos + 3 + i]);
+            hex[k] = 0;
+            mtk_dbg_log("awdl: %s %s capabilities, %u bytes:%s\n", who, bit == 1 ? "HT" : "VHT", l, hex);
+            logged |= bit;
+        }
+        pos += 3 + l;
+    }
+    return logged;
+}
+
 // The master's TLV 4 gives its timeline: re-align ours as its slave (thanhnndev 62afa98, 44d5bd2). Lock held.
 void trackPeer(const uint8_t *sa, const uint8_t *body, uint32_t bodyLen, uint64_t rxUs)
 {
@@ -1374,6 +1422,11 @@ void trackPeer(const uint8_t *sa, const uint8_t *body, uint32_t bodyLen, uint64_
     bool claimChanged = claim != p->masterIs;
     p->masterIs = claim;
     p->heard++;
+    if ((p->capsLogged & 3) != 3 && bodyLen > 16) {
+        char who[24];
+        snprintf(who, sizeof(who), "peer ..:%02x:%02x", sa[4], sa[5]);
+        p->capsLogged |= logCapTlvs(who, body + 16, bodyLen - 16, p->capsLogged);
+    }
     if (claimChanged || p->heard - p->logged >= 200 || p->heard == 1) {
         p->logged = p->heard;
         // where its EAWs start within ours, 0 to 65535 us (0: aligned); -1 before our timeline runs
@@ -1460,7 +1513,7 @@ void mtkAwdlRadioRoomFreed()
     if (gE.dpTimer && gE.txBlocked) gE.dpTimer->setTimeoutUS(1);
 }
 
-void mtkAwdlInput(const uint8_t *frame, uint32_t len, uint32_t channel, int32_t rssi, uint64_t timeUs)
+void mtkAwdlInput(const uint8_t *frame, uint32_t len, uint32_t channel, int32_t rssi, uint64_t timeUs, uint8_t part)
 {
     MtkAwdlInterface *vif = gE.vif;
     if (!vif || !gE.lock || !frame || len < 24) return;
@@ -1469,7 +1522,7 @@ void mtkAwdlInput(const uint8_t *frame, uint32_t len, uint32_t channel, int32_t 
     IOLockUnlock(gE.lock);
     if (!on) return;
     if ((frame[0] & 0x0c) == 0x08) {
-        vif->deliverData(frame, len);
+        vif->deliverData(frame, len, part);
         return;
     }
     if (frame[0] != 0xd0 || len < 40) return;
@@ -1608,6 +1661,62 @@ void dpTimerFired(OSObject *owner, IOTimerEventSource *)
     if (owner) ((MtkAwdlInterface *)owner)->serviceData();
 }
 
+// Whether a unicast QoS data frame of `sa` goes up (RxWin). A window not used for 3 s, or older frames eight times in a
+// row, start again from the frame at hand. Work loop.
+bool acceptQos(const uint8_t *sa, uint8_t tid, uint16_t sn, uint8_t part, uint64_t now)
+{
+    RxWin *w = nullptr;
+    for (RxWin &x : gE.win) if (x.valid && x.tid == tid && !memcmp(x.sa, sa, 6)) { w = &x; break; }
+    if (part == kMtkAwdlMiddlePart || part == kMtkAwdlLastPart) {
+        bool ok = w && w->cur == sn && w->curOk;
+        if (ok) gE.rxParts++;
+        else gE.rxPartsDropped++;
+        return ok;
+    }
+    if (part == kMtkAwdlFirstPart) gE.rxParts++;
+    bool ok = true;
+    if (!w || now - w->lastUs > 3000000ULL) {
+        if (!w) {
+            w = &gE.win[gE.winNext++ % (sizeof(gE.win) / sizeof(gE.win[0]))];
+            memcpy(w->sa, sa, 6);
+            w->tid = tid;
+            w->valid = true;
+        } else {
+            gE.rxQosRestart++;
+        }
+        w->hi = sn;
+        w->seen = 1;
+        w->old = 0;
+    } else {
+        uint16_t back = (uint16_t)((w->hi - sn) & 0xfff);
+        if (back == 0 || (back < 64 && (w->seen & (1ULL << back)))) {
+            ok = false;                                       // sent again: delivered already
+            gE.rxQosDup++;
+        } else if (back < 64) {
+            w->seen |= 1ULL << back;                          // late, inside the window
+            gE.rxQosLate++;
+        } else if (back > 2048) {
+            uint16_t ahead = (uint16_t)((sn - w->hi) & 0xfff); // newer: the window moves up to it
+            w->seen = ahead >= 64 ? 1 : (w->seen << ahead) | 1;
+            w->hi = sn;
+            w->old = 0;
+        } else if (++w->old >= 8) {
+            w->hi = sn;
+            w->seen = 1;
+            w->old = 0;
+            gE.rxQosRestart++;
+        } else {
+            ok = false;
+            gE.rxQosOld++;
+        }
+    }
+    w->lastUs = now;
+    w->cur = sn;
+    w->curOk = ok;
+    if (ok) gE.rxQos++;
+    return ok;
+}
+
 } // namespace
 
 uint32_t MtkAwdlInterface::submitData(IOSkywalkPacket *const *packets, uint32_t count)
@@ -1699,7 +1808,7 @@ void MtkAwdlInterface::serviceData()
 }
 
 // Air -> stack, from the receive tap: the 802.11 data frame becomes an Ethernet frame on awdl0.
-void MtkAwdlInterface::deliverData(const uint8_t *f, uint32_t len)
+void MtkAwdlInterface::deliverData(const uint8_t *f, uint32_t len, uint8_t part)
 {
     gE.rxData++;
     if (!gE.dpOn || !awdlPool || !awdlQueues[2] || len < 24) { gE.rxDataFail++; return; }
@@ -1711,14 +1820,20 @@ void MtkAwdlInterface::deliverData(const uint8_t *f, uint32_t len)
     if (!(da[0] & 1) && memcmp(da, gE.addr, 6)) { gE.rxNotUs++; return; }
     if (!memcmp(sa, gE.addr, 6) || (sa[0] & 1)) { gE.rxNotUs++; return; }
     uint16_t sc = rd16(f + 22);
-    RxDup *d = nullptr;
-    for (RxDup &x : gE.dup) if (x.valid && !memcmp(x.sa, sa, 6)) { d = &x; break; }
-    if (d && d->sc == sc && (f[1] & 0x08)) { gE.rxDup++; return; }          // a retry of a frame already delivered
-    if (!d) { d = &gE.dup[gE.dupNext++ % 8]; memcpy(d->sa, sa, 6); d->valid = true; }
-    d->sc = sc;
+    uint64_t now = mtkAwdlUptimeUs();
+    if (qos && !(da[0] & 1)) {
+        // unicast QoS data, which a Block Ack agreement may bring out of order
+        if (!acceptQos(sa, f[24] & 0x0f, sc >> 4, part, now)) return;
+    } else {
+        RxDup *d = nullptr;
+        for (RxDup &x : gE.dup) if (x.valid && !memcmp(x.sa, sa, 6)) { d = &x; break; }
+        if (d && d->sc == sc && (f[1] & 0x08)) { gE.rxDup++; return; }      // a retry of a frame already delivered
+        if (!d) { d = &gE.dup[gE.dupNext++ % 8]; memcpy(d->sa, sa, 6); d->valid = true; }
+        d->sc = sc;
+    }
     const uint8_t *pl = f + hl;
     uint32_t plen = len - hl;
-    gE.dataUs = mtkAwdlUptimeUs();
+    gE.dataUs = now;
     if (!(qos && (f[24] & 0x80))) {
         deliverMsdu(da, sa, pl, plen);
         return;
@@ -1940,6 +2055,7 @@ static IOReturn engineOob(const uint8_t *r, bool autoReq)
     if (autoReq) {
         memcpy(gE.mi, pl, len);
         gE.miLen = len;
+        if ((gE.ownCapsLogged & 3) != 3) gE.ownCapsLogged |= logCapTlvs("our", pl, len, gE.ownCapsLogged);
     } else {
         memcpy(gE.once, pl, len);
         gE.onceLen = len;
