@@ -134,6 +134,9 @@ Optional boot-args:
 * `-mtk160` — experimental 160 MHz operation on MT7922.
 * `-mtkrxamsdu` — enable RX A-MSDU decapsulation.
 * `-mtknoamsdu` — disable hardware TX A-MSDU.
+* `-mtkallowaspm` — keep PCIe ASPM (L0s, L1) and the L1 substates on; by
+  default attach turns them off on the card and the port above it, as Linux
+  mt76 does.
 * `-mtkno160`, `-mtknopool`, `-mtknowtblba`, `-novht`, `-noht40` — targeted
   diagnostic fallbacks.
 
