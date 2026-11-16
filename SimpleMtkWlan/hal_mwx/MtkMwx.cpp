@@ -10142,7 +10142,8 @@ MtkMwx::debugPoll()
  *    the RX filter with FIF_OTHER_BSS, MCU_CE_CMD(SET_RX_FILTER) (mt7921_mcu_set_rxfilter from
  *    mt7921_configure_filter), and the firmware sniffer, MCU_UNI_CMD(SNIFFER) UNI_SNIFFER_ENABLE
  *    (mt7921_mcu_set_sniffer), then UNI_SNIFFER_CONFIG for the window's channel once the radio is there
- *    (mt7921_mcu_config_sniffer). Both go back to the station's settings when the window ends;
+ *    (mt7921_mcu_config_sniffer). Both go back to the station's settings when the window ends. On the
+ *    station's channel, once a peer has its record on AWDL's BSS, whose BSSID is AWDL's, neither is opened;
  *  - acknowledging frames sent to awdl0: its address on a second own MAC, OMAC 1, with the DEV_INFO_UPDATE
  *    that mt76_connac_mcu_uni_add_dev sends for a second interface;
  *  - sending: the normal TX path with the 802.11 header kept (mt76_connac2_mac_write_txwi), on ALTX0, the
@@ -10375,6 +10376,7 @@ struct mwx_awdl {
 	/* counters */
 	uint32_t		c_win, c_onch, c_late, c_busy, c_share, c_badch, c_gone;
 	uint32_t		c_chain_wait, c_chain_miss;	/* the next window waited for: came, did not */
+	uint32_t		c_quiet;	/* windows on the station's channel with no sniffer or filter opened */
 	uint32_t		c_roc_ok, c_roc_fail, c_roc_late, c_roc_stray, c_roc_clip, c_cmd, c_cmd_err;
 	uint32_t		c_tx_group, c_tx_uc_ok[2], c_tx_uc_fail[2], c_tx_err, c_tx_stale, c_tx_full;
 	uint32_t		c_rx_af, c_rx_data, c_rx_long, c_rx_echo, c_rx_other, c_drain;
@@ -10939,7 +10941,8 @@ mwx_awdl_mcu_sync(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m)
  * AWDL's BSS, the BSS_INFO half of mt76_connac_mcu_uni_add_dev() for OMAC 1 (mwx_awdl_omac() is the DEV_INFO half). A
  * P2P device that is not connected, AP | P2P with conn_state 1, as mt76 builds one for NL80211_IFTYPE_P2P_DEVICE: the
  * firmware gives it no channel and no beacon, only the peers' records hang on it. MtkWireless found an IBSS refused by
- * the MT7921 firmware and this type taken. It shares the station's EDCA set, whose queues the aggregated path uses.
+ * the MT7921 firmware and this type taken. It shares the station's EDCA set, whose queues the aggregated path uses. Its
+ * BSSID is AWDL's, which every AWDL frame carries as address 3.
  */
 static int
 mwx_awdl_bss_cmd(struct mwx_softc *sc, bool on)
@@ -10964,6 +10967,7 @@ mwx_awdl_bss_cmd(struct mwx_softc *sc, bool on)
 	req.basic.conn_type = htole32(STA_TYPE_AP | NETWORK_P2P);
 	req.basic.conn_state = 1;
 	req.basic.wmm_idx = sc->sc_vif.wmm_idx;
+	memcpy(req.basic.bssid, mwx_awdl_bssid, IEEE80211_ADDR_LEN);	/* the peers' frames are then this BSS's */
 	req.basic.bmc_tx_wlan_idx = htole16(MWX_AWDL_BSS_WCID);
 	req.basic.sta_idx = htole16(MWX_AWDL_BSS_WCID);
 	if ((m = mwx_mcu_alloc_msg(sizeof(req))) == NULL)
@@ -12076,7 +12080,7 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	bool onch = home != 0 && home == w->channel, agg;
 	uint64_t now = mtkAwdlUptimeUs(), start = w->startUs, end, roc_deadline = 0, t;
 	uint32_t lead = onch ? 5000 : a->lead_us, dwell = w->dwellMs;
-	bool refresh;
+	bool refresh, quiet;
 	int i;
 
 	if (a->off || mwx_awdl_fw_gone(sc)) {
@@ -12140,16 +12144,31 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	 * commands a second, and the data RX ring has been seen to stop for good after some hundreds of windows.
 	 */
 	refresh = now >= a->rx_cfg_us + MWX_AWDL_RX_REFRESH_MS * 1000ULL;
-	a->tap_filter = true;
-	if (!a->filter_open || refresh) {
-		a->filter_open = true;
-		if (mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE | MWX_AWDL_FILTER_OTHER_BSS) != 0)
-			goto fail;
-	}
-	if (!a->sniffer_on) {
-		a->sniffer_on = true;
-		if (mwx_awdl_sniffer(sc, 1, 0) != 0)
-			goto fail;
+	/*
+	 * On the station's channel, once a peer has its station record on AWDL's BSS, whose BSSID is AWDL's, the MAC takes
+	 * the peers' frames as frames of a BSS of ours: neither the sniffer nor the filter for other BSSs is opened there, as
+	 * ForbiddenItlwm keeps its listener out of promiscuous mode while the phone has a firmware station (their
+	 * maintainer saw the firmware stop acknowledging the phone with promiscuous reception on). Here the data RX ring
+	 * stopped right after the sniffer and the filter changed under load. The first such window closes what an earlier
+	 * one opened; elsewhere, and before any record, the reception opens as before.
+	 */
+	quiet = onch && a->bss_on && a->sta_used != 0;
+	if (quiet) {
+		a->c_quiet++;
+		if (a->sniffer_on || a->filter_open)
+			mwx_awdl_close(sc);
+	} else {
+		a->tap_filter = true;
+		if (!a->filter_open || refresh) {
+			a->filter_open = true;
+			if (mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE | MWX_AWDL_FILTER_OTHER_BSS) != 0)
+				goto fail;
+		}
+		if (!a->sniffer_on) {
+			a->sniffer_on = true;
+			if (mwx_awdl_sniffer(sc, 1, 0) != 0)
+				goto fail;
+		}
 	}
 	if (!onch) {
 		/*
@@ -12216,13 +12235,13 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 			sctr = w->channel == 44 ? 42 : 155;
 		}
 		cfg = 1U << 24 | (uint32_t)sctr << 16 | (uint32_t)sbw << 8 | w->channel;
-		if (cfg != a->sniff_cfg || refresh) {
+		if (!quiet && (cfg != a->sniff_cfg || refresh)) {
 			a->sniff_cfg = 0;
 			if (mwx_awdl_sniffer_config(sc, w->channel, sbw, sctr) != 0)
 				goto abort;
 			a->sniff_cfg = cfg;
 		}
-		if (refresh)
+		if (refresh && !quiet)
 			a->rx_cfg_us = mtkAwdlUptimeUs();
 	}
 	if (mtkAwdlUptimeUs() < start)
@@ -12942,10 +12961,10 @@ mtkAwdlRadioSummary(char *buffer, size_t length)
 		return;
 	}
 	snprintf(buffer, length,
-	    "win=%u onch=%u chain=%u/%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
+	    "win=%u onch=%u quiet=%u chain=%u/%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
 	    "badch=%u gone=%u cmd=%u/%u tx grp=%u uc2=%u/%u uc5=%u/%u err=%u stale=%u full=%u drain=%u "
 	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d",
-	    a->c_win, a->c_onch, a->c_chain_wait, a->c_chain_miss, a->c_roc_ok, a->c_roc_fail, a->c_roc_late,
+	    a->c_win, a->c_onch, a->c_quiet, a->c_chain_wait, a->c_chain_miss, a->c_roc_ok, a->c_roc_fail, a->c_roc_late,
 	    a->c_roc_stray, a->c_roc_clip, a->lead_us,
 	    a->c_late, a->late_us / 1000, a->off_us / 1000, a->c_busy, a->c_share, a->c_badch, a->c_gone, a->c_cmd,
 	    a->c_cmd_err, a->c_tx_group, a->c_tx_uc_ok[0], a->c_tx_uc_fail[0], a->c_tx_uc_ok[1], a->c_tx_uc_fail[1],
