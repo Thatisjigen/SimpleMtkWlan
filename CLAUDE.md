@@ -105,6 +105,11 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - A warm reboot keeps the M.2 card powered; attach recovers via WFSYS reset and
   PCIe FLR. When the patch semaphore answers `PATCH_IS_DL` the ROM patch is
   skipped and only the WM firmware is loaded, as in Linux.
+- PCIe link power: `mwx_pci_disable_aspm()` clears ASPM L0s/L1 and then the
+  L1.1/L1.2 enables at attach, the card before its upstream port, as Linux
+  does at probe (`mt76_pci_disable_aspm`, `pci_disable_link_state`). The
+  `aspm(ep)` and `aspm(parent)` log lines show each register that changed;
+  `-mtkallowaspm` keeps the firmware's setting.
 - Restart / power off: `AirportItlwm::systemWillShutdown()` takes the
   interface down like a system sleep, then `MtkMwx::shutdown()` parks the chip
   (interrupts masked, DMA off, firmware own, bus mastering off). No MCU

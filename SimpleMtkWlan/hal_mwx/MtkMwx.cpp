@@ -1092,6 +1092,7 @@ int	mwx_mcu_wait_resp_msg(struct mwx_softc *, uint32_t, int,
 int		mwx_dma_disable(struct mwx_softc *sc, int force);
 void		mwx_dma_enable(struct mwx_softc *sc);
 int		mwx_pci_flr(struct mwx_softc *, IOPCIDevice *);
+void		mwx_pci_disable_aspm(struct mwx_softc *, IOPCIDevice *);
 static void	mwx_node_chan_width(struct ieee80211_node *, uint8_t *, uint8_t *);
 int		mwx_ampdu_rx_start(struct ieee80211com *, struct ieee80211_node *,
 		    uint8_t);
@@ -3271,6 +3272,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 		MWX_DEV_LOG(sc, "attach MCU power control recovered\n");
 	}
 	MWX_DEV_LOG(sc, "attach MCU power control ok\n");
+	mwx_pci_disable_aspm(sc, pa->pa_tag);
 
 	hwid = mwx_read(sc, MT_HW_CHIPID) & 0xffff;
 	hwrev = mwx_read(sc, MT_HW_REV) & 0xff;
@@ -5314,6 +5316,103 @@ mwx_pci_flr(struct mwx_softc *sc, IOPCIDevice *dev)
 	dev->setBusMasterEnable(true);
 	MWX_DEV_LOG(sc, "FLR done vendor=0x%04x\n", dev->configRead16(0));
 	return 0;
+}
+
+/*
+ * PCIe link power states, turned off as Linux mt76 does at probe
+ * (mt76_pci_disable_aspm() in mt76/pci.c): read the ASPM control of the card
+ * and of the port above it, stop if both ends are already off, and otherwise
+ * clear the card before its upstream port. The L1 PM Substates enables go
+ * too, as with Linux's pci_disable_link_state(): L1.1 and L1.2 are only
+ * entered through L1, so L1 is turned off first and the substates after it,
+ * each at the downstream end before the upstream one, in the order Linux
+ * uses. Every register that changes is logged with the value read back.
+ * -mtkallowaspm leaves the link as the firmware set it.
+ */
+#define	MWX_PCIE_LNKCTL			0x10		/* in the PCIe capability */
+#define	MWX_PCIE_LNKCTL_ASPM		0x0003		/* ASPM Control: L0s, L1 */
+#define	MWX_PCIE_L1SS_CTL1		0x08		/* in the L1 PM Substates capability */
+#define	MWX_PCIE_L1SS_CTL1_EN		0x0000000f	/* PCI-PM and ASPM L1.2, L1.1 */
+
+struct mwx_link_end {
+	IOPCIDevice	*dev;
+	const char	*name;
+	UInt8		 exp;		/* PCIe capability, 0 if none */
+	IOByteCount	 l1ss;		/* L1 PM Substates capability, 0 if none */
+	uint16_t	 lnkctl;
+	uint32_t	 l1ss_ctl1;
+};
+
+static void
+mwx_link_end_read(struct mwx_link_end *end, IOPCIDevice *dev, const char *name)
+{
+	bzero(end, sizeof(*end));
+	end->dev = dev;
+	end->name = name;
+	if (dev == NULL)
+		return;
+	if (dev->findPCICapability(kIOPCICapabilityIDPCIExpress, &end->exp) == 0)
+		end->exp = 0;
+	if (end->exp != 0)
+		end->lnkctl = dev->configRead16(end->exp + MWX_PCIE_LNKCTL);
+	if (dev->extendedFindPCICapability(kIOPCIExpressCapabilityIDL1PMSubstates,
+	    &end->l1ss) == 0 || end->l1ss < 0x100)
+		end->l1ss = 0;
+	if (end->l1ss != 0)
+		end->l1ss_ctl1 = dev->extendedConfigRead32(end->l1ss +
+		    MWX_PCIE_L1SS_CTL1);
+}
+
+static void
+mwx_link_end_l1ss_off(struct mwx_softc *sc, const struct mwx_link_end *end)
+{
+	IOByteCount reg = end->l1ss + MWX_PCIE_L1SS_CTL1;
+
+	if (end->dev == NULL || !(end->l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_EN))
+		return;
+	end->dev->extendedConfigWrite32(reg,
+	    end->l1ss_ctl1 & ~MWX_PCIE_L1SS_CTL1_EN);
+	MWX_DEV_LOG(sc, "aspm(%s): L1SS CTL1 0x%08x -> 0x%08x\n", end->name,
+	    end->l1ss_ctl1, end->dev->extendedConfigRead32(reg));
+}
+
+static void
+mwx_link_end_aspm_off(struct mwx_softc *sc, const struct mwx_link_end *end)
+{
+	UInt8 reg = end->exp + MWX_PCIE_LNKCTL;
+
+	if (end->dev == NULL || !(end->lnkctl & MWX_PCIE_LNKCTL_ASPM))
+		return;
+	end->dev->configWrite16(reg, end->lnkctl & ~MWX_PCIE_LNKCTL_ASPM);
+	MWX_DEV_LOG(sc, "aspm(%s): LNKCTL 0x%04x -> 0x%04x\n", end->name,
+	    end->lnkctl, end->dev->configRead16(reg));
+}
+
+void
+mwx_pci_disable_aspm(struct mwx_softc *sc, IOPCIDevice *dev)
+{
+	struct mwx_link_end card, port;
+	IOPCIDevice *up = NULL;
+	int allow = 0;
+
+	if (dev == NULL ||
+	    PE_parse_boot_argn("-mtkallowaspm", &allow, sizeof(allow)))
+		return;
+	/* The upstream port is the nearest PCI device above the card. */
+	for (IORegistryEntry *e = dev->getParentEntry(gIOServicePlane);
+	    e != NULL && up == NULL; e = e->getParentEntry(gIOServicePlane))
+		up = OSDynamicCast(IOPCIDevice, e);
+	mwx_link_end_read(&card, dev, "ep");
+	mwx_link_end_read(&port, up, "parent");
+	if (!(card.lnkctl & MWX_PCIE_LNKCTL_ASPM) &&
+	    !(card.l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_EN) &&
+	    !(port.lnkctl & MWX_PCIE_LNKCTL_ASPM) &&
+	    !(port.l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_EN))
+		return;		/* already off at both ends */
+	mwx_link_end_aspm_off(sc, &card);
+	mwx_link_end_aspm_off(sc, &port);
+	mwx_link_end_l1ss_off(sc, &card);
+	mwx_link_end_l1ss_off(sc, &port);
 }
 
 int
