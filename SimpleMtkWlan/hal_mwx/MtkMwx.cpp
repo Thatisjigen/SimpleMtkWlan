@@ -1192,6 +1192,7 @@ static uint8_t	mwx_awdl_rx_subframe(struct mbuf *, uint16_t);
 static bool	mwx_awdl_mcu_event(struct mwx_softc *, uint8_t, uint8_t, uint8_t, struct mbuf *);
 static bool	mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
 static void	mwx_awdl_sta_traffic(struct mwx_softc *, struct mbuf *, bool);
+static bool	mwx_awdl_rx_expected(struct mwx_softc *, uint64_t);
 static void	mwx_awdl_quiesce(struct mwx_softc *);
 static void	mwx_awdl_firmware_reset(struct mwx_softc *);
 static void	mwx_awdl_resume(struct mwx_softc *);
@@ -4847,6 +4848,33 @@ mwx_mcu_set_len(struct mbuf *m, void *end)
 	m_adj(m, -adj);
 }
 
+/*
+ * The last firmware commands sent and when (ms of uptime), for the log of a reception stall: the step that stops the
+ * data RX ring is not known. Any thread; a torn entry only spoils one line of the log.
+ */
+static struct {
+	uint32_t	cmd;
+	uint32_t	ms;
+} mwx_mcu_trace[16];
+static uint32_t mwx_mcu_trace_next;
+
+static void
+mwx_mcu_trace_log(struct mwx_softc *sc, uint64_t now_ms)
+{
+	char line[16 * 20 + 1];
+	uint32_t i, k = 0;
+
+	line[0] = 0;
+	for (i = 0; i < nitems(mwx_mcu_trace) && k < sizeof(line) - 20; i++) {
+		uint32_t j = (mwx_mcu_trace_next + i) % nitems(mwx_mcu_trace);
+
+		if (mwx_mcu_trace[j].cmd != 0)
+			k += (uint32_t)snprintf(line + k, sizeof(line) - k, " %x@-%u", mwx_mcu_trace[j].cmd,
+			    (uint32_t)now_ms - mwx_mcu_trace[j].ms);
+	}
+	MWX_DEV_LOG(sc, "last firmware commands, oldest first (command@-ms):%s\n", line);
+}
+
 int
 mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 {
@@ -4867,6 +4895,14 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 	if (sc->sc_mcu_mute) {
 		m_freem(m);
 		return ETIMEDOUT;
+	}
+	{
+		uint64_t ns = 0;
+		uint32_t i = mwx_mcu_trace_next++ % nitems(mwx_mcu_trace);
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		mwx_mcu_trace[i].cmd = cmd;
+		mwx_mcu_trace[i].ms = (uint32_t)(ns / 1000000);
 	}
 
 	if (cmd == MCU_CMD_FW_SCATTER) {
@@ -5070,10 +5106,16 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 	}
 
 	len = le16toh(rxd->len);
-	/* make sure all the data is in one mbuf */
-	if ((m = m_pullup(m, len)) == NULL) {
-		printf("%s: mwx_mcu_rx_event m_pullup failed\n", DEVNAME(sc));
-		return;
+	/* make sure all the data is in one mbuf; an event longer than what came is logged with its kind and sizes */
+	{
+		uint8_t eid = rxd->eid, ext_eid = rxd->ext_eid;
+		int have = (int)mbuf_pkthdr_len(m);
+
+		if ((m = m_pullup(m, len)) == NULL) {
+			printf("%s: mwx_mcu_rx_event m_pullup failed: event %02x/%02x says %d bytes, %d came\n",
+			    DEVNAME(sc), eid, ext_eid, len, have);
+			return;
+		}
 	}
 	/* refetch after pullup */
 	rxd = mtod(m, struct mwx_mcu_rxd *);
@@ -10029,7 +10071,7 @@ MtkMwx::debugPoll()
 		uint32_t n = sc->sc_txq.mq_count;
 		int scanning = (sc->sc_flags &
 		    (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) != 0;
-		uint64_t now_ns = 0, now_ms, gap;
+		uint64_t now_ns = 0, now_ms, gap, limit;
 
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
 		now_ms = now_ns / 1000000;
@@ -10049,13 +10091,27 @@ MtkMwx::debugPoll()
 		rx_was_scanning = scanning;
 		gap = 60000ULL << (rx_resets == 0 ? 0 : rx_resets - 1 < 3 ?
 		    rx_resets - 1 : 3);
-		if (now_ms - rx_moved_ms >= 30000 && (rx_sent >= 32 ||
+		limit = 30000;
+#ifdef MTK_AWDL
+		/*
+		 * An AWDL peer was sending data when the ring stopped: while it is there its frames, at least its
+		 * synchronization frames, keep coming, so 6 s of silence is a stall already, and a transfer may still
+		 * survive the reload; at 30 s the other side had given up.
+		 */
+		if (sc->sc_awdl != NULL && mwx_awdl_rx_expected(sc, rx_moved_ms))
+			limit = 6000;
+#endif
+		if (now_ms - rx_moved_ms >= limit && (rx_sent >= 32 ||
 		    (ic->ic_state != IEEE80211_S_RUN && rx_scans >= 2)) &&
 		    (rx_resets == 0 || now_ms - rx_reset_ms >= gap)) {
 			MWX_DEV_LOG(sc,
-			    "RX stall detected: nothing received for %llu s while %u frames went out and %u scans ended, hard reset\n",
+			    "RX stall detected: nothing received for %llu s while %u frames went out and %u scans ended, hard reset "
+			    "(rxq cpu=%u dma=%u cons=%u, rxmcu cpu=%u dma=%u cons=%u)\n",
 			    (unsigned long long)((now_ms - rx_moved_ms) / 1000),
-			    rx_sent, rx_scans);
+			    rx_sent, rx_scans, mwx_read(sc, sc->sc_rxq.mq_regbase + MT_DMA_CPU_IDX), rq_dma,
+			    sc->sc_rxq.mq_cons, mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_CPU_IDX),
+			    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX), sc->sc_rxmcuq.mq_cons);
+			mwx_mcu_trace_log(sc, now_ms);
 			rx_reset_ms = now_ms;
 			rx_resets++;
 			rx_last = 0xffffffff;
@@ -12247,6 +12303,28 @@ mwx_awdl_rx_subframe(struct mbuf *m, uint16_t hdr_gap)
 	    memcmp(d + 16, mwx_awdl_bssid, 6) != 0)
 		return 0;
 	return (uint8_t)(rxd4 & MT_RXD4_NORMAL_PAYLOAD_FORMAT);
+}
+
+/*
+ * For the watchdog's reception check (MtkMwx::debugPoll()): the radio runs and a peer's data frame came less than 3 s
+ * before `since_ms`, the last time the data RX ring moved.
+ */
+static bool
+mwx_awdl_rx_expected(struct mwx_softc *sc, uint64_t since_ms)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint64_t since_us = since_ms * 1000ULL;
+	int i;
+
+	if (!a->armed)
+		return false;
+	for (i = 0; i < MWX_AWDL_PEERS; i++) {
+		uint64_t rx = a->peers[i].rx_us;
+
+		if (rx != 0 && rx + 3000000ULL >= since_us)
+			return true;
+	}
+	return false;
 }
 
 /*
