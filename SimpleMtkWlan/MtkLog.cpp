@@ -22,6 +22,17 @@ static size_t gMtkDbgLen;
 static volatile SInt32 gMtkDbgLock;
 static IOService *gMtkDbgNub;
 
+/*
+ * The lines logged while mtk_dbg_keep() is on, kept apart: the reports of a reception stall, which are seldom read
+ * before the ring above has moved past them. Published as "MtkStallLog"; when full, the oldest half goes, as in the
+ * ring.
+ */
+#define MTK_DBG_KEEP_SIZE (16 * 1024)
+static char gMtkDbgKeep[MTK_DBG_KEEP_SIZE];
+static size_t gMtkDbgKeepLen;
+static uint32_t gMtkDbgKeepGen;
+static volatile int gMtkDbgKeepOn;
+
 static void mtkDbgLock()
 {
     while (!OSCompareAndSwap(0, 1, &gMtkDbgLock)) {}
@@ -57,7 +68,23 @@ extern "C" void mtk_dbg_log(const char *fmt, ...)
     memcpy(gMtkDbgBuf + gMtkDbgLen, line, len);
     gMtkDbgLen += len;
     gMtkDbgBuf[gMtkDbgLen] = 0;
+    if (gMtkDbgKeepOn) {
+        if (gMtkDbgKeepLen + len >= MTK_DBG_KEEP_SIZE) {
+            size_t drop = MTK_DBG_KEEP_SIZE / 2;
+            memmove(gMtkDbgKeep, gMtkDbgKeep + drop, gMtkDbgKeepLen - drop);
+            gMtkDbgKeepLen -= drop;
+        }
+        memcpy(gMtkDbgKeep + gMtkDbgKeepLen, line, len);
+        gMtkDbgKeepLen += len;
+        gMtkDbgKeep[gMtkDbgKeepLen] = 0;
+        gMtkDbgKeepGen++;
+    }
     mtkDbgUnlock();
+}
+
+extern "C" void mtk_dbg_keep(int on)
+{
+    gMtkDbgKeepOn = on != 0;
 }
 
 /*
@@ -77,6 +104,34 @@ static bool mtkDbgPublishAllowed()
                    PE_parse_boot_argn("-mtkawdl", flag, sizeof(flag))) ? 1 : 0;
     }
     return allowed > 0;
+}
+
+/* "MtkStallLog", only when something was added since it was last published. */
+static void mtkDbgPublishKeep(IOService *nub)
+{
+    static uint32_t published;
+    char *copy;
+    size_t len;
+    uint32_t gen;
+
+    if (gMtkDbgKeepGen == published)
+        return;
+    copy = (char *)IOMalloc(MTK_DBG_KEEP_SIZE);
+    if (copy == NULL)
+        return;
+    mtkDbgLock();
+    len = gMtkDbgKeepLen;
+    gen = gMtkDbgKeepGen;
+    memcpy(copy, gMtkDbgKeep, len);
+    mtkDbgUnlock();
+    copy[len] = 0;
+    OSString *str = OSString::withCString(copy);
+    IOFree(copy, MTK_DBG_KEEP_SIZE);
+    if (str != NULL) {
+        nub->setProperty("MtkStallLog", str);
+        str->release();
+        published = gen;
+    }
 }
 
 void mtk_dbg_publish()
@@ -101,6 +156,7 @@ void mtk_dbg_publish()
         nub->setProperty("MtkDebugLog", str);
         str->release();
     }
+    mtkDbgPublishKeep(nub);
 }
 
 void mtk_dbg_set_nub(IOService *nub)

@@ -1201,6 +1201,7 @@ static bool	mwx_awdl_mcu_event(struct mwx_softc *, uint8_t, uint8_t, uint8_t, st
 static bool	mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
 static void	mwx_awdl_sta_traffic(struct mwx_softc *, struct mbuf *, bool);
 static bool	mwx_awdl_rx_expected(struct mwx_softc *, uint64_t);
+static void	mwx_awdl_stall_log(struct mwx_softc *);
 static void	mwx_awdl_quiesce(struct mwx_softc *);
 static void	mwx_awdl_firmware_reset(struct mwx_softc *);
 static void	mwx_awdl_resume(struct mwx_softc *);
@@ -10156,9 +10157,11 @@ MtkMwx::debugPoll()
 	    (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) ? 10 : 4;
 	if ((txq_stuck >= stuck_limit || mcu_stuck >= stuck_limit) &&
 	    polls - last_reset_poll >= 30) {
+		mtk_dbg_keep(1);
 		MWX_DEV_LOG(sc,
 		    "DMA stall detected (txq_stuck=%u mcu_stuck=%u), hard reset\n",
 		    txq_stuck, mcu_stuck);
+		mtk_dbg_keep(0);
 		last_reset_poll = polls;
 		txq_stuck = mcu_stuck = 0;
 		last_txq_dma = last_mcu_dma = 0xffffffff;
@@ -10230,6 +10233,8 @@ MtkMwx::debugPoll()
 		if (now_ms - rx_moved_ms >= limit && (rx_sent >= 32 ||
 		    (ic->ic_state != IEEE80211_S_RUN && rx_scans >= 2)) &&
 		    (rx_resets == 0 || now_ms - rx_reset_ms >= gap)) {
+			/* The report also goes to MtkStallLog, which outlives the ring (mtk_dbg_keep()). */
+			mtk_dbg_keep(1);
 			MWX_DEV_LOG(sc,
 			    "RX stall detected: nothing received for %llu s while %u frames went out and %u scans ended, hard reset "
 			    "(rxq cpu=%u dma=%u cons=%u, rxmcu cpu=%u dma=%u cons=%u)\n",
@@ -10238,6 +10243,11 @@ MtkMwx::debugPoll()
 			    sc->sc_rxq.mq_cons, mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_CPU_IDX),
 			    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX), sc->sc_rxmcuq.mq_cons);
 			mwx_mcu_trace_log(sc, now_ns / 1000);
+#ifdef MTK_AWDL
+			if (sc->sc_awdl != NULL)
+				mwx_awdl_stall_log(sc);
+#endif
+			mtk_dbg_keep(0);
 			rx_reset_ms = now_ms;
 			rx_resets++;
 			rx_last = 0xffffffff;
@@ -12615,6 +12625,23 @@ mwx_awdl_rx_expected(struct mwx_softc *sc, uint64_t since_ms)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * For the report of a reception stall (MtkMwx::debugPoll()): what the radio was doing when it was noticed, then its
+ * counters, as in its periodic line.
+ */
+static void
+mwx_awdl_stall_log(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	char line[480];
+
+	MWX_DEV_LOG(sc, "awdl at the stall: radio %s, window %s, last on %u, remain-on-channel %s, sniffer %s, "
+	    "filter %s\n", a->armed ? "started" : "stopped", a->rx_open ? "open" : "closed", a->rx_ch,
+	    a->roc_active ? "held" : "none", a->sniffer_on ? "on" : "off", a->filter_open ? "open" : "station");
+	mtkAwdlRadioSummary(line, sizeof(line));
+	MWX_DEV_LOG(sc, "awdl: radio %s\n", line);
 }
 
 /*
