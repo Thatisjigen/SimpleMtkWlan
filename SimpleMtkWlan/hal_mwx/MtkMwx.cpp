@@ -10194,10 +10194,14 @@ MtkMwx::debugPoll()
 	 * its access point's beacons from the ring ten times a second, AWDL's
 	 * windows away included, so there 6 s of silence is a stall already;
 	 * and since the station associated again after the last reload, the
-	 * reception had come back and the stall is a new one: its reload waits
-	 * only the minute. With 30 s and the longer gaps, a stall that came
-	 * back soon after each reload left the station without data for
-	 * minutes.
+	 * reception had come back and the stall is a new one: it is reloaded
+	 * at once, three times in a row at most. With 30 s and the longer
+	 * gaps, a stall that came back soon after each reload left the station
+	 * without data for minutes, and with a minute between two reloads one
+	 * that came back 5 s after the station did lasted 53 s. From the
+	 * fourth reload on the gaps grow here as well, so that a stall coming
+	 * back at every return cannot reload the firmware every few seconds;
+	 * the count starts again after ten minutes without a reload.
 	 */
 	{
 		static uint32_t rx_last = 0xffffffff, rx_tx_last = 0xffffffff;
@@ -10227,8 +10231,8 @@ MtkMwx::debugPoll()
 		}
 		rx_tx_last = tq_dma;
 		rx_was_scanning = scanning;
-		gap = assoc ? 60000ULL : 60000ULL << (rx_resets == 0 ? 0 :
-		    rx_resets - 1 < 3 ? rx_resets - 1 : 3);
+		gap = assoc && rx_resets < 3 ? 0 : 60000ULL << (rx_resets == 0 ?
+		    0 : rx_resets - 1 < 3 ? rx_resets - 1 : 3);
 		limit = assoc ? 6000 : 30000;
 #ifdef MTK_AWDL
 		/*
