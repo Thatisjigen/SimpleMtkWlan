@@ -675,6 +675,7 @@ struct mwx_softc {
 	uint32_t		sc_rx_dma_bad_len;
 	uint64_t		sc_rx_dma_notdone;	/* slots found without DMA_DONE behind the DMA index */
 	uint64_t		sc_rx_dma_done_missing;	/* ... still without it after MWX_RX_DONE_WAIT_NS */
+	uint64_t		sc_rx_data_last_us;	/* uptime of the last slot taken from the data RX ring */
 	uint64_t		sc_rx_dma_chain_completed;
 	uint64_t		sc_rx_dma_chain_resumed;
 	uint64_t		sc_rx_dma_chain_dropped;
@@ -4838,6 +4839,12 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	    BUS_DMASYNC_POSTREAD);
 	q->mq_cons = idx;
+	if (consumed != 0 && q == &sc->sc_rxq) {
+		uint64_t ns = 0;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		sc->sc_rx_data_last_us = ns / 1000;
+	}
 	sc->sc_rx_dma_desc += consumed;
 	if (consumed > sc->sc_rx_dma_max_batch)
 		sc->sc_rx_dma_max_batch = consumed;
@@ -4892,30 +4899,106 @@ mwx_mcu_set_len(struct mbuf *m, void *end)
 }
 
 /*
- * The last firmware commands sent and when (ms of uptime), for the log of a reception stall: the step that stops the
- * data RX ring is not known. Any thread; a torn entry only spoils one line of the log.
+ * The firmware commands sent, and the remain-on-channel events received, with their time, for the log of a reception
+ * stall: the step that stops the data RX ring is not known. 1024 entries reach back past the 30 s a stall takes to be
+ * noticed, at the dozen commands a second of AWDL's search windows. Each keeps bytes 4-13 of the payload, which tell
+ * the commands apart (mwx_mcu_trace_name). Any thread; a torn entry only spoils one line of the log.
  */
+#define MWX_MCU_TRACE_ROC_EVENT	0xffff0001	/* not a command: an MCU_UNI_EVENT_ROC */
 static struct {
+	uint64_t	us;
 	uint32_t	cmd;
-	uint32_t	ms;
-} mwx_mcu_trace[16];
+	uint8_t		b[10];
+} mwx_mcu_trace[1024];
 static uint32_t mwx_mcu_trace_next;
 
 static void
-mwx_mcu_trace_log(struct mwx_softc *sc, uint64_t now_ms)
+mwx_mcu_trace_add(uint32_t cmd, const uint8_t *b, size_t len)
 {
-	char line[16 * 20 + 1];
-	uint32_t i, k = 0;
+	uint64_t ns = 0;
+	uint32_t i = mwx_mcu_trace_next++ % nitems(mwx_mcu_trace);
 
-	line[0] = 0;
-	for (i = 0; i < nitems(mwx_mcu_trace) && k < sizeof(line) - 20; i++) {
-		uint32_t j = (mwx_mcu_trace_next + i) % nitems(mwx_mcu_trace);
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	mwx_mcu_trace[i].us = ns / 1000;
+	mwx_mcu_trace[i].cmd = cmd;
+	memset(mwx_mcu_trace[i].b, 0, sizeof(mwx_mcu_trace[i].b));
+	memcpy(mwx_mcu_trace[i].b, b, len < sizeof(mwx_mcu_trace[i].b) ? len : sizeof(mwx_mcu_trace[i].b));
+}
 
-		if (mwx_mcu_trace[j].cmd != 0)
-			k += (uint32_t)snprintf(line + k, sizeof(line) - k, " %x@-%u", mwx_mcu_trace[j].cmd,
-			    (uint32_t)now_ms - mwx_mcu_trace[j].ms);
+/*
+ * One entry as text. b holds bytes 4-13 of the payload, laid out as in the requests of mwx_awdl_roc(),
+ * mwx_awdl_roc_abort(), mwx_awdl_sniffer(), mwx_awdl_sniffer_config() and mwx_awdl_rxfilter(); for a remain-on-channel
+ * event, its tag, token, status and channel.
+ */
+static void
+mwx_mcu_trace_name(char *s, size_t n, uint32_t cmd, const uint8_t *b)
+{
+	switch (cmd) {
+	case MWX_MCU_TRACE_ROC_EVENT:
+		if (b[0] == 0)				/* UNI_EVENT_ROC_GRANT */
+			snprintf(s, n, "grant:t%u:s%u:%u", b[1], b[2], b[3]);
+		else
+			snprintf(s, n, "rocevent%u:t%u", b[0], b[1]);
+		break;
+	case MCU_UNI_CMD_ROC:				/* tag 0 acquire, with token and channel; 1 abort */
+		if (b[0] == 0)
+			snprintf(s, n, "roc:t%u:%u", b[5], b[6]);
+		else
+			snprintf(s, n, "abort:t%u", b[5]);
+		break;
+	case MCU_UNI_CMD_SNIFFER:			/* tag 0 enable, with its flag; 1 config, control channel */
+		if (b[0] == 0)
+			snprintf(s, n, "sniffer:%u", b[4]);
+		else
+			snprintf(s, n, "sniffer@%u", b[8]);
+		break;
+	case MCU_CE_CMD_SET_RX_FILTER:			/* mode, then the filter flags */
+		snprintf(s, n, "filter:%u:%x", b[0], (uint32_t)b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 |
+		    (uint32_t)b[7] << 24);
+		break;
+	default:
+		snprintf(s, n, "%x", cmd);
+		break;
 	}
-	MWX_DEV_LOG(sc, "last firmware commands, oldest first (command@-ms):%s\n", line);
+}
+
+/*
+ * For a reception stall: when the last frame was taken from the data RX ring, then the commands and remain-on-channel
+ * events from 2 s before it to 1 s after, oldest first, timed from it in ms, eight to a line.
+ */
+static void
+mwx_mcu_trace_log(struct mwx_softc *sc, uint64_t now_us)
+{
+	uint64_t last = sc->sc_rx_data_last_us;
+	uint32_t next = mwx_mcu_trace_next, i, shown = 0, k = 0;
+	uint32_t kept = next < nitems(mwx_mcu_trace) ? next : (uint32_t)nitems(mwx_mcu_trace);
+	char line[8 * 32 + 1], name[24];
+
+	MWX_DEV_LOG(sc, "last data frame at %llu.%03llu s, %llu ms before; commands and remain-on-channel events around it "
+	    "(ms from it):\n", (unsigned long long)(last / 1000000), (unsigned long long)(last / 1000 % 1000),
+	    (unsigned long long)((now_us - last) / 1000));
+	line[0] = 0;
+	for (i = next - kept; i != next; i++) {
+		uint32_t j = i % nitems(mwx_mcu_trace);
+		int64_t d = (int64_t)(mwx_mcu_trace[j].us - last);
+
+		if (d < -2000000 || d > 1000000)
+			continue;
+		mwx_mcu_trace_name(name, sizeof(name), mwx_mcu_trace[j].cmd, mwx_mcu_trace[j].b);
+		k += (uint32_t)snprintf(line + k, sizeof(line) - k, " %s@%s%llu", name, d < 0 ? "-" : "+",
+		    (unsigned long long)((d < 0 ? -d : d) / 1000));
+		if (k >= sizeof(line))
+			k = sizeof(line) - 1;
+		if (++shown % 8 == 0) {
+			MWX_DEV_LOG(sc, " %s\n", line);
+			line[0] = 0;
+			k = 0;
+		}
+	}
+	if (k != 0)
+		MWX_DEV_LOG(sc, " %s\n", line);
+	if (shown == 0)
+		MWX_DEV_LOG(sc, " none of the last %u is that close\n", kept);
 }
 
 int
@@ -4940,12 +5023,11 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 		return ETIMEDOUT;
 	}
 	{
-		uint64_t ns = 0;
-		uint32_t i = mwx_mcu_trace_next++ % nitems(mwx_mcu_trace);
+		uint8_t b[10] = { 0 };
 
-		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-		mwx_mcu_trace[i].cmd = cmd;
-		mwx_mcu_trace[i].ms = (uint32_t)(ns / 1000000);
+		if (len > 4)
+			mbuf_copydata(m, 4, (size_t)len - 4 < sizeof(b) ? (size_t)len - 4 : sizeof(b), b);
+		mwx_mcu_trace_add(cmd, b, sizeof(b));
 	}
 
 	if (cmd == MCU_CMD_FW_SCATTER) {
@@ -10155,7 +10237,7 @@ MtkMwx::debugPoll()
 			    rx_sent, rx_scans, mwx_read(sc, sc->sc_rxq.mq_regbase + MT_DMA_CPU_IDX), rq_dma,
 			    sc->sc_rxq.mq_cons, mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_CPU_IDX),
 			    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX), sc->sc_rxmcuq.mq_cons);
-			mwx_mcu_trace_log(sc, now_ms);
+			mwx_mcu_trace_log(sc, now_ns / 1000);
 			rx_reset_ms = now_ms;
 			rx_resets++;
 			rx_last = 0xffffffff;
@@ -10673,6 +10755,11 @@ mwx_awdl_roc_event(struct mwx_softc *sc, struct mbuf *m)
 
 	if (mbuf_len(m) < 4 + sizeof(g) || mbuf_copydata(m, 4, sizeof(g), g) != 0)
 		return;
+	{
+		uint8_t t[4] = { g[0], g[5], g[6], g[7] };	/* tag, token, status, channel, for the stall's log */
+
+		mwx_mcu_trace_add(MWX_MCU_TRACE_ROC_EVENT, t, sizeof(t));
+	}
 	if ((g[0] | g[1] << 8) != 0 || !a->roc_want || g[5] != a->roc_token) {	/* UNI_EVENT_ROC_GRANT */
 		a->c_roc_stray++;
 		return;
