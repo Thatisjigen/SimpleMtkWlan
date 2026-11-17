@@ -10189,7 +10189,14 @@ MtkMwx::debugPoll()
 	 * two scans ended (a background scan of a few channels may rightly
 	 * find nothing), is a stall: the same hard reset as a DMA stall, the
 	 * next one no sooner than 1, 2, 4, then 8 minutes later while it
-	 * keeps coming back.
+	 * keeps coming back. An associated station that is not scanning takes
+	 * its access point's beacons from the ring ten times a second, AWDL's
+	 * windows away included, so there 6 s of silence is a stall already;
+	 * and since the station associated again after the last reload, the
+	 * reception had come back and the stall is a new one: its reload waits
+	 * only the minute. With 30 s and the longer gaps, a stall that came
+	 * back soon after each reload left the station without data for
+	 * minutes.
 	 */
 	{
 		static uint32_t rx_last = 0xffffffff, rx_tx_last = 0xffffffff;
@@ -10200,6 +10207,7 @@ MtkMwx::debugPoll()
 		uint32_t n = sc->sc_txq.mq_count;
 		int scanning = (sc->sc_flags &
 		    (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) != 0;
+		int assoc = ic->ic_state == IEEE80211_S_RUN && !scanning;
 		uint64_t now_ns = 0, now_ms, gap, limit;
 
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
@@ -10218,9 +10226,9 @@ MtkMwx::debugPoll()
 		}
 		rx_tx_last = tq_dma;
 		rx_was_scanning = scanning;
-		gap = 60000ULL << (rx_resets == 0 ? 0 : rx_resets - 1 < 3 ?
-		    rx_resets - 1 : 3);
-		limit = 30000;
+		gap = assoc ? 60000ULL : 60000ULL << (rx_resets == 0 ? 0 :
+		    rx_resets - 1 < 3 ? rx_resets - 1 : 3);
+		limit = assoc ? 6000 : 30000;
 #ifdef MTK_AWDL
 		/*
 		 * An AWDL peer was sending data when the ring stopped: while it is there its frames, at least its
