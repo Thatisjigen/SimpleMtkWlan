@@ -738,7 +738,9 @@ IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedM
 // OMAC 1 off), as with awdl0 down. A sequence of the Family denser than its idle pattern (a browse or an advertisement:
 // AirDrop and AirPlay both start with one), a template of a new length (AirDrop's services), a frame or traffic request,
 // or a packet of awdl0 starts it again from the next EAW. Turning AWDL on is not a use: the Family turns it on again
-// after each firmware reload, with its idle sequence, and the timeline then waits for one of these.
+// after each firmware reload, with its idle sequence, and the timeline then waits for one of these. For two minutes after
+// a reload for a reception stall (mtkAwdlRadioResting()) the Family's sequence and templates do not count either: at boot
+// or at an unlock it turns AWDL on with a denser sequence, and the ring stopped again within the windows that followed.
 //
 // Threads. The Family's setters, the timer (the controller's work loop), the radio's stamp (radio thread, main gate) and
 // the receive path (main work loop) share the state below under `lock`, a leaf: nothing is called with it held.
@@ -901,6 +903,7 @@ struct Engine {
     bool still, famBusy;
     uint8_t wakeReq;
     uint64_t actUs, stillUs;        // the last request of the Family or the stack; when the still period began
+    uint64_t useUs;                 // the last request of the stack alone: a frame, traffic, a packet of awdl0
     // counters
     uint32_t eaws, posted, postFail, ended, late, syncs, frames, framesFail, windows;
     uint32_t rxAf, rxAfFail, rxNoRssi, rxData, rxDataUp, rxDataFail, rxDup, rxNotUs;
@@ -1000,6 +1003,7 @@ const Peer *findPeer(const uint8_t *a)
 bool noteActivity(uint64_t now, uint8_t why)
 {
     gE.actUs = now;
+    if (why == kWakeFrame || why == kWakeTraffic || why == kWakeData) gE.useUs = now;
     if (!gE.still || gE.wakeReq) return false;
     gE.wakeReq = why;
     return true;
@@ -1011,21 +1015,21 @@ void kickTimeline()
 }
 
 // The last use of AWDL: a request of the Family or the stack, a peer heard, data either way; 0 for none since the boot.
-// Lock held.
-uint64_t lastUseUs()
+// While the radio rests after a reception stall (mtkAwdlRadioResting()) the Family's requests do not count. Lock held.
+uint64_t lastUseUs(bool resting)
 {
-    uint64_t last = gE.actUs;
+    uint64_t last = resting ? gE.useUs : gE.actUs;
     if (gE.peerHeardUs > last) last = gE.peerHeardUs;
     if (gE.dataUs > last) last = gE.dataUs;
     return last;
 }
 
 // Nothing used AWDL for kStillUs: no peer heard, no data either way, no request of the Family or the stack, the Family's
-// sequence back to its idle pattern and no frame waiting to go out. Lock held.
-bool quietFor(uint64_t now)
+// sequence back to its idle pattern (or the radio resting) and no frame waiting to go out. Lock held.
+bool quietFor(uint64_t now, bool resting)
 {
-    uint64_t last = lastUseUs();
-    return !gE.famBusy && !gE.onceLen && last < now && now - last > kStillUs;
+    uint64_t last = lastUseUs(resting);
+    return (!gE.famBusy || resting) && !gE.onceLen && last < now && now - last > kStillUs;
 }
 
 // The access point's traffic class (kApIdle...), from the station's data frames either way, at most once every half
@@ -1258,6 +1262,7 @@ void logState(uint64_t now)
 void tlTick()
 {
     uint64_t now = mtkAwdlUptimeUs();
+    bool resting = mtkAwdlRadioResting();
     AwStart ev;
     AwEnd ee;
     MtkAwdlWindow w;
@@ -1315,8 +1320,8 @@ void tlTick()
         chooseChannel();
         buildPresence(now);
     }
-    if (gE.famBusy) gE.actUs = now;             // the Family asks for more than its idle presence
-    if (quietFor(now)) {
+    if (gE.famBusy && !resting) gE.actUs = now; // the Family asks for more than its idle presence
+    if (quietFor(now, resting)) {
         // Close the window the Family was told about, post no new one, give the radio back to the station and leave
         // the timer off until a request comes.
         if (gE.endPending) {
@@ -1329,7 +1334,7 @@ void tlTick()
         gE.wakeReq = kWakeNone;
         gE.stillUs = now;
         gE.stills++;
-        uint64_t last = lastUseUs();
+        uint64_t last = lastUseUs(resting);
         IOLockUnlock(gE.lock);
         postEvents(doEnd, ee, false, ev);
         mtkAwdlRadioStop();
@@ -2008,6 +2013,7 @@ static void engineChanSeq(const uint8_t *s)
     uint32_t n = s[5] > 16 ? 16 : s[5];
     if (!n) return;
     uint64_t now = mtkAwdlUptimeUs();
+    bool resting = mtkAwdlRadioResting();
     IOLockLock(gE.lock);
     uint8_t home = mtkAwdlRadioHomeChannel();
     uint32_t used = 0, away = 0;
@@ -2019,7 +2025,7 @@ static void engineChanSeq(const uint8_t *s)
     }
     gE.famSet = true;
     gE.famBusy = away >= 5 || used >= 9;
-    bool kick = gE.famBusy && noteActivity(now, kWakeSeq);
+    bool kick = gE.famBusy && !resting && noteActivity(now, kWakeSeq);
     chooseChannel();
     IOLockUnlock(gE.lock);
     if (kick) kickTimeline();
@@ -2080,8 +2086,9 @@ static void engineTemplate(const uint8_t *tlv, uint32_t len)
     if (!gE.lock) return;
     bool ok = tlv && len <= kTlvMax && tlvsWellFormed(tlv, len);
     uint64_t now = mtkAwdlUptimeUs();
+    bool resting = mtkAwdlRadioResting();
     IOLockLock(gE.lock);
-    bool kick = ok && gE.psfLen && len != gE.psfLen && noteActivity(now, kWakeTemplate);
+    bool kick = ok && gE.psfLen && len != gE.psfLen && !resting && noteActivity(now, kWakeTemplate);
     if (ok) memcpy(gE.psf, tlv, len);
     gE.psfLen = ok ? len : 0;
     IOLockUnlock(gE.lock);

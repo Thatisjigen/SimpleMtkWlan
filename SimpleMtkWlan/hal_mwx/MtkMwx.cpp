@@ -1202,6 +1202,7 @@ static bool	mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
 static void	mwx_awdl_sta_traffic(struct mwx_softc *, struct mbuf *, bool);
 static bool	mwx_awdl_rx_expected(struct mwx_softc *, uint64_t);
 static void	mwx_awdl_stall_log(struct mwx_softc *);
+static void	mwx_awdl_rest(struct mwx_softc *);
 static void	mwx_awdl_quiesce(struct mwx_softc *);
 static void	mwx_awdl_firmware_reset(struct mwx_softc *);
 static void	mwx_awdl_resume(struct mwx_softc *);
@@ -10252,8 +10253,10 @@ MtkMwx::debugPoll()
 			    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX), sc->sc_rxmcuq.mq_cons);
 			mwx_mcu_trace_log(sc, now_ns / 1000);
 #ifdef MTK_AWDL
-			if (sc->sc_awdl != NULL)
+			if (sc->sc_awdl != NULL) {
 				mwx_awdl_stall_log(sc);
+				mwx_awdl_rest(sc);
+			}
 #endif
 			mtk_dbg_keep(0);
 			rx_reset_ms = now_ms;
@@ -10325,6 +10328,7 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_ROC_STOP_MS	40	/* the dwell ends this long before the firmware ends the period itself */
 #define MWX_AWDL_HOME_MIN_MS	20	/* on the station's channel at least this long between two windows away */
 #define MWX_AWDL_HOME_SETTLE_MS	20	/* after an abort, before the reception changes: the radio gets home first */
+#define MWX_AWDL_REST_MS	120000	/* no search after a reload for a reception stall (mtkAwdlRadioResting()) */
 #define MWX_AWDL_RX_REFRESH_MS	2000	/* reception settings sent again although unchanged, at most this often */
 #define MWX_AWDL_CHAIN_WAIT_MS	80	/* for the next window on the station's channel, before the reception closes */
 #define MWX_AWDL_TX_GUARD_MS	10	/* nothing new for the hardware this close to the end of a window */
@@ -10480,6 +10484,7 @@ struct mwx_awdl {
 	uint64_t		off_since_us;
 	uint64_t		backoff_until_us;
 	uint64_t		home_until_us;	/* the access point keeps the radio until then */
+	uint64_t		rest_until_us;	/* after a reload for a reception stall: no search until then */
 	uint32_t		lead_us;	/* measured request-to-grant time, the setup lead of the next window */
 	/* the radio's own commands: their answers never reach sc_mcu_wait[] */
 	uint32_t		seq_cmd[16];
@@ -12662,6 +12667,19 @@ mwx_awdl_stall_log(struct mwx_softc *sc)
 }
 
 /*
+ * After the reload that ends a reception stall, the search waits MWX_AWDL_REST_MS (mtkAwdlRadioResting()). The
+ * Family turns AWDL on again after the reload, at boot or at an unlock with a denser sequence, and the ring stopped
+ * again within the windows that followed: at the 17th, in one boot. Real use still runs the timeline.
+ */
+static void
+mwx_awdl_rest(struct mwx_softc *sc)
+{
+	sc->sc_awdl->rest_until_us = mtkAwdlUptimeUs() + MWX_AWDL_REST_MS * 1000ULL;
+	MWX_DEV_LOG(sc, "awdl: no search for %u s: the Family's sequence alone does not start the timeline\n",
+	    MWX_AWDL_REST_MS / 1000);
+}
+
+/*
  * One data frame of the station with its access point, for the interface's rating of the access point's traffic
  * (mtkAwdlRadioStationTraffic()): from mwx_tx() before the frame is handed over, and from mwx_rx() for what goes to
  * net80211, of which only what the access point sent counts. Each direction has its own counters, written by its own
@@ -13097,6 +13115,15 @@ mtkAwdlRadioRoom()
 	room = MWX_AWDL_TX_SLOTS - a->tx_count;
 	IOLockUnlock(a->lock);
 	return room;
+}
+
+bool
+mtkAwdlRadioResting()
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+
+	return a != NULL && mtkAwdlUptimeUs() < a->rest_until_us;
 }
 
 uint8_t

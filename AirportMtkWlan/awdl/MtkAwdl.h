@@ -48,6 +48,9 @@ int mtkAwdlRadioWindow(const MtkAwdlWindow *window);
 int mtkAwdlRadioQueue(const uint8_t *frame, uint32_t length, uint8_t channel, uint32_t maxAgeMs);
 // Free places in that queue.
 uint32_t mtkAwdlRadioRoom();
+// True for two minutes after the firmware was reloaded for a reception stall: the Family's channel sequence and new
+// templates then do not start the timeline, only a frame or traffic request, a peer or data do.
+bool mtkAwdlRadioResting();
 // The station's channel while it is associated, else 0.
 uint8_t mtkAwdlRadioHomeChannel();
 // True when the radio may use `channel` (in the chip's channel list, not passive).
