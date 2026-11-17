@@ -69,8 +69,13 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - `MtkMwx::debugPoll()` runs from the watchdog every second on the main gate:
   periodic `poll`/`stats` lines, TX stall descriptor dump, automatic hard reset
   (firmware reload) if a DMA ring stops moving, or if the data RX ring stays
-  silent for 30 s while frames go out (without a link: while scans end). The
-  stall's log gives when the last frame came off the data RX ring, and the
+  silent while frames go out: 6 s for an associated station that is not
+  scanning (its access point's beacons come ten times a second), 30 s
+  otherwise (without a link: while scans end). An associated station is
+  reloaded as soon as its stall is seen, three times in a row at most;
+  otherwise reloads are at least a minute apart, growing to 8 minutes while
+  it keeps coming back, and the count starts again after ten minutes without
+  a reload. The stall's log gives when the last frame came off the data RX ring, and the
   firmware commands and remain-on-channel events from 2 s before it to 1 s
   after (`mwx_mcu_trace_log`), then what the AWDL radio was doing. The ring
   holds about ten minutes while AWDL runs, so every hard-reset report also
