@@ -12190,8 +12190,10 @@ mwx_awdl_sleep_until(struct mwx_softc *sc, uint64_t until_us, bool wake_on_windo
 /*
  * Back to the station's own reception. The sniffer goes off first and its answer is waited for: until then
  * the receive tap keeps the station's filter in software. Then MT7921_FILTER_ENABLE alone, which is
- * mt7921_configure_filter() without FIF flags, and the register value mwx_init_hw() wrote, as the daily
- * driver has it. Nothing is sent to a firmware that is not there: mwx_awdl_resume() or a reload sorts it.
+ * mt7921_configure_filter() without FIF flags. The register is left to the firmware, which applies that
+ * command on its own and does not answer it: writing MT_WF_RFCR here as well put two writers on it at the
+ * moment the data RX ring was seen to stop. Nothing is sent to a firmware that is not there:
+ * mwx_awdl_resume() or a reload sorts it.
  */
 static void
 mwx_awdl_close(struct mwx_softc *sc)
@@ -12205,10 +12207,8 @@ mwx_awdl_close(struct mwx_softc *sc)
 		a->sniffer_on = false;
 		a->sniff_cfg = 0;
 	}
-	if (a->filter_open && !a->sniffer_on && mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE) == 0) {
-		mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
+	if (a->filter_open && !a->sniffer_on && mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE) == 0)
 		a->filter_open = false;
-	}
 	if (!a->sniffer_on && !a->filter_open) {
 		a->tap_grace_until_us = mtkAwdlUptimeUs() + MWX_AWDL_TAP_GRACE_MS * 1000ULL;
 		a->tap_grace = true;
