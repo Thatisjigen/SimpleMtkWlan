@@ -143,7 +143,8 @@ ieee80211_print_essid(const u_int8_t *essid, int len)
 	int i;
 	const u_int8_t *p;
 
-    XYLog("%s\n", essid);
+    /* essid has no terminator: print len bytes of it, not up to the first zero */
+    XYLog("%.*s\n", len > IEEE80211_NWID_LEN ? IEEE80211_NWID_LEN : (len < 0 ? 0 : len), (const char *)essid);
 //	if (len > IEEE80211_NWID_LEN)
 //		len = IEEE80211_NWID_LEN;
 //	/* determine printable or not */
