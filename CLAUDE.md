@@ -233,7 +233,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   a new length), a frame or traffic request, or a packet of awdl0 starts it
   again from the next EAW. Turning AWDL on is not a use: after a firmware
   reload the Family turns it on with its idle sequence, and the timeline stays
-  still. The driver writes awdl0's
+  still. For two minutes after a reload for a reception stall
+  (`mtkAwdlRadioResting()`) the Family's sequence and templates do not start
+  it either; a frame or traffic request, a peer or data still do. The driver
+  writes awdl0's
   `IO80211VirtualInterfaceRole` itself (the Family cannot store it on these
   classes, and wifip2pd drops an interface
   without it). An AWDL test needs the driver log, which only `-mtkdbglog`
