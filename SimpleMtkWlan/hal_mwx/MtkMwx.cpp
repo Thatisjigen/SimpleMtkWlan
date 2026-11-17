@@ -10324,6 +10324,7 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_ROC_SPARE_MS	95	/* asked on top of the dwell: grant, drain and abort have to fit */
 #define MWX_AWDL_ROC_STOP_MS	40	/* the dwell ends this long before the firmware ends the period itself */
 #define MWX_AWDL_HOME_MIN_MS	20	/* on the station's channel at least this long between two windows away */
+#define MWX_AWDL_HOME_SETTLE_MS	20	/* after an abort, before the reception changes: the radio gets home first */
 #define MWX_AWDL_RX_REFRESH_MS	2000	/* reception settings sent again although unchanged, at most this often */
 #define MWX_AWDL_CHAIN_WAIT_MS	80	/* for the next window on the station's channel, before the reception closes */
 #define MWX_AWDL_TX_GUARD_MS	10	/* nothing new for the hardware this close to the end of a window */
@@ -12490,6 +12491,14 @@ abort:
 		a->off_us += now - a->off_since_us;
 		/* The access point gets the radio back, at least for what it kept while the radio was away. */
 		a->home_until_us = now + MWX_AWDL_HOME_MIN_MS * 1000ULL;
+		/*
+		 * The reception changes once the radio is home. The data RX ring stopped for good at the end of
+		 * windows whose abort and sniffer switch-off had gone out in the same millisecond, the last frame
+		 * taken as the filter went back to the station's, while the firmware was still bringing the radio
+		 * back.
+		 */
+		if (a->sniffer_on || a->filter_open)
+			mwx_awdl_sleep_until(sc, now + MWX_AWDL_HOME_SETTLE_MS * 1000ULL, false);
 	}
 fail:
 	mwx_awdl_close(sc);

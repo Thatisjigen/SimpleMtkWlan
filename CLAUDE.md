@@ -102,7 +102,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - AWDL remain-on-channel: the grant is waited for up to 1 s before the abort,
   as `mt7921_set_roc` does. The first grant for 149 after the firmware starts
   takes over 300 ms, and an abort sent before a grant that is still coming is
-  what the MT7925 firmware did not survive (mt7925-macos-wifi).
+  what the MT7925 firmware did not survive (mt7925-macos-wifi). After the
+  abort the sniffer and the RX filter change only 20 ms later, once the radio
+  is home: the data RX ring stopped for good when they changed in the same
+  millisecond as the abort.
 - Only advertise VHT to the firmware (`PHY_TYPE_BIT_VHT`) once VHT is
   negotiated. The operating width comes from the association
   (`mwx_node_chan_width`); the channel is switched to 40/80 MHz on RUN.
