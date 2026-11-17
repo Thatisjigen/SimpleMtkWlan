@@ -521,6 +521,16 @@ struct ieee80211_node {
 #endif
 };
 
+/*
+ * ni_essid has no terminator: an SSID of IEEE80211_NWID_LEN bytes fills the
+ * array, and a "%s" then reads on into the fields after it. The two arguments
+ * of a "%.*s" in a log line: the length, then the bytes.
+ */
+#define IEEE80211_ESSID_PRINT(_ni)					\
+	((_ni)->ni_esslen < IEEE80211_NWID_LEN ?			\
+	    (int)(_ni)->ni_esslen : IEEE80211_NWID_LEN),		\
+	(const char *)(_ni)->ni_essid
+
 RB_HEAD(ieee80211_tree, ieee80211_node);
 
 struct ieee80211_ess_rbt {
