@@ -1562,7 +1562,14 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	frm = mtod(m, u_int8_t *);
 	capinfo = IEEE80211_CAPINFO_ESS;
-	if (ic->ic_flags & IEEE80211_F_WEPON)
+	/*
+	 * Privacy goes with WEP and with every request that carries an RSN or
+	 * WPA element below: an access point may refuse the element when the
+	 * bit is clear (status 45, invalid RSN capabilities).
+	 */
+	if ((ic->ic_flags & IEEE80211_F_WEPON) ||
+	    ((ic->ic_flags & IEEE80211_F_RSNON) &&
+	     (ni->ni_rsnprotos & (IEEE80211_PROTO_RSN | IEEE80211_PROTO_WPA))))
 		capinfo |= IEEE80211_CAPINFO_PRIVACY;
 	if ((ic->ic_flags & IEEE80211_F_SHPREAMBLE) &&
 	    IEEE80211_IS_CHAN_2GHZ(ni->ni_chan))
