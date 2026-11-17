@@ -10218,7 +10218,7 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_TX_SLOTS	64
 #define MWX_AWDL_PEERS		8
 #define MWX_AWDL_MCU_MS		300	/* for the answer to one command */
-#define MWX_AWDL_ROC_GRANT_MS	300	/* a grant is waited for this long, then the request is aborted */
+#define MWX_AWDL_ROC_GRANT_MS	1000	/* a grant is waited for this long, as mt7921_set_roc() does, then aborted */
 #define MWX_AWDL_ROC_LATE_MS	80	/* a grant later than this is released without sending in it */
 #define MWX_AWDL_ROC_BACKOFF_MS	2000	/* after a request that was never granted */
 #define MWX_AWDL_ROC_SPARE_MS	95	/* asked on top of the dwell: grant, drain and abort have to fit */
@@ -12231,7 +12231,9 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 		roc_deadline = asked + (uint64_t)duration * 1000;
 		/*
 		 * The grant is waited for, never given up early: an abort sent before a grant that was still
-		 * coming is what the firmware did not survive (mt7925-macos-wifi 0f00c9a).
+		 * coming is what the firmware did not survive (mt7925-macos-wifi 0f00c9a). Linux waits a second
+		 * (mt7921_set_roc); the first grant for channel 149 after the firmware starts takes over 300 ms,
+		 * and one that comes after the abort shows only as a stray event.
 		 */
 		while (a->roc_want && !a->roc_granted &&
 		    mtkAwdlUptimeUs() < asked + MWX_AWDL_ROC_GRANT_MS * 1000ULL && !mwx_awdl_fw_gone(sc) &&

@@ -91,6 +91,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   background scans in RUN are throttled to one per 120 s.
 - MCU commands sent from RX/interrupt context (BA setup) must not wait for the
   response; the response arrives through the same interrupt path.
+- AWDL remain-on-channel: the grant is waited for up to 1 s before the abort,
+  as `mt7921_set_roc` does. The first grant for 149 after the firmware starts
+  takes over 300 ms, and an abort sent before a grant that is still coming is
+  what the MT7925 firmware did not survive (mt7925-macos-wifi).
 - Only advertise VHT to the firmware (`PHY_TYPE_BIT_VHT`) once VHT is
   negotiated. The operating width comes from the association
   (`mwx_node_chan_width`); the channel is switched to 40/80 MHz on RUN.
