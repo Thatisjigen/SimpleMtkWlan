@@ -216,7 +216,9 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   timeline stops and the radio goes back to the station, as with awdl0 down; the
   Family's next browse or advertisement (a denser channel sequence, a template of
   a new length), a frame or traffic request, or a packet of awdl0 starts it
-  again from the next EAW. The driver writes awdl0's
+  again from the next EAW. Turning AWDL on is not a use: after a firmware
+  reload the Family turns it on with its idle sequence, and the timeline stays
+  still. The driver writes awdl0's
   `IO80211VirtualInterfaceRole` itself (the Family cannot store it on these
   classes, and wifip2pd drops an interface
   without it). `-mtkawdl` also publishes the driver log, as `-mtkdbglog` does, so

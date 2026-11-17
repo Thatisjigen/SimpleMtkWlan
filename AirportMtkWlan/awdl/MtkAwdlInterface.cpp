@@ -737,7 +737,8 @@ IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedM
 // data and no request, the timeline stops posting windows and the radio goes back to the station (reception closed,
 // OMAC 1 off), as with awdl0 down. A sequence of the Family denser than its idle pattern (a browse or an advertisement:
 // AirDrop and AirPlay both start with one), a template of a new length (AirDrop's services), a frame or traffic request,
-// or a packet of awdl0 starts it again from the next EAW.
+// or a packet of awdl0 starts it again from the next EAW. Turning AWDL on is not a use: the Family turns it on again
+// after each firmware reload, with its idle sequence, and the timeline then waits for one of these.
 //
 // Threads. The Family's setters, the timer (the controller's work loop), the radio's stamp (radio thread, main gate) and
 // the receive path (main work loop) share the state below under `lock`, a leaf: nothing is called with it held.
@@ -1009,13 +1010,21 @@ void kickTimeline()
     if (gE.tlTimer) gE.tlTimer->setTimeoutUS(1);
 }
 
-// Nothing used AWDL for kStillUs: no peer heard, no data either way, no request of the Family or the stack, the Family's
-// sequence back to its idle pattern and no frame waiting to go out. Lock held.
-bool quietFor(uint64_t now)
+// The last use of AWDL: a request of the Family or the stack, a peer heard, data either way; 0 for none since the boot.
+// Lock held.
+uint64_t lastUseUs()
 {
     uint64_t last = gE.actUs;
     if (gE.peerHeardUs > last) last = gE.peerHeardUs;
     if (gE.dataUs > last) last = gE.dataUs;
+    return last;
+}
+
+// Nothing used AWDL for kStillUs: no peer heard, no data either way, no request of the Family or the stack, the Family's
+// sequence back to its idle pattern and no frame waiting to go out. Lock held.
+bool quietFor(uint64_t now)
+{
+    uint64_t last = lastUseUs();
     return !gE.famBusy && !gE.onceLen && last < now && now - last > kStillUs;
 }
 
@@ -1320,11 +1329,15 @@ void tlTick()
         gE.wakeReq = kWakeNone;
         gE.stillUs = now;
         gE.stills++;
+        uint64_t last = lastUseUs();
         IOLockUnlock(gE.lock);
         postEvents(doEnd, ee, false, ev);
         mtkAwdlRadioStop();
         gE.radioOn = false;
-        mtk_dbg_log("awdl: still: no AWDL use for %u s\n", (uint32_t)(kStillUs / 1000000));
+        if (last != 0)
+            mtk_dbg_log("awdl: still: no AWDL use for %u s\n", (uint32_t)((now - last) / 1000000));
+        else
+            mtk_dbg_log("awdl: still: no AWDL use since the boot\n");
         gE.logUs = 0;
         logState(now);
         return;
@@ -1673,7 +1686,9 @@ static void engineEnable(bool on)
         chooseChannel();
         buildPresence(now);
     }
-    if (on && !was) gE.actUs = now;       // just turned on: the timeline runs at least kStillUs
+    // Turning on is not a use. The Family turns AWDL on again after each firmware reload, with its idle sequence, and a
+    // minute of windows nobody had asked for followed every reload: with nothing else the timeline stops at its first EAW.
+    if (on && !was) gE.actUs = 0;
     if (!on) {
         gE.tlRunning = false;
         gE.endPending = false;
