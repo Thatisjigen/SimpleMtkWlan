@@ -69,8 +69,13 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - `MtkMwx::debugPoll()` runs from the watchdog every second on the main gate:
   periodic `poll`/`stats` lines, TX stall descriptor dump, automatic hard reset
   (firmware reload) if a DMA ring stops moving, or if the data RX ring stays
-  silent for 30 s while frames go out (without a link: while scans end). Wi-Fi
-  off and on keeps the firmware and does not recover a deaf chip.
+  silent for 30 s while frames go out (without a link: while scans end). The
+  stall's log gives when the last frame came off the data RX ring, and the
+  firmware commands and remain-on-channel events from 2 s before it to 1 s
+  after (`mwx_mcu_trace_log`), then what the AWDL radio was doing. The ring
+  holds about ten minutes while AWDL runs, so every hard-reset report also
+  goes to `MtkStallLog` (`mtk_dbg_keep`), 16 KB kept until the next boot.
+  Wi-Fi off and on keeps the firmware and does not recover a deaf chip.
 - In zsh, `log` is a builtin; use `/usr/bin/log`.
 
 ## Hardware lessons (do not regress)

@@ -122,6 +122,7 @@
 extern "C" {
 #endif
 void mtk_dbg_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void mtk_dbg_keep(int on);
 #ifdef __cplusplus
 }
 #endif
