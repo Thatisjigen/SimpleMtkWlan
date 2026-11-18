@@ -2296,6 +2296,18 @@ ieee80211_clean_nodes(struct ieee80211com *ic, int cache_timeout)
         ni->ni_scangen = gen;
         if (ni->ni_refcnt > 0)
             continue;
+        /*
+         * A sweep that only makes room for a new scan result skips the access
+         * point a join has named. With more networks in range than the cache
+         * holds, nodes go in address order, and the named one could go before
+         * the scan that was looking for it ended: the join then never got to
+         * authentication. The cache timeout (cache_timeout != 0) still ages it
+         * out like any other node.
+         */
+        if (!cache_timeout && ic->ic_opmode == IEEE80211_M_STA &&
+            (ic->ic_flags & IEEE80211_F_DESBSSID) &&
+            IEEE80211_ADDR_EQ(ni->ni_bssid, ic->ic_des_bssid))
+            continue;
 #ifndef IEEE80211_STA_ONLY
         if ((ic->ic_opmode == IEEE80211_M_HOSTAP ||
              ic->ic_opmode == IEEE80211_M_IBSS) &&
