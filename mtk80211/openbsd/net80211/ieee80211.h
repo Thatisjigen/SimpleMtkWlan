@@ -1317,6 +1317,7 @@ struct ieee80211_eapol_key {
 #define EAPOL_KEY_DESC_V1	1
 #define EAPOL_KEY_DESC_V2	2
 #define EAPOL_KEY_DESC_V3	3		/* 11r */
+#define EAPOL_KEY_DESC_USE_AKM	0		/* SAE/WPA3: MIC algorithm from AKM */
 #define EAPOL_KEY_PAIRWISE	(1 <<  3)
 #define EAPOL_KEY_INSTALL	(1 <<  6)	/* I */
 #define EAPOL_KEY_KEYACK	(1 <<  7)	/* A */
