@@ -1205,6 +1205,7 @@ static void	mwx_awdl_stall_log(struct mwx_softc *);
 static void	mwx_awdl_quiesce(struct mwx_softc *);
 static void	mwx_awdl_firmware_reset(struct mwx_softc *);
 static void	mwx_awdl_resume(struct mwx_softc *);
+static void	mwx_awdl_rx_release(struct mwx_softc *);
 static void	mwx_awdl_free(struct mwx_softc *);
 static void	mwx_awdl_attach(struct mwx_softc *);
 #endif
@@ -1963,6 +1964,11 @@ mwx_newstate_task(void *ptr)
 	case IEEE80211_S_RUN:
 		if (nstate != ostate)
 			mwx_mcu_set_deep_sleep(sc, 1);
+#ifdef MTK_AWDL
+		/* A reception the AWDL radio holds open between its windows is on this station's channel: it closes now. */
+		if (nstate != ostate && sc->sc_awdl != NULL)
+			mwx_awdl_rx_release(sc);
+#endif
 		/*
 		 * Leaving the BSS: tell the firmware the BSS is gone and remove
 		 * the peer station record (like Linux does on disassoc). Without
@@ -6538,6 +6544,11 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	memset(req, 0, sizeof(*req));
 
 	sc->sc_flags |= MWX_FLAG_SCANNING;
+#ifdef MTK_AWDL
+	/* A reception the AWDL radio holds open between its windows goes back to the station's before the sweep. */
+	if (sc->sc_awdl != NULL)
+		mwx_awdl_rx_release(sc);
+#endif
 	sc->sc_scan_seq_num = (sc->sc_scan_seq_num + 1) & 0x7f;
 
 	req->seq_num = sc->sc_scan_seq_num /* | sc->sc_band_idx << 7 */;
@@ -10328,6 +10339,7 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_ROC_SPARE_MS	95	/* asked on top of the dwell: grant, drain and abort have to fit */
 #define MWX_AWDL_ROC_STOP_MS	40	/* the dwell ends this long before the firmware ends the period itself */
 #define MWX_AWDL_HOME_MIN_MS	20	/* on the station's channel at least this long between two windows away */
+#define MWX_AWDL_HOME_SETTLE_MS	20	/* after an abort, before the reception changes: the radio gets home first */
 #define MWX_AWDL_RX_REFRESH_MS	2000	/* reception settings sent again although unchanged, at most this often */
 #define MWX_AWDL_CHAIN_WAIT_MS	80	/* for the next window on the station's channel, before the reception closes */
 #define MWX_AWDL_TX_GUARD_MS	10	/* nothing new for the hardware this close to the end of a window */
@@ -10525,6 +10537,8 @@ struct mwx_awdl {
 	uint32_t		c_win, c_onch, c_late, c_busy, c_share, c_badch, c_gone;
 	uint32_t		c_chain_wait, c_chain_miss;	/* the next window waited for: came, did not */
 	uint32_t		c_quiet;	/* windows on the station's channel with no sniffer or filter opened */
+	uint32_t		c_hold;		/* windows after which the reception stayed open (mwx_awdl_rx_hold()) */
+	uint32_t		c_rx_close;	/* times the sniffer went off and the station's filter came back */
 	uint32_t		c_roc_ok, c_roc_fail, c_roc_late, c_roc_stray, c_roc_clip, c_cmd, c_cmd_err;
 	uint32_t		c_tx_group, c_tx_uc_ok[2], c_tx_uc_fail[2], c_tx_err, c_tx_stale, c_tx_full;
 	uint32_t		c_rx_af, c_rx_data, c_rx_long, c_rx_echo, c_rx_other, c_drain;
@@ -12193,25 +12207,27 @@ mwx_awdl_sleep_until(struct mwx_softc *sc, uint64_t until_us, bool wake_on_windo
 /*
  * Back to the station's own reception. The sniffer goes off first and its answer is waited for: until then
  * the receive tap keeps the station's filter in software. Then MT7921_FILTER_ENABLE alone, which is
- * mt7921_configure_filter() without FIF flags, and the register value mwx_init_hw() wrote, as the daily
- * driver has it. Nothing is sent to a firmware that is not there: mwx_awdl_resume() or a reload sorts it.
+ * mt7921_configure_filter() without FIF flags. The register is left to the firmware, which applies that
+ * command on its own and does not answer it: writing MT_WF_RFCR here as well put two writers on it at the
+ * moment the data RX ring was seen to stop. Nothing is sent to a firmware that is not there:
+ * mwx_awdl_resume() or a reload sorts it. wait_ms 0 does not wait for the sniffer's answer: the filter
+ * command still reaches the firmware after it, and the tap's grace covers the frames in between.
  */
 static void
-mwx_awdl_close(struct mwx_softc *sc)
+mwx_awdl_close_wait(struct mwx_softc *sc, uint32_t wait_ms)
 {
 	struct mwx_awdl *a = sc->sc_awdl;
 
 	a->rx_open = false;
 	if ((!a->sniffer_on && !a->filter_open) || mwx_awdl_fw_gone(sc))
 		return;
-	if (a->sniffer_on && mwx_awdl_sniffer(sc, 0, MWX_AWDL_MCU_MS) == 0) {
+	a->c_rx_close++;
+	if (a->sniffer_on && mwx_awdl_sniffer(sc, 0, wait_ms) == 0) {
 		a->sniffer_on = false;
 		a->sniff_cfg = 0;
 	}
-	if (a->filter_open && !a->sniffer_on && mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE) == 0) {
-		mwx_write(sc, MT_WF_RFCR(0), sc->sc_rxfilter);
+	if (a->filter_open && !a->sniffer_on && mwx_awdl_rxfilter(sc, MWX_AWDL_FILTER_ENABLE) == 0)
 		a->filter_open = false;
-	}
 	if (!a->sniffer_on && !a->filter_open) {
 		a->tap_grace_until_us = mtkAwdlUptimeUs() + MWX_AWDL_TAP_GRACE_MS * 1000ULL;
 		a->tap_grace = true;
@@ -12219,10 +12235,72 @@ mwx_awdl_close(struct mwx_softc *sc)
 	}
 }
 
+static void
+mwx_awdl_close(struct mwx_softc *sc)
+{
+	mwx_awdl_close_wait(sc, MWX_AWDL_MCU_MS);
+}
+
+/*
+ * Whether the reception stays open after a window, pointed at the station's channel, until the next one. Linux sets
+ * the sniffer of a monitor up once and afterwards only moves it to the next channel (mt7921_change_chanctx); here it
+ * was switched off and the station's filter restored after every window, about twice a second, and every reception
+ * stall whose commands were logged came at that switch-off, also with the radio given 20 ms to get home first. So
+ * while the timeline runs and the station is associated, with nothing in its way, the reception is left open: it
+ * closes when the timeline stops, the station scans or leaves its network (mwx_awdl_rx_release()), or a peer has
+ * its record on AWDL's BSS, when on the station's channel neither the sniffer nor the filter is opened (`quiet` in
+ * mwx_awdl_window()).
+ */
+static bool
+mwx_awdl_rx_hold(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	return (a->sniffer_on || a->filter_open) && !mwx_awdl_stop_asked(sc) && !mwx_awdl_station_busy(sc) &&
+	    mwx_awdl_home(sc, NULL, NULL) != 0 && !(a->bss_on && a->sta_used != 0);
+}
+
+/* Between windows the sniffer listens on the station's channel at the link's width, as in a window there. */
+static int
+mwx_awdl_rx_home(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint8_t bw = CMD_CBW_20MHZ, center = 0, home = mwx_awdl_home(sc, &bw, &center);
+	uint32_t cfg;
+
+	if (home == 0)
+		return ENXIO;
+	cfg = 1U << 24 | (uint32_t)center << 16 | (uint32_t)bw << 8 | home;
+	if (!a->sniffer_on || cfg == a->sniff_cfg)
+		return 0;
+	a->sniff_cfg = 0;
+	if (mwx_awdl_sniffer_config(sc, home, bw, center) != 0)
+		return EIO;
+	a->sniff_cfg = cfg;
+	return 0;
+}
+
+/*
+ * The station takes the radio for itself, a scan or the end of its association: a reception held open between
+ * windows goes back to the station's settings first, without waiting, so the commands reach the firmware ahead of
+ * the station's. A window in progress ends on its own, as the station is busy, and closes then.
+ */
+static void
+mwx_awdl_rx_release(struct mwx_softc *sc)
+{
+	struct mwx_awdl *a = sc->sc_awdl;
+
+	if (a->running || (!a->sniffer_on && !a->filter_open))
+		return;
+	mwx_awdl_close_wait(sc, 0);
+}
+
 /*
  * One window. Radio thread, inside the main command gate; every wait opens the gate, and after every wait
  * the reasons to stop are looked at again. A step that fails ends the window: the remain-on-channel period
- * is always given back with an abort and the reception goes back to the station's settings.
+ * is always given back with an abort and the reception goes back to the station's settings. After a window
+ * that went well the reception only moves back to the station's channel while it may stay open
+ * (mwx_awdl_rx_hold()).
  */
 static void
 mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
@@ -12233,7 +12311,7 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	bool onch = home != 0 && home == w->channel, agg;
 	uint64_t now = mtkAwdlUptimeUs(), start = w->startUs, end, roc_deadline = 0, t;
 	uint32_t lead = onch ? 5000 : a->lead_us, dwell = w->dwellMs;
-	bool refresh, quiet;
+	bool refresh, quiet, ok = false;
 	int i;
 
 	if (a->off || mwx_awdl_fw_gone(sc)) {
@@ -12242,7 +12320,8 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	}
 	if (mwx_awdl_station_busy(sc) || now < a->backoff_until_us) {
 		a->c_busy++;
-		mwx_awdl_close(sc);
+		if (!mwx_awdl_rx_hold(sc))
+			mwx_awdl_close(sc);
 		return;
 	}
 	/*
@@ -12260,7 +12339,8 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	}
 	if (!mwx_awdl_channel_ok(sc, w->channel)) {
 		a->c_badch++;
-		mwx_awdl_close(sc);
+		if (!mwx_awdl_rx_hold(sc))
+			mwx_awdl_close(sc);
 		return;
 	}
 	if (start == 0)
@@ -12272,7 +12352,8 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 		return;
 	if (now > start + (uint64_t)dwell * 500 || mwx_awdl_station_busy(sc)) {
 		a->c_late++;
-		mwx_awdl_close(sc);
+		if (!mwx_awdl_rx_hold(sc))
+			mwx_awdl_close(sc);
 		return;
 	}
 
@@ -12350,9 +12431,10 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 			tsleep_nsec((void *)&a->roc_granted, 0, "mwxroc", 2000000ULL);
 		took = (uint32_t)((mtkAwdlUptimeUs() - asked) / 1000);
 		if (!a->roc_granted || a->roc_status != 0 || took >= MWX_AWDL_ROC_LATE_MS) {
-			if (a->roc_granted && a->roc_status == 0)
+			if (a->roc_granted && a->roc_status == 0) {
 				a->c_roc_late++;
-			else
+				ok = true;	/* only the time is gone: the reception may stay as it is */
+			} else
 				a->c_roc_fail++;
 			if (a->c_roc_fail + a->c_roc_late <= 8)
 				MWX_DEV_LOG(sc, "awdl: no window on %u: grant %d status %u after %u ms\n",
@@ -12481,6 +12563,7 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 		if (waited)
 			a->c_chain_miss++;
 	}
+	ok = true;
 abort:
 	if (a->roc_active) {
 		/*
@@ -12494,8 +12577,20 @@ abort:
 		a->off_us += now - a->off_since_us;
 		/* The access point gets the radio back, at least for what it kept while the radio was away. */
 		a->home_until_us = now + MWX_AWDL_HOME_MIN_MS * 1000ULL;
+		/*
+		 * The reception changes once the radio is home. The data RX ring stopped for good at the end of
+		 * windows whose abort and sniffer switch-off had gone out in the same millisecond, the last frame
+		 * taken as the filter went back to the station's, while the firmware was still bringing the radio
+		 * back.
+		 */
+		if (a->sniffer_on || a->filter_open)
+			mwx_awdl_sleep_until(sc, now + MWX_AWDL_HOME_SETTLE_MS * 1000ULL, false);
 	}
 fail:
+	if (ok && mwx_awdl_rx_hold(sc) && mwx_awdl_rx_home(sc) == 0) {
+		a->c_hold++;
+		return;
+	}
 	mwx_awdl_close(sc);
 }
 
@@ -12526,7 +12621,9 @@ mwx_awdl_run_gated(OSObject *, void *arg, void *, void *, void *)
 		mwx_awdl_window(sc, &w);
 	}
 	if (!a->dying) {
-		mwx_awdl_close(sc);
+		/* While the timeline runs the reception waits open for the next window (mwx_awdl_rx_hold()). */
+		if (!mwx_awdl_rx_hold(sc))
+			mwx_awdl_close(sc);
 		if (!a->armed && !a->paused) {
 			mwx_awdl_fullpwr(sc, false);
 			/*
@@ -13133,10 +13230,11 @@ mtkAwdlRadioSummary(char *buffer, size_t length)
 		return;
 	}
 	snprintf(buffer, length,
-	    "win=%u onch=%u quiet=%u chain=%u/%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
+	    "win=%u onch=%u quiet=%u chain=%u/%u hold=%u/%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
 	    "badch=%u gone=%u cmd=%u/%u tx grp=%u uc2=%u/%u uc5=%u/%u err=%u stale=%u full=%u drain=%u "
 	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d",
-	    a->c_win, a->c_onch, a->c_quiet, a->c_chain_wait, a->c_chain_miss, a->c_roc_ok, a->c_roc_fail, a->c_roc_late,
+	    a->c_win, a->c_onch, a->c_quiet, a->c_chain_wait, a->c_chain_miss, a->c_hold, a->c_rx_close, a->c_roc_ok,
+	    a->c_roc_fail, a->c_roc_late,
 	    a->c_roc_stray, a->c_roc_clip, a->lead_us,
 	    a->c_late, a->late_us / 1000, a->off_us / 1000, a->c_busy, a->c_share, a->c_badch, a->c_gone, a->c_cmd,
 	    a->c_cmd_err, a->c_tx_group, a->c_tx_uc_ok[0], a->c_tx_uc_fail[0], a->c_tx_uc_ok[1], a->c_tx_uc_fail[1],
