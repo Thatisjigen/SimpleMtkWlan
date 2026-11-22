@@ -1202,7 +1202,7 @@ static bool	mwx_awdl_tx_done(struct mwx_softc *, uint16_t, uint32_t);
 static void	mwx_awdl_sta_traffic(struct mwx_softc *, struct mbuf *, bool);
 static bool	mwx_awdl_rx_expected(struct mwx_softc *, uint64_t);
 static void	mwx_awdl_stall_log(struct mwx_softc *);
-static void	mwx_awdl_rest(struct mwx_softc *);
+static void	mwx_awdl_rest(struct mwx_softc *, bool);
 static void	mwx_awdl_quiesce(struct mwx_softc *);
 static void	mwx_awdl_firmware_reset(struct mwx_softc *);
 static void	mwx_awdl_resume(struct mwx_softc *);
@@ -10210,15 +10210,20 @@ MtkMwx::debugPoll()
 	 * gaps, a stall that came back soon after each reload left the station
 	 * without data for minutes, and with a minute between two reloads one
 	 * that came back 5 s after the station did lasted 53 s. From the
-	 * fourth reload on the gaps grow here as well, so that a stall coming
+	 * fourth reload in a row it waits a minute, so that a stall coming
 	 * back at every return cannot reload the firmware every few seconds;
-	 * the count starts again after ten minutes without a reload.
+	 * gaps growing to 8 minutes there left a station without data for
+	 * 7 minutes. Such a station counts as associated until its reception
+	 * moves again, as it loses its link because of the stall. The second
+	 * stall in a row also stops the AWDL radio's windows, where the ring
+	 * stops, for ten minutes (mwx_awdl_rest()). The count starts again
+	 * after ten minutes without a reload.
 	 */
 	{
 		static uint32_t rx_last = 0xffffffff, rx_tx_last = 0xffffffff;
 		static uint32_t rx_sent, rx_scans, rx_resets;
 		static uint64_t rx_moved_ms, rx_reset_ms;
-		static int rx_was_scanning;
+		static int rx_was_scanning, rx_moved_assoc;
 		uint32_t rq_dma = mwx_read(sc, sc->sc_rxq.mq_regbase + MT_DMA_DMA_IDX);
 		uint32_t n = sc->sc_txq.mq_count;
 		int scanning = (sc->sc_flags &
@@ -10233,6 +10238,7 @@ MtkMwx::debugPoll()
 				rx_resets = 0;
 			rx_last = rq_dma;
 			rx_moved_ms = now_ms;
+			rx_moved_assoc = assoc;
 			rx_sent = rx_scans = 0;
 		} else {
 			if (n != 0 && tq_dma < n && rx_tx_last < n)
@@ -10242,9 +10248,11 @@ MtkMwx::debugPoll()
 		}
 		rx_tx_last = tq_dma;
 		rx_was_scanning = scanning;
-		gap = assoc && rx_resets < 3 ? 0 : 60000ULL << (rx_resets == 0 ?
-		    0 : rx_resets - 1 < 3 ? rx_resets - 1 : 3);
-		limit = assoc ? 6000 : 30000;
+		if (assoc || rx_moved_assoc)
+			gap = rx_resets < 3 ? 0 : 60000;
+		else
+			gap = 60000ULL << (rx_resets == 0 ? 0 : rx_resets - 1 < 3 ? rx_resets - 1 : 3);
+		limit = assoc || rx_moved_assoc ? 6000 : 30000;
 #ifdef MTK_AWDL
 		/*
 		 * An AWDL peer was sending data when the ring stopped: while it is there its frames, at least its
@@ -10270,7 +10278,7 @@ MtkMwx::debugPoll()
 #ifdef MTK_AWDL
 			if (sc->sc_awdl != NULL) {
 				mwx_awdl_stall_log(sc);
-				mwx_awdl_rest(sc);
+				mwx_awdl_rest(sc, rx_resets != 0);
 			}
 #endif
 			mtk_dbg_keep(0);
@@ -10344,6 +10352,7 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_HOME_MIN_MS	20	/* on the station's channel at least this long between two windows away */
 #define MWX_AWDL_HOME_SETTLE_MS	20	/* after an abort, before the reception changes: the radio gets home first */
 #define MWX_AWDL_REST_MS	120000	/* no search after a reload for a reception stall (mtkAwdlRadioResting()) */
+#define MWX_AWDL_SILENT_MS	600000	/* no windows at all after the second reception stall in a row */
 #define MWX_AWDL_RX_REFRESH_MS	2000	/* reception settings sent again although unchanged, at most this often */
 #define MWX_AWDL_CHAIN_WAIT_MS	80	/* for the next window on the station's channel, before the reception closes */
 #define MWX_AWDL_TX_GUARD_MS	10	/* nothing new for the hardware this close to the end of a window */
@@ -10500,6 +10509,7 @@ struct mwx_awdl {
 	uint64_t		backoff_until_us;
 	uint64_t		home_until_us;	/* the access point keeps the radio until then */
 	uint64_t		rest_until_us;	/* after a reload for a reception stall: no search until then */
+	uint64_t		silent_until_us;	/* after the second stall in a row: no windows until then */
 	uint32_t		lead_us;	/* measured request-to-grant time, the setup lead of the next window */
 	/* the radio's own commands: their answers never reach sc_mcu_wait[] */
 	uint32_t		seq_cmd[16];
@@ -10543,6 +10553,7 @@ struct mwx_awdl {
 	uint32_t		c_chain_wait, c_chain_miss;	/* the next window waited for: came, did not */
 	uint32_t		c_quiet;	/* windows on the station's channel with no sniffer or filter opened */
 	uint32_t		c_hold;		/* windows after which the reception stayed open (mwx_awdl_rx_hold()) */
+	uint32_t		c_silent;	/* windows not taken while the radio is silent after repeated stalls */
 	uint32_t		c_rx_close;	/* times the sniffer went off and the station's filter came back */
 	uint32_t		c_roc_ok, c_roc_fail, c_roc_late, c_roc_stray, c_roc_clip, c_cmd, c_cmd_err;
 	uint32_t		c_tx_group, c_tx_uc_ok[2], c_tx_uc_fail[2], c_tx_err, c_tx_stale, c_tx_full;
@@ -12323,6 +12334,11 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 		a->c_gone++;
 		return;
 	}
+	if (now < a->silent_until_us) {
+		a->c_silent++;
+		mwx_awdl_close(sc);
+		return;
+	}
 	if (mwx_awdl_station_busy(sc) || now < a->backoff_until_us) {
 		a->c_busy++;
 		if (!mwx_awdl_rx_hold(sc))
@@ -12762,13 +12778,24 @@ mwx_awdl_stall_log(struct mwx_softc *sc)
  * After the reload that ends a reception stall, the search waits MWX_AWDL_REST_MS (mtkAwdlRadioResting()). The
  * Family turns AWDL on again after the reload, at boot or at an unlock with a denser sequence, and the ring stopped
  * again within the windows that followed: at the 17th, in one boot. Real use still runs the timeline.
+ * Real use is also what kept the windows coming while the ring stopped again and again, its traffic or the
+ * Family's search: after the second stall in a row (`again`) the radio takes no window at all for
+ * MWX_AWDL_SILENT_MS. AWDL is away for that time; the station keeps its data.
  */
 static void
-mwx_awdl_rest(struct mwx_softc *sc)
+mwx_awdl_rest(struct mwx_softc *sc, bool again)
 {
-	sc->sc_awdl->rest_until_us = mtkAwdlUptimeUs() + MWX_AWDL_REST_MS * 1000ULL;
+	struct mwx_awdl *a = sc->sc_awdl;
+	uint64_t now = mtkAwdlUptimeUs();
+
+	a->rest_until_us = now + MWX_AWDL_REST_MS * 1000ULL;
 	MWX_DEV_LOG(sc, "awdl: no search for %u s: the Family's sequence alone does not start the timeline\n",
 	    MWX_AWDL_REST_MS / 1000);
+	if (again) {
+		a->silent_until_us = now + MWX_AWDL_SILENT_MS * 1000ULL;
+		MWX_DEV_LOG(sc, "awdl: no windows for %u s: the reception stopped again within ten minutes\n",
+		    MWX_AWDL_SILENT_MS / 1000);
+	}
 }
 
 /*
@@ -13259,14 +13286,14 @@ mtkAwdlRadioSummary(char *buffer, size_t length)
 	snprintf(buffer, length,
 	    "win=%u onch=%u quiet=%u chain=%u/%u hold=%u/%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
 	    "badch=%u gone=%u cmd=%u/%u tx grp=%u uc2=%u/%u uc5=%u/%u err=%u stale=%u full=%u drain=%u "
-	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d",
+	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d silent=%u",
 	    a->c_win, a->c_onch, a->c_quiet, a->c_chain_wait, a->c_chain_miss, a->c_hold, a->c_rx_close, a->c_roc_ok,
 	    a->c_roc_fail, a->c_roc_late,
 	    a->c_roc_stray, a->c_roc_clip, a->lead_us,
 	    a->c_late, a->late_us / 1000, a->off_us / 1000, a->c_busy, a->c_share, a->c_badch, a->c_gone, a->c_cmd,
 	    a->c_cmd_err, a->c_tx_group, a->c_tx_uc_ok[0], a->c_tx_uc_fail[0], a->c_tx_uc_ok[1], a->c_tx_uc_fail[1],
 	    a->c_tx_err, a->c_tx_stale, a->c_tx_full, a->c_drain, a->c_rx_af, a->c_rx_data, a->c_rx_uc, a->c_rx_echo,
-	    a->c_rx_other, a->c_rx_long, a->omac_on, sc->sc_alpha2[0], sc->sc_alpha2[1], a->off);
+	    a->c_rx_other, a->c_rx_long, a->omac_on, sc->sc_alpha2[0], sc->sc_alpha2[1], a->off, a->c_silent);
 }
 
 /* Windows, AWDL frames and other frames heard, by social channel: a line of its own, the summary is long already. */

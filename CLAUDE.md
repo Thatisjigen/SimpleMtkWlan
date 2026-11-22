@@ -71,11 +71,14 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   (firmware reload) if a DMA ring stops moving, or if the data RX ring stays
   silent while frames go out: 6 s for an associated station that is not
   scanning (its access point's beacons come ten times a second), 30 s
-  otherwise (without a link: while scans end). An associated station is
-  reloaded as soon as its stall is seen, three times in a row at most;
-  otherwise reloads are at least a minute apart, growing to 8 minutes while
-  it keeps coming back, and the count starts again after ten minutes without
-  a reload. The stall's log gives when the last frame came off the data RX ring, and the
+  otherwise (without a link: while scans end). A station whose reception
+  stopped while it was associated counts as associated until frames come
+  again, also after it lost the link to the stall: it is reloaded as soon as
+  its stall is seen, three times in a row, then a minute apart. Otherwise
+  reloads are at least a minute apart, growing to 8 minutes while it keeps
+  coming back. The second stall in a row also stops the AWDL radio's windows
+  for ten minutes. The count starts again after ten minutes without a reload.
+  The stall's log gives when the last frame came off the data RX ring, and the
   firmware commands and remain-on-channel events from 2 s before it to 1 s
   after (`mwx_mcu_trace_log`), then what the AWDL radio was doing. The ring
   holds about ten minutes while AWDL runs, so every hard-reset report also
@@ -235,7 +238,9 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   reload the Family turns it on with its idle sequence, and the timeline stays
   still. For two minutes after a reload for a reception stall
   (`mtkAwdlRadioResting()`) the Family's sequence and templates do not start
-  it either; a frame or traffic request, a peer or data still do. The driver
+  it either; a frame or traffic request, a peer or data still do. After the
+  second stall in a row the radio takes no window at all for ten minutes
+  (`silent=` in the radio line). The driver
   writes awdl0's
   `IO80211VirtualInterfaceRole` itself (the Family cannot store it on these
   classes, and wifip2pd drops an interface
