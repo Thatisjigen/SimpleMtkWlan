@@ -59,6 +59,7 @@ static void engineSyncState(uint32_t state, const uint8_t *master);
 static void engineTopMaster(const uint8_t *top);
 static void engineTemplate(const uint8_t *tlv, uint32_t len);
 static IOReturn engineOob(const uint8_t *r, bool autoReq);
+static bool miHoldsMulticast();
 static void engineTraffic(bool active);
 
 // -----------------------------------------------------------------------------------------------------------------------
@@ -170,6 +171,7 @@ public:
     void deliverData(const uint8_t *frame, uint32_t len, uint8_t part);
     void deliverMsdu(const uint8_t *da, const uint8_t *sa, const uint8_t *pl, uint32_t plen);
     void noteLinkActivity(bool tx);
+    void countForFamily(bool tx);
     void enableData();
 
 private:
@@ -626,6 +628,55 @@ bool mtkAwdlEnabled()
     return cached == 1;
 }
 
+uint32_t mtkAwdlSchedMask()
+{
+    static int64_t mask = -1;
+    if (mask < 0) {
+        uint32_t v = 0;
+        if (!PE_parse_boot_argn("mtkawdlsched", &v, sizeof(v))) v = 0;
+        mask = v & 15;
+        if (mask) mtk_dbg_log("awdl: mtkawdlsched=%u\n", (unsigned)mask);
+    }
+    return (uint32_t)mask;
+}
+
+// mtkawdlsched bit 2, from ForbiddenItlwm (itlReportAWDLData in 1bb9169). The peer manager's state counts awdl0's unicast
+// packets: received ones in IO80211PeerManager::inputPacket and skywalkInputPacket, sent ones in preQueuePacket,
+// getUnicastPackets and skywalkLogTxPacket. The Family's AWDL monitors read those counts (monitorAWDLDataMode,
+// updatePacketStatsPerPeriod, gatherInfraStats), and this driver's packets reach none of the functions that keep them,
+// so the Family counted none. With the bit each unicast packet delivered or queued adds one, as their `incl` does
+// (MtkAwdlInterface::countForFamily). Where the counts are is not public: it is taken once from the Family's own
+// getters, getUnicastPacketsInputCount and getUnicastPacketsOutputCount, which read them from the state
+// (`mov 0x18(%rdi), %rax; mov disp32(%rax), %eax`). If either has another shape nothing is counted.
+extern void mtkPmInputCount() __asm__("__ZN18IO80211PeerManager27getUnicastPacketsInputCountEv");
+extern void mtkPmOutputCount() __asm__("__ZN18IO80211PeerManager28getUnicastPacketsOutputCountEv");
+
+namespace {
+
+uint32_t gFamCount[2];              // the counts' offsets in the state, received [0] and sent [1]
+int gFamCountFound = -1;            // -1: not looked up yet
+
+uint32_t famCountOffset(const uint8_t *code)
+{
+    static const uint8_t head[10] = { 0x55, 0x48, 0x89, 0xe5, 0x48, 0x8b, 0x47, 0x18, 0x8b, 0x80 };
+    if (memcmp(code, head, sizeof(head)) || code[14] != 0x5d || code[15] != 0xc3) return 0;
+    uint32_t off = (uint32_t)code[10] | ((uint32_t)code[11] << 8) | ((uint32_t)code[12] << 16) | ((uint32_t)code[13] << 24);
+    return off >= 0x20 && off < 0x4000 && !(off & 3) ? off : 0;
+}
+
+// Once, on the work loop that creates awdl0, before any data moves.
+void famCountsLookup()
+{
+    if (gFamCountFound >= 0) return;
+    gFamCount[0] = famCountOffset((const uint8_t *)(uintptr_t)&mtkPmInputCount);
+    gFamCount[1] = famCountOffset((const uint8_t *)(uintptr_t)&mtkPmOutputCount);
+    gFamCountFound = gFamCount[0] && gFamCount[1] && gFamCount[0] != gFamCount[1] ? 1 : 0;
+    mtk_dbg_log("awdl: sched: the peer manager's packet counts %s (received %#x, sent %#x)\n",
+                gFamCountFound ? "found" : "not found, nothing counted", gFamCount[0], gFamCount[1]);
+}
+
+} // namespace
+
 // -----------------------------------------------------------------------------------------------------------------------
 // APPLE80211_IOC_VIRTUAL_IF_CREATE (0x5e), role 6.
 // -----------------------------------------------------------------------------------------------------------------------
@@ -660,6 +711,7 @@ IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedM
         return kIOReturnSuccess;
     }
 
+    if (mtkAwdlSchedMask() & kMtkAwdlSchedCounters) famCountsLookup();
     MtkAwdlInterface *vif = (MtkAwdlInterface *)OSMetaClass::allocClassWithName("MtkAwdlInterface");
     if (!vif) {
         mtk_dbg_log("awdl: vif alloc failed\n");
@@ -808,6 +860,10 @@ const uint64_t kUcHoldUs = 3000000;
 const uint64_t kDataPeerHoldUs = 300000000;
 // The idle cap (capIdleRuns()) waits this long after the last unicast data frame and the last request of the stack.
 const uint64_t kIdleCapQuietUs = 5000000;
+// Following the Family's plan (followPlan()), the runs away grow while unicast data moved this recently.
+const uint64_t kPlanExtendUs = 200000;
+// After the master indication's content changes, multicast data waits at most this long for it (miHoldsMulticast()).
+const uint64_t kMiFirstMaxUs = 300000;
 // The access point's traffic as Apple rates it (currentInfraTrafficType): streaming when its packets average at least
 // kApStreamBytes (and at least 6 came), data with more than kApDataPps packets a second, otherwise idle.
 enum : uint8_t { kApIdle, kApData, kApStream };
@@ -942,6 +998,19 @@ struct Engine {
     uint32_t txIn, txQueued, txFull, txBad, txEarly, rxAmsdu, rxSub, stills, stillS;
     uint32_t rxQos, rxQosDup, rxQosLate, rxQosOld, rxQosRestart, rxParts, rxPartsDropped;
     uint32_t capSeqs, capRuns, capIdx;  // the idle cap: sequences it trimmed, runs away it dropped, whose turn is next
+    uint32_t planSeqs, planExt;         // mtkawdlsched bit 0: sequences that followed the Family's plan, EAWs added
+    // mtkawdlsched bit 1: the station's unicast counters at the last report (packets and bytes in, out), what went
+    // to the infrastructure interface's monitor in all (packets in, out)
+    uint64_t infraLast[4], infraIn, infraOut;
+    bool infraPrimed;
+    uint32_t famCounted[2], famNoState;  // mtkawdlsched bit 2: packets added to the Family's counts, received and sent
+    // mtkawdlsched bit 3: a hash of the master indication's content (its TLVs but those that follow the timing), when it
+    // last changed, whether a frame has carried that change yet, and which change the data path last waited for;
+    // changes, indications sent first, changes multicast data waited for, waits that ran out
+    uint32_t miHash;
+    uint64_t miChangeUs, miHeldFor;
+    bool miDue;
+    uint32_t miChanges, miFirst, miHolds, miExpired;
     uint64_t logUs;
 };
 Engine gE;
@@ -1189,6 +1258,37 @@ void capIdleRuns(uint64_t now, uint8_t home, const Peer *d)
     gE.capRuns += n - 1;
 }
 
+// mtkawdlsched bit 0 (ForbiddenItlwm's scheduler): the radio follows the Family's own plan, the channel sequence it
+// hands down, and the frames advertise it (TLV 4 and 18 are built from gE.pres). Where the Family thinks we are, for
+// its overlap check with each peer and its AW events, is then where the radio is. A free (0) entry is time at home, an
+// entry on the access point's channel is presence there. While unicast data moved in the last kPlanExtendUs, a free
+// EAW right after a run on a 5 GHz channel away from the access point's joins that run, up to 6 EAWs (ForbiddenItlwm's
+// extension of its 5 GHz listener), unless the next EAW is on another channel: placeRuns() keeps two different
+// channels from being back to back by dropping the second, which would drop an EAW of the plan. Slots 0 and 15 are
+// never added, so a run still never wraps. Lock held.
+void followPlan(uint64_t now, uint8_t home)
+{
+    static const uint8_t kNoRow[16] = {};
+    uint8_t cand[16];
+    for (uint32_t i = 0; i < 16; i++) {
+        uint8_t c = gE.famSet ? gE.famCh[i] : 0;
+        cand[i] = (c && usableCh(c) && mtkAwdlRadioChannelAllowed(c)) ? c : 0;
+    }
+    if (gE.ucUs && now - gE.ucUs < kPlanExtendUs) {
+        for (uint32_t i = 1; i < 15; i++) {
+            uint8_t prev = cand[i - 1], next = cand[i + 1];
+            if (cand[i] || !prev || prev == home || prev <= 14 || (next && next != prev)) continue;
+            uint32_t run = 0;
+            for (uint32_t k = i; k > 0 && cand[k - 1] == prev; k--) run++;
+            if (run >= 6) continue;
+            cand[i] = prev;
+            gE.planExt++;
+        }
+    }
+    placeRuns(cand, kNoRow, home);
+    gE.planSeqs++;
+}
+
 // The schedule for the next 16 EAWs (see the top). Lock held.
 void buildPresence(uint64_t now)
 {
@@ -1199,6 +1299,10 @@ void buildPresence(uint64_t now)
     rateAccessPoint(now);
     bzero(gE.pres, sizeof(gE.pres));
     if (!ch) return;
+    if (mtkAwdlSchedMask() & kMtkAwdlSchedPlan) {
+        followPlan(now, home);
+        return;
+    }
     const Peer *d = dataPeer(now, home);
     if (home && home == ch && !d) {
         // The access point is on the AWDL channel: being there costs nothing. At rest the schedule is the Family's
@@ -1394,6 +1498,12 @@ void logState(uint64_t now)
                 gE.rxAmsdu, gE.rxSub, gE.rxDup,
                 gE.rxNotUs, gE.txIn, gE.txQueued, gE.txFull, gE.txBad, gE.txEarly, gE.stills, gE.stillS, gE.capSeqs,
                 gE.capRuns);
+    // mtkawdlsched: plan = sequences that followed the Family's plan / EAWs the data extension added
+    if (mtkAwdlSchedMask())
+        mtk_dbg_log("awdl: sched mask=%u plan=%u/%u infra=%llu/%llu count=%u/%u/%u mi=%u/%u/%u/%u\n", mtkAwdlSchedMask(),
+                    gE.planSeqs, gE.planExt, (unsigned long long)gE.infraIn, (unsigned long long)gE.infraOut,
+                    gE.famCounted[0], gE.famCounted[1], gE.famNoState, gE.miChanges, gE.miFirst, gE.miHolds,
+                    gE.miExpired);
     mtk_dbg_log("awdl: radio %s\n", radio);
     mtkAwdlRadioChannels(radio, sizeof(radio));
     mtk_dbg_log("awdl: radio %s\n", radio);
@@ -1416,6 +1526,8 @@ void tlTick()
     bool doEnd = false, doStart = false, doWin = false;
     uint32_t l1 = 0, l2 = 0;
     uint8_t curCh = 0;
+    bool miFirst = false;
+    uint64_t miChangeUs = 0;
 
     bzero(&ev, sizeof(ev));
     bzero(&ee, sizeof(ee));
@@ -1537,12 +1649,28 @@ void tlTick()
             gE.onceLen = 0;
         } else if (gE.miLen) {
             l2 = buildFrame(gTxScratch2, sizeof(gTxScratch2), 3, bcast, gE.mi, gE.miLen, curCh);
+            // mtkawdlsched bit 3: the first indication with a new content goes ahead of the PSF, and the multicast data
+            // held for it follows
+            if (l2 && gE.miDue) {
+                miFirst = true;
+                miChangeUs = gE.miChangeUs;
+                gE.miDue = false;
+                gE.miFirst++;
+            }
         }
     }
     IOLockUnlock(gE.lock);
 
     postEvents(doEnd, ee, doStart, ev);
     if (doWin && mtkAwdlRadioWindow(&w) == 0) gE.windows++;
+    if (miFirst) {
+        if (mtkAwdlRadioQueue(gTxScratch2, l2, curCh, 40) == 0) gE.frames++; else gE.framesFail++;
+        l2 = 0;
+        if (gE.dpTimer && gE.txBlocked) gE.dpTimer->setTimeoutUS(1);
+        if (gE.miFirst <= 16)
+            mtk_dbg_log("awdl: sched: master indication with a new content sent first, %llu ms after the change\n",
+                        (unsigned long long)((now - miChangeUs) / 1000));
+    }
     if (l1) { if (mtkAwdlRadioQueue(gTxScratch, l1, curCh, 40) == 0) gE.frames++; else gE.framesFail++; }
     if (l2) { if (mtkAwdlRadioQueue(gTxScratch2, l2, curCh, 40) == 0) gE.frames++; else gE.framesFail++; }
     if (gE.eaws <= 2 || (gE.eaws % 64) == 0) logState(now);
@@ -1970,6 +2098,11 @@ uint32_t MtkAwdlInterface::submitData(IOSkywalkPacket *const *packets, uint32_t 
         const uint8_t *e = single ? (const uint8_t *)p->getDataVirtualAddress() : nullptr;
         if (e && len >= 14 && off <= size && len <= size - off && 40 + (len - 14) <= sizeof(gDataTx)) {
             e += off;
+            if ((e[0] & 1) && miHoldsMulticast()) {
+                gE.txBlocked = true;
+                if (gE.dpTimer) gE.dpTimer->setTimeoutMS(5);
+                break;                         // this packet stays in the queue until the indication went out
+            }
             uint8_t *f = gDataTx;
             bzero(f, 24);
             f[0] = 0x08;
@@ -1998,6 +2131,7 @@ uint32_t MtkAwdlInterface::submitData(IOSkywalkPacket *const *packets, uint32_t 
                     gE.ucUs = gE.dataUs;
                     noteDataPeer(e);
                     noteLinkActivity(true);
+                    countForFamily(true);
                 }
             } else {
                 gE.txBad++;
@@ -2129,6 +2263,7 @@ void MtkAwdlInterface::deliverMsdu(const uint8_t *da, const uint8_t *sa, const u
         return;
     }
     gE.rxDataUp++;
+    if (!(da[0] & 1)) countForFamily(false);
 }
 
 // Unicast data moved on awdl0: the Family's peer manager is told the time (see IO80211PeerManager at the top). Without it
@@ -2145,6 +2280,57 @@ void MtkAwdlInterface::noteLinkActivity(bool tx)
     uint64_t now = mach_absolute_time();
     if (tx) pm->setLastUnicastTxLinkActivity(now);
     else pm->setLastUnicastRxLinkActivity(now);
+}
+
+// One unicast packet of awdl0, delivered or queued, for the Family's counts (see famCountsLookup at the top).
+void MtkAwdlInterface::countForFamily(bool tx)
+{
+    if (!(mtkAwdlSchedMask() & kMtkAwdlSchedCounters) || gFamCountFound != 1) return;
+    IO80211PeerManager *pm = getPeerManager();
+    uint8_t *state = pm ? *(uint8_t **)((uint8_t *)pm + 0x18) : nullptr;
+    if (!state) {
+        gE.famNoState++;
+        return;
+    }
+    __atomic_fetch_add((uint32_t *)(state + gFamCount[tx ? 1 : 0]), 1u, __ATOMIC_RELAXED);
+    gE.famCounted[tx ? 1 : 0]++;
+}
+
+// mtkawdlsched bit 1, from ForbiddenItlwm (reportInfraTraffic in 1bb9169). The Family's AWDL scheduler weighs the access
+// point's traffic (IO80211AWDLPeerManager::gatherInfraStats) from the packet counters of the infrastructure interface's
+// monitor, which only the driver feeds: Apple's drivers call these two functions, this one never did, so the Family
+// always saw an idle access point. Both are exported by the Family and only add to the monitor's counters; they are
+// called directly, not through the vtable. Unicast only: group traffic would keep the Family on the access point's side
+// on any busy network.
+extern IOReturn mtkRecordInputPacket(IO80211SkywalkInterface *, int, int)
+    __asm__("__ZN23IO80211SkywalkInterface17recordInputPacketEii");
+extern IOReturn mtkRecordOutputPacket(IO80211SkywalkInterface *, apple80211_wme_ac, int, int)
+    __asm__("__ZN23IO80211SkywalkInterface18recordOutputPacketE17apple80211_wme_acii");
+
+void mtkAwdlReportInfraTraffic(IO80211SkywalkInterface *infra)
+{
+    if (!infra || !mtkAwdlEnabled() || !(mtkAwdlSchedMask() & kMtkAwdlSchedInfra)) return;
+    uint64_t now[4];
+    int delta[4];
+    mtkAwdlRadioStationUnicast(&now[0], &now[1], &now[2], &now[3]);
+    for (int i = 0; i < 4; i++) {
+        uint64_t d = now[i] >= gE.infraLast[i] ? now[i] - gE.infraLast[i] : 0;
+        gE.infraLast[i] = now[i];
+        delta[i] = d > 0x7fffffffULL ? 0x7fffffff : (int)d;
+    }
+    if (!gE.infraPrimed) {              // the first call only takes the counters as they are
+        gE.infraPrimed = true;
+        return;
+    }
+    if (!mtkAwdlRadioHomeChannel()) return;
+    if (delta[0] > 0) {
+        mtkRecordInputPacket(infra, delta[0], delta[1]);
+        gE.infraIn += (uint32_t)delta[0];
+    }
+    if (delta[2] > 0) {
+        mtkRecordOutputPacket(infra, (apple80211_wme_ac)0 /* best effort */, delta[2], delta[3]);
+        gE.infraOut += (uint32_t)delta[2];
+    }
 }
 
 // The queues run once they are enabled: completions first, the submission last (its action uses the others).
@@ -2277,6 +2463,46 @@ static void engineTraffic(bool active)
     if (kick) kickTimeline();
 }
 
+// mtkawdlsched bit 3, from ForbiddenItlwm (-itlschedminow in 1bb9169). There an iPhone heard a device's mDNS
+// announcement 36-280 ms before the master indication that carried the same service: its AWDL discovery found
+// nothing and AirDrop's route check failed. After the indication's content changes, multicast data waits for the
+// first frame that carries the change, at most kMiFirstMaxUs, and that frame goes ahead of the PSF. The content is the
+// TLVs but those that follow the timing or the schedule: synchronization (4), election (5, 24), data path state (12),
+// channel sequence (18), synchronization tree (20), version (21). FNV-1a, as ForbiddenItlwm hashes them.
+static uint32_t miContentHash(const uint8_t *t, uint32_t len)
+{
+    const uint32_t timing = (1u << 4) | (1u << 5) | (1u << 12) | (1u << 18) | (1u << 20) | (1u << 21) | (1u << 24);
+    uint32_t h = 2166136261u;
+    for (uint32_t pos = 0; pos + 3 <= len;) {
+        uint32_t l = rd16(t + pos + 1);
+        if (pos + 3 + l > len) break;
+        if (t[pos] >= 32 || !(timing & (1u << t[pos])))
+            for (uint32_t k = 0; k < 3 + l; k++) h = (h ^ t[pos + k]) * 16777619u;
+        pos += 3 + l;
+    }
+    return h;
+}
+
+// True while a multicast packet of awdl0 has to wait for the master indication (see miContentHash()). Work loop.
+static bool miHoldsMulticast()
+{
+    if (!(mtkAwdlSchedMask() & kMtkAwdlSchedMiFirst) || !gE.lock || !gE.miDue) return false;
+    uint64_t now = mtkAwdlUptimeUs();
+    IOLockLock(gE.lock);
+    bool hold = gE.miDue;
+    if (hold && now - gE.miChangeUs > kMiFirstMaxUs) {
+        gE.miDue = false;
+        gE.miExpired++;
+        hold = false;
+    }
+    if (hold && gE.miHeldFor != gE.miChangeUs) {
+        gE.miHeldFor = gE.miChangeUs;
+        gE.miHolds++;
+    }
+    IOLockUnlock(gE.lock);
+    return hold;
+}
+
 // apple80211_awdl_oob_request: +0x16 the destination, +0x28 the payload length, +0x30 the payload (the master
 // indication's TLVs for the automatic request; thanhnndev d4b9008, ForbiddenItlwm storeMasterIndication). Only a kernel
 // buffer of plausible size whose TLVs end where it ends is kept.
@@ -2303,6 +2529,15 @@ static IOReturn engineOob(const uint8_t *r, bool autoReq)
         memcpy(gE.mi, pl, len);
         gE.miLen = len;
         if ((gE.ownCapsLogged & 3) != 3) gE.ownCapsLogged |= logCapTlvs("our", pl, len, gE.ownCapsLogged);
+        if (mtkAwdlSchedMask() & kMtkAwdlSchedMiFirst) {
+            uint32_t h = miContentHash(pl, len);
+            if (h != gE.miHash) {
+                gE.miHash = h;
+                gE.miChangeUs = now;
+                gE.miDue = true;
+                gE.miChanges++;
+            }
+        }
     } else {
         memcpy(gE.once, pl, len);
         gE.onceLen = len;

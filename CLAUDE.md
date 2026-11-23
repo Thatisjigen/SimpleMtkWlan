@@ -277,6 +277,24 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   AWDL peer manager picks its channels from that country whenever the link
   changes (with the world domain "00" it takes 149, which a Pixel never visits;
   with IT it takes 44).
+  `mtkawdlsched=<mask>` (0 by default, 15 for all) turns on the parts of
+  ForbiddenItlwm's AWDL scheduler that apply here (`kMtkAwdlSched*` in
+  `awdl/MtkAwdl.h`). Bit 0: the radio follows the Family's channel plan in
+  every EAW and advertises it, instead of the schedule built from the master's
+  or the data peer's sequence; while unicast data moved in the last 200 ms a
+  free EAW after a run away joins it, up to 6. Bit 1: once a second the
+  watchdog hands the station's unicast frames with its access point to the
+  infrastructure interface's monitor (`recordInputPacket`,
+  `recordOutputPacket`), the counters the Family's AWDL scheduler weighs the
+  access point's traffic from. Bit 2: every unicast packet awdl0 delivers or
+  queues adds one to the peer manager's received or sent count, which the
+  Family's AWDL monitors read (`monitorAWDLDataMode`); where those counts are
+  is read once from the Family's getters `getUnicastPacketsInputCount` and
+  `getUnicastPacketsOutputCount`, and with any other code there nothing is
+  counted. Bit 3: after the master indication's content changes (its TLVs but
+  the timing ones), multicast data waits up to 300 ms for the first indication
+  that carries it, and that frame goes ahead of the PSF. `awdl: sched` in the
+  log counts all four.
 
 ## Testing on hardware
 

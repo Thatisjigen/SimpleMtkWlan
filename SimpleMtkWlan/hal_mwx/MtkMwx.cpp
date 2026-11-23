@@ -10575,6 +10575,8 @@ struct mwx_awdl {
 	uint64_t		late_us, off_us, log_us;
 	/* the station's data frames with its access point, sent [0] and received [1] (mwx_awdl_sta_traffic()) */
 	uint64_t		sta_pkts[2], sta_bytes[2];
+	/* of which addressed to one device */
+	uint64_t		sta_uc_pkts[2], sta_uc_bytes[2];
 };
 
 static struct mwx_softc *gMwxAwdlSc;
@@ -12860,7 +12862,8 @@ mwx_awdl_rest(struct mwx_softc *sc, bool again)
  * One data frame of the station with its access point, for the interface's rating of the access point's traffic
  * (mtkAwdlRadioStationTraffic()): from mwx_tx() before the frame is handed over, and from mwx_rx() for what goes to
  * net80211, of which only what the access point sent counts. Each direction has its own counters, written by its own
- * path only.
+ * path only. The frames addressed to one device are counted apart as well (mtkAwdlRadioStationUnicast()): the final
+ * destination is the third address of a frame to the access point, the first one otherwise.
  */
 static void
 mwx_awdl_sta_traffic(struct mwx_softc *sc, struct mbuf *m, bool rx)
@@ -12868,6 +12871,7 @@ mwx_awdl_sta_traffic(struct mwx_softc *sc, struct mbuf *m, bool rx)
 	struct mwx_awdl *a = sc->sc_awdl;
 	struct ieee80211com *ic = &sc->sc_ic;
 	const struct ieee80211_frame *wh;
+	const uint8_t *da;
 
 	if (mbuf_len(m) < sizeof(*wh))
 		return;
@@ -12879,6 +12883,11 @@ mwx_awdl_sta_traffic(struct mwx_softc *sc, struct mbuf *m, bool rx)
 		return;
 	a->sta_pkts[rx]++;
 	a->sta_bytes[rx] += mbuf_pkthdr_len(m);
+	da = (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) == IEEE80211_FC1_DIR_TODS ? wh->i_addr3 : wh->i_addr1;
+	if (!IEEE80211_IS_MULTICAST(da)) {
+		a->sta_uc_pkts[rx]++;
+		a->sta_uc_bytes[rx] += mbuf_pkthdr_len(m);
+	}
 }
 
 /*
@@ -13327,6 +13336,18 @@ mtkAwdlRadioStationTraffic(uint64_t *packets, uint64_t *bytes)
 
 	*packets = a != NULL ? a->sta_pkts[0] + a->sta_pkts[1] : 0;
 	*bytes = a != NULL ? a->sta_bytes[0] + a->sta_bytes[1] : 0;
+}
+
+void
+mtkAwdlRadioStationUnicast(uint64_t *inPackets, uint64_t *inBytes, uint64_t *outPackets, uint64_t *outBytes)
+{
+	struct mwx_softc *sc = gMwxAwdlSc;
+	struct mwx_awdl *a = sc != NULL ? sc->sc_awdl : NULL;
+
+	*inPackets = a != NULL ? a->sta_uc_pkts[1] : 0;
+	*inBytes = a != NULL ? a->sta_uc_bytes[1] : 0;
+	*outPackets = a != NULL ? a->sta_uc_pkts[0] : 0;
+	*outBytes = a != NULL ? a->sta_uc_bytes[0] : 0;
 }
 
 void

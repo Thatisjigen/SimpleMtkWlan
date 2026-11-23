@@ -14,8 +14,22 @@
 #include <stdint.h>
 
 class IOService;
+class IO80211SkywalkInterface;
 
 bool mtkAwdlEnabled();
+
+// The boot-arg mtkawdlsched=<mask>, 0 by default: the parts of ForbiddenItlwm's AWDL scheduler (retropineaple 1bb9169,
+// off by default since fd8b236) that apply to this driver. 15 is all of them.
+enum : uint32_t {
+    kMtkAwdlSchedPlan = 1,      // the radio follows the Family's channel plan and advertises it
+    kMtkAwdlSchedInfra = 2,     // the station's unicast traffic goes to the Family's interface monitor
+    kMtkAwdlSchedCounters = 4,  // awdl0's data packets go to the Family's peer manager counters
+    kMtkAwdlSchedMiFirst = 8,   // after its content changes, the master indication goes before group data
+};
+uint32_t mtkAwdlSchedMask();
+// Once a second from the front end's watchdog, with the main work loop's gate held: with kMtkAwdlSchedInfra, the
+// station's unicast data since the last call goes to the infrastructure interface's monitor.
+void mtkAwdlReportInfraTraffic(IO80211SkywalkInterface *infra);
 
 // requestedMac may be all zero, then the address is derived from primaryMac. bsdName receives awdl0, or the name in use.
 IOReturn mtkAwdlCreateInterface(IOService *controller, const uint8_t *requestedMac, const uint8_t *primaryMac,
@@ -59,6 +73,8 @@ bool mtkAwdlRadioChannelAllowed(uint8_t channel);
 // The station's data frames with its access point, either way, counted since the radio was started: packets and their
 // bytes (an A-MSDU counts once). The interface rates the access point's traffic from them.
 void mtkAwdlRadioStationTraffic(uint64_t *packets, uint64_t *bytes);
+// The same frames, only those addressed to one device: received from the access point, and sent to it.
+void mtkAwdlRadioStationUnicast(uint64_t *inPackets, uint64_t *inBytes, uint64_t *outPackets, uint64_t *outBytes);
 // Counters for the driver log.
 void mtkAwdlRadioSummary(char *buffer, size_t length);
 // Windows, AWDL frames and other frames heard, by social channel (6, 44, 149, others).

@@ -145,6 +145,9 @@ IOReturn AirportItlwm::halDebugPollGated(OSObject *owner, void *, void *, void *
     auto self = static_cast<AirportItlwm *>(owner);
     if (self->fHalService)
         self->fHalService->debugPoll();
+#ifdef MTK_AWDL
+    mtkAwdlReportInfraTraffic(self->fNetIf);
+#endif
     return kIOReturnSuccess;
 }
 
