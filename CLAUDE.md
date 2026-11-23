@@ -238,8 +238,11 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   point on 36 fills most of the Family's low power sequence. Otherwise a
   device heard in the last 8 s that is on one channel in every entry of its
   sequence (a Pixel's Quick Share; no Apple device so far) sets them before
-  the master's (`awdl: schedule on <ch>` in the log). After 60 s with no
-  peer, no data and nothing asked by the Family, the
+  the master's (`awdl: schedule on <ch>` in the log). Each unicast
+  frame of awdl0 also goes to the Family's peer manager as its last link
+  activity each way (`setLastUnicastTxLinkActivity`/`Rx`, exported), which
+  keeps the Family out of its low power schedule while data moves. After 60 s
+  with no peer, no data and nothing asked by the Family, the
   timeline stops and the radio goes back to the station, as with awdl0 down; the
   Family's next browse or advertisement (a denser channel sequence, a template of
   a new length), a frame or traffic request, or a packet of awdl0 starts it

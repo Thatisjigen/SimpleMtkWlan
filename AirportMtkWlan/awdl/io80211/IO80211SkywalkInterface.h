@@ -208,6 +208,7 @@ public:
     uint32_t getInterfaceId();   // exported: __ZN23IO80211SkywalkInterface14getInterfaceIdEv; queue factories take it as ifId
     IO80211WorkQueue* getWorkQueue();   // exported: __ZN23IO80211SkywalkInterface12getWorkQueueEv; AppleBCMWLANSkywalkInterface::start takes the interface's work queue from it; result used with the IOWorkLoop virtuals
     void setInterfaceId(uint32_t id);   // exported: __ZN23IO80211SkywalkInterface14setInterfaceIdEj; called by AppleBCMWLANSkywalkInterface::initWithProviderAndParameters
+    IO80211PeerManager* getPeerManager();   // exported: __ZN23IO80211SkywalkInterface14getPeerManagerEv; the ivars' peer manager, stored there from createPeerManager()
 
 protected:
     uint8_t iO80211SkywalkInterfaceOpaque[0x128 - sizeof(IOSkywalkEthernetInterface)];   // ivars of Apple's class: layout not determined

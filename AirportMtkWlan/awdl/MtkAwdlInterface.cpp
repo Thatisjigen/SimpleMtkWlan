@@ -12,11 +12,23 @@
 #include "skywalk_min.h"
 #include "io80211/IO80211AWDLProtocol.h"
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
 #include <sys/errno.h>
 
 extern "C" void mtk_dbg_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+// The Family's peer manager, declared for two of its exported functions only. monitorAWDLState moves AWDL to its low power
+// schedule once the idle state has lasted its timeout and the last unicast frame each way (getLastUnicastTxLinkActivity,
+// getLastUnicastRxLinkActivity, in mach_absolute_time units) is older than that timeout plus 3. Apple's drivers report those
+// times through getLastTxTimeStamp/getLastRxTimeStamp, which the Family asks for only from a driver with capability 142,
+// and that capability turns on its other data path statistics too; these setters store the same times.
+class IO80211PeerManager {
+public:
+    void setLastUnicastTxLinkActivity(unsigned long long absTime);   // exported: __ZN18IO80211PeerManager28setLastUnicastTxLinkActivityEy
+    void setLastUnicastRxLinkActivity(unsigned long long absTime);   // exported: __ZN18IO80211PeerManager28setLastUnicastRxLinkActivityEy
+};
 
 namespace {
 
@@ -157,6 +169,7 @@ public:
     void serviceData();
     void deliverData(const uint8_t *frame, uint32_t len, uint8_t part);
     void deliverMsdu(const uint8_t *da, const uint8_t *sa, const uint8_t *pl, uint32_t plen);
+    void noteLinkActivity(bool tx);
     void enableData();
 
 private:
@@ -904,6 +917,7 @@ struct Engine {
                                     // written by the data paths without the lock (noteDataPeer())
     uint64_t ucPeerLogged;          // the data peer the schedule last followed, for the driver log
     uint64_t stayPeer;              // the device on one channel the schedule last followed (stayingPeer()), 0: none
+    uint64_t linkUs[2];             // when the Family was last told of unicast data received [0] and sent [1]
     // the access point's traffic, sampled once a sequence (rateAccessPoint())
     uint64_t apPkts, apBytes, apSampleUs;
     uint8_t apClass;
@@ -1935,6 +1949,7 @@ uint32_t MtkAwdlInterface::submitData(IOSkywalkPacket *const *packets, uint32_t 
                 if (!(e[0] & 1)) {
                     gE.ucUs = gE.dataUs;
                     noteDataPeer(e);
+                    noteLinkActivity(true);
                 }
             } else {
                 gE.txBad++;
@@ -1998,6 +2013,7 @@ void MtkAwdlInterface::deliverData(const uint8_t *f, uint32_t len, uint8_t part)
     if (!(da[0] & 1)) {
         gE.ucUs = now;
         noteDataPeer(sa);
+        noteLinkActivity(false);
     }
     if (!(qos && (f[24] & 0x80))) {
         deliverMsdu(da, sa, pl, plen);
@@ -2065,6 +2081,22 @@ void MtkAwdlInterface::deliverMsdu(const uint8_t *da, const uint8_t *sa, const u
         return;
     }
     gE.rxDataUp++;
+}
+
+// Unicast data moved on awdl0: the Family's peer manager is told the time (see IO80211PeerManager at the top). Without it
+// the Family went to its low power schedule 0.8 s after an AirDrop request had come, while the sender waited for the
+// answer, and dropped a peer that is on none of the low power schedule's channels. At most every 100 ms each way.
+void MtkAwdlInterface::noteLinkActivity(bool tx)
+{
+    uint64_t us = mtkAwdlUptimeUs();
+    uint64_t &last = gE.linkUs[tx ? 1 : 0];
+    if (last && us - last < 100000) return;
+    last = us;
+    IO80211PeerManager *pm = getPeerManager();
+    if (!pm) return;
+    uint64_t now = mach_absolute_time();
+    if (tx) pm->setLastUnicastTxLinkActivity(now);
+    else pm->setLastUnicastRxLinkActivity(now);
 }
 
 // The queues run once they are enabled: completions first, the submission last (its action uses the others).
