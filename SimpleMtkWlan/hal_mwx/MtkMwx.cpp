@@ -694,6 +694,7 @@ struct mwx_softc {
 #ifdef MTK_AWDL
 	struct mwx_awdl		*sc_awdl;	/* the AWDL radio, allocated when awdl0 starts it */
 	int			sc_awdl_ds;	/* the deep sleep setting the station asked for last */
+	uint8_t			sc_cc_bssid[6];	/* the access point whose Country element was last read */
 #endif
 
 };
@@ -1209,6 +1210,9 @@ static void	mwx_awdl_resume(struct mwx_softc *);
 static void	mwx_awdl_rx_release(struct mwx_softc *);
 static void	mwx_awdl_free(struct mwx_softc *);
 static void	mwx_awdl_attach(struct mwx_softc *);
+/* The access point's country, at the end of this file too; it does not need sc_awdl. */
+static void	mwx_ap_country(struct mwx_softc *, struct ieee80211_node *);
+bool		mtkAwdlEnabled();
 #endif
 
 static inline int
@@ -2084,6 +2088,11 @@ mwx_newstate_task(void *ptr)
 		if (rv)
 			break;
 		mt7921_mcu_set_rts_thresh(sc, 0x92b, 0);
+#ifdef MTK_AWDL
+		/* The access point's country, before net80211 brings the link up: the Family's AWDL channels follow it. */
+		if (mtkAwdlEnabled())
+			mwx_ap_country(sc, ic->ic_bss);
+#endif
 		break;
 	}
 
@@ -10495,8 +10504,6 @@ struct mwx_awdl {
 	volatile bool		tap_filter;	/* sniffer_on || filter_open */
 	volatile bool		tap_grace;
 	uint64_t		tap_grace_until_us;
-	char			cc[2];		/* the country taken from the access point */
-	uint8_t			cc_bssid[6];
 	/* the window in progress */
 	volatile bool		rx_open;
 	volatile uint8_t	rx_ch;
@@ -10997,20 +11004,22 @@ mwx_awdl_fullpwr(struct mwx_softc *sc, bool on)
 /*
  * The regulatory country from the access point's Country element, as cfg80211 does (802.11d) before
  * mt7921_regd_notifier sends the channel domain and the power limits again. The HAL starts with the world
- * domain, "00".
+ * domain, "00". It is read once per access point, on entering RUN before net80211 brings the link up, and the
+ * front end is told of a change (IEEE80211_EVT_COUNTRY_CODE_UPDATE). The front end reports this country to the
+ * Family (APPLE80211_IOC_COUNTRY_CODE), and the Family's AWDL peer manager takes its channels from it whenever
+ * the station's link changes (configureValidAWDLChannels). Read only from the AWDL radio's first window, after the
+ * link was up, it came too late: the Family kept the world domain, took 149 for AWDL, which most of Europe does
+ * not allow and which a Pixel never visits, and dropped a Pixel on 44 every second.
  */
 static void
-mwx_awdl_country(struct mwx_softc *sc)
+mwx_ap_country(struct mwx_softc *sc, struct ieee80211_node *ni)
 {
-	struct mwx_awdl *a = sc->sc_awdl;
 	struct ieee80211com *ic = &sc->sc_ic;
-	struct ieee80211_node *ni = ic->ic_bss;
 	const uint8_t *ie, *end;
 
-	if (ic->ic_state != IEEE80211_S_RUN || ni == NULL || ni->ni_rsnie_tlv == NULL ||
-	    memcmp(a->cc_bssid, ni->ni_bssid, 6) == 0)
+	if (ni == NULL || ni->ni_rsnie_tlv == NULL || memcmp(sc->sc_cc_bssid, ni->ni_bssid, 6) == 0)
 		return;
-	memcpy(a->cc_bssid, ni->ni_bssid, 6);	/* once per access point */
+	memcpy(sc->sc_cc_bssid, ni->ni_bssid, 6);	/* once per access point */
 	ie = ni->ni_rsnie_tlv;
 	end = ie + ni->ni_rsnie_tlv_len;
 	while (end - ie >= 2 && end - ie >= 2 + ie[1]) {
@@ -11023,12 +11032,24 @@ mwx_awdl_country(struct mwx_softc *sc)
 		return;
 	if (sc->sc_alpha2[0] == (char)ie[2] && sc->sc_alpha2[1] == (char)ie[3])
 		return;
-	MWX_DEV_LOG(sc, "awdl: regulatory country %c%c from the access point (was %c%c)\n", ie[2], ie[3],
+	MWX_DEV_LOG(sc, "regulatory country %c%c from the access point (was %c%c)\n", ie[2], ie[3],
 	    sc->sc_alpha2[0], sc->sc_alpha2[1]);
-	a->cc[0] = sc->sc_alpha2[0] = (char)ie[2];
-	a->cc[1] = sc->sc_alpha2[1] = (char)ie[3];
+	sc->sc_alpha2[0] = (char)ie[2];
+	sc->sc_alpha2[1] = (char)ie[3];
 	if (mt7921_mcu_set_channel_domain(sc) != 0 || mt7921_mcu_set_rate_txpower(sc) != 0)
-		MWX_DEV_LOG(sc, "awdl: the country was not taken by the firmware\n");
+		MWX_DEV_LOG(sc, "the country was not taken by the firmware\n");
+	if (ic->ic_event_handler)
+		ic->ic_event_handler(ic, IEEE80211_EVT_COUNTRY_CODE_UPDATE, NULL);
+}
+
+/* Before an AWDL window: the same, once per access point, so nothing new after the read on entering RUN. */
+static void
+mwx_awdl_country(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	if (ic->ic_state == IEEE80211_S_RUN)
+		mwx_ap_country(sc, ic->ic_bss);
 }
 
 static struct mwx_awdl_peer *

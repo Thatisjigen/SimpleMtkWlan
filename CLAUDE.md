@@ -261,6 +261,12 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   the radio, the windows by channel and the peers. The interface file is compiled
   on its own against the layouts in `awdl/io80211`; struct sizes come from the
   request lengths the Family's ioctl handlers check, never from a guess.
+  With AWDL on the station takes the access point's country (its Country
+  element, as 802.11d) on entering RUN, before the link comes up, and tells
+  the front end, which reports it as the card's country code: the Family's
+  AWDL peer manager picks its channels from that country whenever the link
+  changes (with the world domain "00" it takes 149, which a Pixel never visits;
+  with IT it takes 44).
 
 ## Testing on hardware
 
