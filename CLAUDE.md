@@ -247,7 +247,11 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   the master's (`awdl: schedule on <ch>` in the log). Each unicast
   frame of awdl0 also goes to the Family's peer manager as its last link
   activity each way (`setLastUnicastTxLinkActivity`/`Rx`, exported), which
-  keeps the Family out of its low power schedule while data moves. After 60 s
+  keeps the Family out of its low power schedule while data moves. With the
+  Family on a sparse sequence (6 slots in 16 or fewer), no data peer and no
+  unicast data or request of the stack for 5 s, the schedule leaves the access
+  point's channel once a sequence at most, each run away in turn (the idle
+  cap; `cap=` in the `tl` line, `mtkawdlidlecap=0` turns it off). After 60 s
   with no peer, no data and nothing asked by the Family, the
   timeline stops and the radio goes back to the station, as with awdl0 down; the
   Family's next browse or advertisement (a denser channel sequence, a template of

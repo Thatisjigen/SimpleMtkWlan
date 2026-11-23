@@ -806,6 +806,8 @@ const uint64_t kUcHoldUs = 3000000;
 // long enough for an AirDrop request to wait for the user's answer, and a device that stays around does not keep the
 // radio off the access point's channel for good.
 const uint64_t kDataPeerHoldUs = 300000000;
+// The idle cap (capIdleRuns()) waits this long after the last unicast data frame and the last request of the stack.
+const uint64_t kIdleCapQuietUs = 5000000;
 // The access point's traffic as Apple rates it (currentInfraTrafficType): streaming when its packets average at least
 // kApStreamBytes (and at least 6 came), data with more than kApDataPps packets a second, otherwise idle.
 enum : uint8_t { kApIdle, kApData, kApStream };
@@ -939,6 +941,7 @@ struct Engine {
     uint32_t rxAf, rxAfFail, rxNoRssi, rxData, rxDataUp, rxDataFail, rxDup, rxNotUs;
     uint32_t txIn, txQueued, txFull, txBad, txEarly, rxAmsdu, rxSub, stills, stillS;
     uint32_t rxQos, rxQosDup, rxQosLate, rxQosOld, rxQosRestart, rxParts, rxPartsDropped;
+    uint32_t capSeqs, capRuns, capIdx;  // the idle cap: sequences it trimmed, runs away it dropped, whose turn is next
     uint64_t logUs;
 };
 Engine gE;
@@ -1143,6 +1146,49 @@ void placeRuns(const uint8_t *cand, const uint8_t *row, uint8_t home)
     }
 }
 
+// The idle cap, on unless the boot-arg mtkawdlidlecap=0 turns it off.
+bool idleCapOn()
+{
+    static int on = -1;
+    if (on < 0) {
+        int v = 1;
+        if (!PE_parse_boot_argn("mtkawdlidlecap", &v, sizeof(v))) v = 1;
+        on = v != 0;
+    }
+    return on != 0;
+}
+
+// The idle cap. With the station associated, the Family on a sparse sequence (6 slots in 16 or fewer, its low power
+// one), no device data goes to or comes from (dataPeer()), and neither unicast data nor a request of the stack for
+// kIdleCapQuietUs, the radio leaves the access point's channel once a sequence at most: of the runs of present EAWs away
+// from it, one is kept, each in turn, and the others become time at home. Every run away is a remain-on-channel period
+// during which the access point holds the station's frames; with an Apple device nearby the idle schedule left the
+// channel about three times a second. A peer that appears makes the Family search, with a dense sequence, and data or
+// a data peer lift the cap at once. Lock held.
+void capIdleRuns(uint64_t now, uint8_t home, const Peer *d)
+{
+    if (!idleCapOn() || !home || d || !gE.famSet) return;
+    if ((gE.ucUs && now - gE.ucUs < kIdleCapQuietUs) || (gE.useUs && now - gE.useUs < kIdleCapQuietUs)) return;
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < 16; i++) used += gE.famCh[i] != 0;
+    if (used > 6) return;
+    uint8_t first[16];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 16; i++) {
+        uint8_t c = gE.pres[i];
+        if (c && c != home && (i == 0 || gE.pres[i - 1] != c)) first[n++] = (uint8_t)i;
+    }
+    if (n <= 1) return;
+    uint32_t keep = gE.capIdx++ % n;
+    for (uint32_t r = 0; r < n; r++) {
+        if (r == keep) continue;
+        uint8_t c = gE.pres[first[r]];
+        for (uint32_t i = first[r]; i < 16 && gE.pres[i] == c; i++) gE.pres[i] = 0;
+    }
+    gE.capSeqs++;
+    gE.capRuns += n - 1;
+}
+
 // The schedule for the next 16 EAWs (see the top). Lock held.
 void buildPresence(uint64_t now)
 {
@@ -1212,6 +1258,7 @@ void buildPresence(uint64_t now)
     bool met = false;
     for (uint32_t i = 0; i < 16; i++) met = met || gE.pres[i];
     if (!data && synced && !met) placeRuns(cand, kHomeIdleWide, home);
+    capIdleRuns(now, home, d);
 }
 
 // TLV 4, the synchronization parameters (73 value bytes; thanhnndev d4b9008, seemoo-lab owl's layout). The counters at
@@ -1341,11 +1388,12 @@ void logState(uint64_t now)
     // ap: the access point's traffic, i(dle), d(ata) or s(treaming)
     mtk_dbg_log("awdl: tl role=%u ch=%u pres=%s ap=%c eaws=%u posted=%u/%u end=%u late=%u syncs=%u "
                 "frames=%u/%u rx af=%u/%u norssi=%u data=%u/%u/%u amsdu=%u/%u dup=%u notus=%u tx in=%u q=%u full=%u bad=%u "
-                "early=%u still=%u/%us\n",
+                "early=%u still=%u/%us cap=%u/%u\n",
                 gE.role, gE.awdlCh, pres, "ids"[gE.apClass % 3], gE.eaws, gE.posted, gE.postFail, gE.ended, gE.late, gE.syncs,
                 gE.frames, gE.framesFail, gE.rxAf, gE.rxAfFail, gE.rxNoRssi, gE.rxData, gE.rxDataUp, gE.rxDataFail,
                 gE.rxAmsdu, gE.rxSub, gE.rxDup,
-                gE.rxNotUs, gE.txIn, gE.txQueued, gE.txFull, gE.txBad, gE.txEarly, gE.stills, gE.stillS);
+                gE.rxNotUs, gE.txIn, gE.txQueued, gE.txFull, gE.txBad, gE.txEarly, gE.stills, gE.stillS, gE.capSeqs,
+                gE.capRuns);
     mtk_dbg_log("awdl: radio %s\n", radio);
     mtkAwdlRadioChannels(radio, sizeof(radio));
     mtk_dbg_log("awdl: radio %s\n", radio);
