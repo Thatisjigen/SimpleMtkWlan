@@ -789,6 +789,10 @@ const uint8_t kHomeDataApIdle[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 const uint8_t kHomeDataApData[16] = { 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1 };
 const uint8_t kHomeDataApStream[16] = { 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1 };
 const uint64_t kUcHoldUs = 3000000;
+// How long the device of the last unicast data frame keeps the schedule on its channels with no more data (dataPeer()):
+// long enough for an AirDrop request to wait for the user's answer, and a device that stays around does not keep the
+// radio off the access point's channel for good.
+const uint64_t kDataPeerHoldUs = 300000000;
 // The access point's traffic as Apple rates it (currentInfraTrafficType): streaming when its packets average at least
 // kApStreamBytes (and at least 6 came), data with more than kApDataPps packets a second, otherwise idle.
 enum : uint8_t { kApIdle, kApData, kApStream };
@@ -896,6 +900,10 @@ struct Engine {
     Peer peers[kPeers];
     uint64_t peerHeardUs, dataUs;
     uint64_t ucUs;                  // the last unicast data frame, either way
+    uint64_t ucPeer;                // the device it came from or went to, its address in the low 48 bits (0: none);
+                                    // written by the data paths without the lock (noteDataPeer())
+    uint64_t ucPeerLogged;          // the data peer the schedule last followed, for the driver log
+    uint64_t stayPeer;              // the device on one channel the schedule last followed (stayingPeer()), 0: none
     // the access point's traffic, sampled once a sequence (rateAccessPoint())
     uint64_t apPkts, apBytes, apSampleUs;
     uint8_t apClass;
@@ -928,6 +936,21 @@ inline uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); 
 inline void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 inline void wr32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
 inline bool isZero6(const uint8_t *a) { return !(a[0] | a[1] | a[2] | a[3] | a[4] | a[5]); }
+
+inline uint64_t mac48(const uint8_t *a)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 6; i++) v |= (uint64_t)a[i] << (8 * i);
+    return v;
+}
+
+// The device of a unicast data frame, received or sent. The data paths do not take the lock: one 64-bit word, written
+// only when it changes.
+inline void noteDataPeer(const uint8_t *a)
+{
+    uint64_t v = mac48(a);
+    if (__atomic_load_n(&gE.ucPeer, __ATOMIC_RELAXED) != v) __atomic_store_n(&gE.ucPeer, v, __ATOMIC_RELAXED);
+}
 
 // A 20 MHz channel without radar duty, as the radio accepts it (mwx_awdl_channel_ok).
 bool usableCh(uint32_t ch)
@@ -1006,6 +1029,42 @@ const Peer *findPeer(const uint8_t *a)
     return nullptr;
 }
 
+// The device unicast data last came from or went to, up to kDataPeerHoldUs after that frame, while it is heard and its
+// channel sequence is known, if it is on AWDL away from the access point's channel in one of its EAWs, on a channel the
+// radio may use; otherwise null. Lock held.
+const Peer *dataPeer(uint64_t now, uint8_t home)
+{
+    uint64_t v = __atomic_load_n(&gE.ucPeer, __ATOMIC_RELAXED);
+    if (!v || gE.ucUs + kDataPeerHoldUs <= now) return nullptr;
+    for (const Peer &p : gE.peers) {
+        if (!p.valid || !p.n || p.lastUs + kPeerStaleUs <= now || mac48(p.addr) != v) continue;
+        for (uint32_t i = 0; i < p.n; i++)
+            if (p.ch[i] && p.ch[i] != home && mtkAwdlRadioChannelAllowed(p.ch[i])) return &p;
+        return nullptr;
+    }
+    return nullptr;
+}
+
+// A device heard in the last kPeerStaleUs that is on one channel in every entry of its sequence, one the radio may use;
+// otherwise null. A Pixel's Quick Share stays on 44 in all 16 EAWs from the time it looks for receivers, and none of the
+// Apple devices heard so far did. Followed instead, an Apple master was on 44 in one EAW of 16, and with the idle cap
+// keeping one of its four runs away the radio was there once in 64 EAWs: the Pixel never listed the Mac until the
+// Apple device's Wi-Fi was turned off. The device the schedule already follows keeps it while it is heard, so that two
+// such devices do not take turns; otherwise the one heard last. Lock held.
+const Peer *stayingPeer(uint64_t now)
+{
+    const Peer *best = nullptr;
+    for (const Peer &p : gE.peers) {
+        if (!p.valid || !p.n || p.lastUs + kPeerStaleUs <= now || !mtkAwdlRadioChannelAllowed(p.ch[0])) continue;
+        uint32_t i = 1;
+        while (i < p.n && p.ch[i] == p.ch[0]) i++;
+        if (i < p.n) continue;
+        if (mac48(p.addr) == gE.stayPeer) return &p;
+        if (!best || p.lastUs > best->lastUs) best = &p;
+    }
+    return best;
+}
+
 // The Family or the stack asked for AWDL: the timeline keeps running, or runs again from the next EAW. Lock held; true
 // when the caller has to kick the timeline (kickTimeline(), outside the lock) to end a still period.
 bool noteActivity(uint64_t now, uint8_t why)
@@ -1080,10 +1139,14 @@ void buildPresence(uint64_t now)
     rateAccessPoint(now);
     bzero(gE.pres, sizeof(gE.pres));
     if (!ch) return;
-    if (home && home == ch) {
+    const Peer *d = dataPeer(now, home);
+    if (home && home == ch && !d) {
         // The access point is on the AWDL channel: being there costs nothing. At rest the schedule is the Family's
         // sequence; while AWDL is in use, every EAW. The Family keeps its idle sequence during a transfer (3 EAWs in 16
-        // on the channel), peers send only in the EAWs we advertise, and our frames go out only in them.
+        // on the channel), peers send only in the EAWs we advertise, and our frames go out only in them. Not while the
+        // device data goes to or comes from is elsewhere (dataPeer()): with the access point on 36 the Family's low
+        // power sequence has 36 in 6 slots, more than any AWDL channel, and a Pixel that stays on 44 went unheard from
+        // the next EAW on and was dropped 3 s later, before the AirDrop request it had sent was accepted.
         for (uint32_t i = 0; i < 16; i++) gE.pres[i] = (active || !gE.famSet || gE.famCh[i] == ch) ? ch : 0;
         return;
     }
@@ -1094,11 +1157,24 @@ void buildPresence(uint64_t now)
         gE.pres[0] = nsoc ? soc[gE.discoIdx++ % nsoc] : ch;
         return;
     }
-    const Peer *m = gE.role == 2 ? findPeer(gE.master) : nullptr;
+    const Peer *s = d ? nullptr : stayingPeer(now);
+    if (s && mac48(s->addr) != gE.stayPeer)
+        mtk_dbg_log("awdl: schedule on %u, where ..:%02x:%02x stays in every EAW\n", s->ch[0], s->addr[4], s->addr[5]);
+    gE.stayPeer = s ? mac48(s->addr) : 0;
+    const Peer *m = d ? d : s;
+    if (!m && gE.role == 2) m = findPeer(gE.master);
     if (!m && gE.followUs && now - gE.followUs < kPeerStaleUs) m = findPeer(gE.follow);
-    bool synced = m && m->n && now - m->lastUs < kPeerStaleUs;
+    bool synced = d || (m && m->n && now - m->lastUs < kPeerStaleUs);
+    if (d && mac48(d->addr) != gE.ucPeerLogged) {
+        gE.ucPeerLogged = mac48(d->addr);
+        mtk_dbg_log("awdl: schedule on the channels of ..:%02x:%02x, which data last came from or went to\n",
+                    d->addr[4], d->addr[5]);
+    }
     if (synced) {
-        // Synchronized to the master: its present EAWs are ours, its empty ones are our time at home.
+        // The present EAWs of the device data goes to or comes from, otherwise of a device that stays on one channel,
+        // otherwise of the master (or the device followed), are ours, its empty ones are our time at home. The data peer
+        // and the device on one channel come first: a master may be on their channel in one EAW of 16, as an Apple
+        // device was on a Pixel's 44, too little to carry the transfer or to be found there.
         for (uint32_t i = 0; i < 16; i++) {
             uint8_t c = m->ch[i % m->n];
             cand[i] = (usableCh(c) && mtkAwdlRadioChannelAllowed(c)) ? c : 0;
@@ -1117,7 +1193,8 @@ void buildPresence(uint64_t now)
     bool data = gE.ucUs && now - gE.ucUs < kUcHoldUs;
     placeRuns(cand, !data ? kHomeIdle : gE.apClass == kApStream ? kHomeDataApStream :
               gE.apClass == kApData ? kHomeDataApData : kHomeDataApIdle, home);
-    // A master that is on AWDL in none of the idle row's EAWs is met where Apple's radio is off too (kHomeIdleWide).
+    // A master or data peer that is on AWDL in none of the idle row's EAWs is met where Apple's radio is off too
+    // (kHomeIdleWide).
     bool met = false;
     for (uint32_t i = 0; i < 16; i++) met = met || gE.pres[i];
     if (!data && synced && !met) placeRuns(cand, kHomeIdleWide, home);
@@ -1855,7 +1932,10 @@ uint32_t MtkAwdlInterface::submitData(IOSkywalkPacket *const *packets, uint32_t 
             if (rv == 0) {
                 gE.txQueued++;
                 gE.dataUs = mtkAwdlUptimeUs();
-                if (!(e[0] & 1)) gE.ucUs = gE.dataUs;
+                if (!(e[0] & 1)) {
+                    gE.ucUs = gE.dataUs;
+                    noteDataPeer(e);
+                }
             } else {
                 gE.txBad++;
             }
@@ -1915,7 +1995,10 @@ void MtkAwdlInterface::deliverData(const uint8_t *f, uint32_t len, uint8_t part)
     const uint8_t *pl = f + hl;
     uint32_t plen = len - hl;
     gE.dataUs = now;
-    if (!(da[0] & 1)) gE.ucUs = now;
+    if (!(da[0] & 1)) {
+        gE.ucUs = now;
+        noteDataPeer(sa);
+    }
     if (!(qos && (f[24] & 0x80))) {
         deliverMsdu(da, sa, pl, plen);
         return;
