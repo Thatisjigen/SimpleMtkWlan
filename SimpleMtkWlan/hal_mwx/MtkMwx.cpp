@@ -10564,6 +10564,8 @@ struct mwx_awdl {
 	uint32_t		c_rx_close;	/* times the sniffer went off and the station's filter came back */
 	uint32_t		c_roc_ok, c_roc_fail, c_roc_late, c_roc_stray, c_roc_clip, c_cmd, c_cmd_err;
 	uint32_t		c_tx_group, c_tx_uc_ok[2], c_tx_uc_fail[2], c_tx_err, c_tx_stale, c_tx_full;
+	/* group frames and action frames as the TX free event reports them: delivered, failed, transmissions */
+	uint32_t		c_grp_ok, c_grp_fail, c_grp_tries;
 	uint32_t		c_rx_af, c_rx_data, c_rx_long, c_rx_echo, c_rx_other, c_drain;
 	/* by social channel, 6, 44, 149, then any other: windows, AWDL frames heard, other frames heard */
 	uint32_t		c_win_ch[4], c_af_ch[4], c_other_ch[4];
@@ -11614,6 +11616,30 @@ mwx_awdl_tx_agg(struct mwx_softc *sc, struct mwx_awdl_peer *p, int slot, const u
 	return 0;
 }
 
+/*
+ * The group-addressed AWDL frames that go out without waiting for an acknowledgement (MT_TXD3_NO_ACK): bit 0 the
+ * management ones (the PSF and MIF to ff:ff:ff:ff:ff:ff), bit 1 the data ones (mDNS to 33:33:...). mac80211 marks every
+ * frame with a group address 1 IEEE80211_TX_CTL_NO_ACK, and mt76 sets MT_TXD3_NO_ACK from it on this chip (on the
+ * MT7925 the same is MT_TXD3_BCM; bit 4 here is MT_TXD3_DAS). Without it the MAC may wait for an acknowledgement a
+ * group frame never gets and send the frame again, up to its remaining count of 15: on the MT7925 each PSF and MIF
+ * went out about 15 times, holding ALTX0 and the window while unicast waited behind it. mtkawdlnoack=<0-3> boot-arg,
+ * 3 by default; 0 is the behaviour before.
+ */
+static uint8_t
+mwx_awdl_noack_mask(void)
+{
+	static int mask = -1;
+
+	if (mask < 0) {
+		int v = 3;
+
+		if (!PE_parse_boot_argn("mtkawdlnoack", &v, sizeof(v)))
+			v = 3;
+		mask = v & 3;
+	}
+	return (uint8_t)mask;
+}
+
 static int
 mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 {
@@ -11701,7 +11727,10 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 	if (frame[4] & 1)
 		val |= MT_TXD2_MULTICAST;
 	txp->txwi[2] = htole32(val);
-	txp->txwi[3] = htole32(((uint32_t)count << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE);
+	val = ((uint32_t)count << MT_TXD3_REM_TX_COUNT_SHIFT) | MT_TXD3_BA_DISABLE;
+	if ((frame[4] & 1) && (mwx_awdl_noack_mask() & (type == 2 ? 2 : 1)))
+		val |= MT_TXD3_NO_ACK;
+	txp->txwi[3] = htole32(val);
 	txp->txwi[5] = htole32(MT_PACKET_ID_NO_SKB & MT_TXD5_PID);
 	txp->txwi[6] = htole32(MT_TXD6_FIXED_BW | (bw & MT_TXD6_BW) |
 	    ((rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK));
@@ -11747,6 +11776,14 @@ mwx_awdl_tx_done(struct mwx_softc *sc, uint16_t msdu, uint32_t txval)
 	a->txinfo[msdu] = 0;
 	if (a->tx_inflight != 0 && --a->tx_inflight == 0)
 		wakeup(&a->tx_inflight);
+	if ((info & MWX_AWDL_TXI_PEER) == 1) {
+		/* a group frame, or an action frame to one peer: how often the MAC sent it (mwx_awdl_noack_mask()) */
+		if (failed)
+			a->c_grp_fail++;
+		else
+			a->c_grp_ok++;
+		a->c_grp_tries += count;
+	}
 	if ((info & MWX_AWDL_TXI_PEER) >= 2 && (info & MWX_AWDL_TXI_PEER) < 2 + MWX_AWDL_PEERS) {
 		struct mwx_awdl_peer *p = &a->peers[(info & MWX_AWDL_TXI_PEER) - 2];
 		int band = (info & MWX_AWDL_TXI_5GHZ) ? 1 : 0;
@@ -13307,14 +13344,16 @@ mtkAwdlRadioSummary(char *buffer, size_t length)
 	snprintf(buffer, length,
 	    "win=%u onch=%u quiet=%u chain=%u/%u hold=%u/%u roc=%u/%u/%u stray=%u clip=%u lead=%uus late=%u/%llums away=%llums busy=%u share=%u "
 	    "badch=%u gone=%u cmd=%u/%u tx grp=%u uc2=%u/%u uc5=%u/%u err=%u stale=%u full=%u drain=%u "
-	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d silent=%u",
+	    "rx af=%u data=%u uc=%u echo=%u other=%u long=%u omac1=%d cc=%c%c off=%d silent=%u grpst=%u/%u tries=%u "
+	    "noack=%u",
 	    a->c_win, a->c_onch, a->c_quiet, a->c_chain_wait, a->c_chain_miss, a->c_hold, a->c_rx_close, a->c_roc_ok,
 	    a->c_roc_fail, a->c_roc_late,
 	    a->c_roc_stray, a->c_roc_clip, a->lead_us,
 	    a->c_late, a->late_us / 1000, a->off_us / 1000, a->c_busy, a->c_share, a->c_badch, a->c_gone, a->c_cmd,
 	    a->c_cmd_err, a->c_tx_group, a->c_tx_uc_ok[0], a->c_tx_uc_fail[0], a->c_tx_uc_ok[1], a->c_tx_uc_fail[1],
 	    a->c_tx_err, a->c_tx_stale, a->c_tx_full, a->c_drain, a->c_rx_af, a->c_rx_data, a->c_rx_uc, a->c_rx_echo,
-	    a->c_rx_other, a->c_rx_long, a->omac_on, sc->sc_alpha2[0], sc->sc_alpha2[1], a->off, a->c_silent);
+	    a->c_rx_other, a->c_rx_long, a->omac_on, sc->sc_alpha2[0], sc->sc_alpha2[1], a->off, a->c_silent,
+	    a->c_grp_ok, a->c_grp_fail, a->c_grp_tries, mwx_awdl_noack_mask());
 }
 
 /* Windows, AWDL frames and other frames heard, by social channel: a line of its own, the summary is long already. */
