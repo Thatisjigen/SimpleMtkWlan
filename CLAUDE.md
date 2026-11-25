@@ -192,7 +192,8 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - HAL sleeps (`tsleep_nsec`) go through `IOCommandGate::commandSleep` in the
   AIRPORT build: `enable()` runs with the gate held, and the interrupt that
   completes an MCU command needs that gate.
-- No AppleVTD support (needs `DisableIoMapper`), no WPA3-SAE.
+- No AppleVTD support (needs `DisableIoMapper`). WPA3-Personal (SAE) is on by
+  default, `-mtkwpa3off` turns it off; see its section.
 - AWDL (Tahoe only, on unless `-mtkawdloff`, and only when the kernel's
   IO80211 classes match the layouts in `awdl/io80211`): `AirportMtkWlan/awdl/` creates `awdl0` as a subclass
   of `IO80211AWDLProtocol`, answers the AWDL peer manager's configure handshake
@@ -305,14 +306,16 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 
 ## Management frame protection (802.11w)
 
-- Negotiated with access points that advertise it (`IEEE80211_C_MFP`, only with
-  `-mtkpmf`, required with `-mtkpmfreq`). Towards the others the RSN element
+- Negotiated with access points that advertise it (`IEEE80211_C_MFP`, on with
+  WPA3 by default; `-mtkwpa3off` turns both off, `-mtkpmf` then offers it
+  alone; `-mtkpmfreq` requires it). Towards the others the RSN element
   is byte for byte the one sent without it. The capabilities reported to
   macOS do not change: its association code reads 802.11w support from
   capability byte 6 for the RSN element it builds itself, of which the front
-  end takes the group cipher alone. Capabilities 75 and 76 (byte 9) are
-  tested before SAE and before a GCMP group cipher, which the driver does
-  not implement: keep them clear.
+  end takes the group cipher alone. Capability 75 (byte 9, bit 3) is tested
+  before SAE: set unless `-mtkwpa3off`. Capability 76 (byte 9, bit 4) is
+  tested before a GCMP group cipher, which the driver does not implement:
+  keep it clear.
 - The integrity group key stays in software (`mwx_set_key`). Never send it to
   the firmware: a key record with BIP alone replaces the CCMP key of that
   station, and its delete command removes the pairwise key. net80211 verifies
@@ -345,6 +348,29 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   (`reauth=`).
   `tests/security/` runs the production code against references written from
   the standard.
+
+## WPA3-Personal (SAE)
+
+- On by default (`ic_wpa3`), off with `-mtkwpa3off`; it also sets
+  `IEEE80211_C_MFP`. The
+  front end then reports byte 6 bit 0 and capability 75, shows macOS the
+  access point's real AKMs where its RSN Extension element has the
+  hash-to-element bit (`advertisesSAEH2E`), and takes the SAE join airportd
+  sends: authentication type 1 << 12, the password itself (cipher 10, up to
+  63 bytes; the request's key field holds 64), from which
+  `ieee80211_sae_password_to_pt` derives the password token.
+- Hash-to-element only, group 19 (P-256): `net80211/ieee80211_sae.c` (OpenBSD)
+  over BearSSL's `crypto/i31` and `crypto/ec_p256_m31`. The password element
+  comes in `ieee80211_node_join_bss`, the commit and confirm in
+  `ieee80211_get_auth`, the peer's in `ieee80211_auth_sae`; the PMK goes to
+  the 4-way handshake, which uses descriptor version 0 (AES-CMAC MIC, key
+  wrap) and echoes the RSN Extension element in message 2. Message 3 must
+  carry the IGTK and the same RSN Extension element as the beacon.
+- A failed exchange tries another access point of the network before a new
+  scan. Authenticating again while associating (an access point that dropped
+  us) starts the exchange over with a new commit (`ieee80211_sae_restart`).
+- The deepest SAE call chain (shared secret from the receive path) needs
+  about 3 KB of stack, measured with `-fstack-usage`.
 
 ## Testing on hardware
 

@@ -349,6 +349,19 @@ inline bool scanUsesProbes(bool requested, bool activeRequest) {
     return requested ? activeRequest : true;
 }
 
+// True if the elements carry an RSN Extension element (244) with SAE
+// hash-to-element (bit 5). The driver implements hash-to-element only, so macOS
+// sees the SAE AKM of a network only when this holds (and never with -mtkwpa3off).
+inline bool advertisesSAEH2E(const uint8_t *ies, size_t length) {
+    if (!validIEs(ies, length))
+        return false;
+    for (size_t offset = 0; offset < length; offset += size_t(ies[offset + 1]) + 2) {
+        if (ies[offset] == 244 && ies[offset + 1] >= 1 && (ies[offset + 2] & 0x20))
+            return true;
+    }
+    return false;
+}
+
 // Present the supported PSK option of a PSK/SAE transition network to WCL.
 // This operates on the scan-message copy, never the received beacon or the
 // net80211 RSN IE used to validate the four-way handshake. SAE-only, mandatory
@@ -356,6 +369,7 @@ inline bool scanUsesProbes(bool requested, bool activeRequest) {
 inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
     if (!validIEs(ies, length))
         return length;
+    bool converted = false;
     for (size_t offset = 0; offset < length; ) {
         uint8_t *ie = ies + offset;
         size_t size = size_t(ie[1]) + 2;
@@ -392,8 +406,10 @@ inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
                 other = true;
             else if (suite[3] == 2)
                 psk = true;
-            else if (suite[3] == 8)
-                sae = true;
+            else if (suite[3] == 6)
+                continue;      // PSK-SHA256: dropped with SAE, as long as plain PSK is offered too
+            else if (suite[3] == 8 || suite[3] == 24)
+                sae = true;    // SAE, and SAE with the group-dependent hash
             else
                 other = true;
         }
@@ -413,6 +429,23 @@ inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
         ie[1] -= removed;
         length -= removed;
         offset += size - removed;
+        converted = true;
+    }
+    // The RSN Extension element only describes SAE features (hash-to-element,
+    // protected TWT and the like). Once the network is shown as WPA2-PSK,
+    // macOS must not see it either.
+    if (converted) {
+        for (size_t offset = 0; offset + 2 <= length; ) {
+            const size_t size = size_t(ies[offset + 1]) + 2;
+            if (size > length - offset)     // never past the list
+                break;
+            if (ies[offset] == 244) {
+                memmove(ies + offset, ies + offset + size, length - offset - size);
+                length -= size;
+            } else {
+                offset += size;
+            }
+        }
     }
     return length;
 }
@@ -484,7 +517,7 @@ struct JoinRequest {
     uint32_t keyLength;
     uint32_t keyCipher;
     uint16_t keyIndex;
-    uint8_t key[32];
+    uint8_t key[64];        // a PMK (32 bytes) or a passphrase (up to 63)
     uint8_t bssid[6];
     uint16_t channelSpec;
     uint16_t rsnLength;
@@ -508,10 +541,10 @@ inline bool validRSNOverride(const uint8_t *ie, size_t length) {
         ie[4] == 0xf2 && ie[5] == 1 && ie[6] == 1 && ie[7] == 0;
 }
 
-// A WPA passphrase (8-63 printable characters, at most 32 fit the request)
-// instead of the 32-byte PMK that macOS normally derives itself.
+// A WPA passphrase (8-63 printable characters) instead of the 32-byte PMK
+// that macOS normally derives itself.
 inline bool isPassphrase(const JoinRequest &j) {
-    if (j.keyLength < 8 || j.keyLength > 32 ||
+    if (j.keyLength < 8 || j.keyLength > 63 ||
         (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)))
         return false;
     for (uint32_t i = 0; i < j.keyLength; ++i)
@@ -520,12 +553,13 @@ inline bool isPassphrase(const JoinRequest &j) {
     return true;
 }
 
-enum class LegacyAuth { Invalid, Open, Wep, Personal, Enterprise };
+enum class LegacyAuth { Invalid, Open, Wep, Personal, PersonalSAE, Enterprise };
 inline const char *legacyAuthName(LegacyAuth auth) {
     switch (auth) {
         case LegacyAuth::Open: return "open";
         case LegacyAuth::Wep: return "WEP";
         case LegacyAuth::Personal: return "personal";
+        case LegacyAuth::PersonalSAE: return "personal SAE";
         case LegacyAuth::Enterprise: return "enterprise";
         default: return "invalid";
     }
@@ -544,7 +578,18 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     }
     const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10);
     const uint32_t enterprise = (1u << 0) | (1u << 2) | (1u << 11);
-    if (j.upperAuth & ~(personal | enterprise)) return LegacyAuth::Invalid;
+    const uint32_t sae = 1u << 12;
+    if (j.upperAuth & ~(personal | enterprise | sae)) return LegacyAuth::Invalid;
+    // WPA3-Personal comes alone, with the password itself (cipher 10), up to
+    // 63 bytes, and an RSN element override, if any, with a CCMP group cipher.
+    if (j.upperAuth & sae) {
+        if (j.upperAuth != sae || j.keyCipher != 10 || j.keyLength < 1 || j.keyLength > 63)
+            return LegacyAuth::Invalid;
+        if (j.rsnLength >= 8 &&
+            (j.rsn[0] != 48 || j.rsn[4] != 0 || j.rsn[5] != 0x0f || j.rsn[6] != 0xac || j.rsn[7] != 4))
+            return LegacyAuth::Invalid;
+        return LegacyAuth::PersonalSAE;
+    }
     if ((j.upperAuth & personal) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
     if (j.upperAuth & personal)
         return (j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7)) || isPassphrase(j) ?
@@ -563,7 +608,7 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     uint32_t keyLength = read32(p + 0x44);
     uint16_t rsnLength = read16(p + 0xd4);
     if (!count || count > 10 || !ssidLength || ssidLength > 32 ||
-        keyLength > 32 || rsnLength > 257 || length < 0x218 + size_t(count) * 18)
+        keyLength > 64 || rsnLength > 257 || length < 0x218 + size_t(count) * 18)
         return false;
     if (p[0x21c] & 1)
         return false;

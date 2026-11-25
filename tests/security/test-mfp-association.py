@@ -20,7 +20,8 @@ out = (ref.NET / 'ieee80211_output.c').read_text()
 rsn = ref.between(node, '    if (ic->ic_flags & IEEE80211_F_RSNON) {\n        /*\n         * If at least one RSN IE field',
                   '    if (ic->ic_if.if_flags & IFF_DEBUG && ieee80211_debug) {')
 assert 'we require MFP but AP does not support it' in rsn
-code = ('static int match_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)\n{\n    int fail = 0;\n' + rsn +
+code = (ref.extract(node, 'ieee80211_node_allow_wpa3') + '\n' +
+        'static int match_rsn(struct ieee80211com *ic, struct ieee80211_node *ni)\n{\n    int fail = 0;\n' + rsn +
         '    return fail;\n}\n' +
         ref.extract(node, 'ieee80211_choose_rsnparams') + '\n' +
         ref.extract(out, 'ieee80211_add_rsn_body') + '\n' + ref.extract(out, 'ieee80211_add_rsn') + '\n' +
@@ -124,10 +125,27 @@ int main(){
  // And never with 802.11w turned off, whatever the node says.
  ic.ic_caps=0;assert(!protects(IEEE80211_FC0_SUBTYPE_DEAUTH,{3,0})&&!protects(IEEE80211_FC0_SUBTYPE_ACTION,addba));ic.ic_caps=IEEE80211_C_MFP;
 
+ // --- WPA3-Personal (on unless -mtkwpa3off): SAE is chosen from a network that offers it
+ // with hash-to-element, once the password token is there, and its element
+ // names AKM 8 alone and requires 802.11w. Without the token, or without
+ // hash-to-element, a transition network is joined with PSK as before, and an
+ // SAE-only one is not joined.
+ ap.ni_flags=0;
+ auto saeap=[&](bool psk,bool h2e){scanned(IEEE80211_RSNCAP_MFPC);ap.ni_rsnakms=IEEE80211_AKM_SAE|(psk?IEEE80211_AKM_PSK:0);ap.ni_rsnxecaps=h2e?IEEE80211_RSNXECAP_H2E:0;};
+ const Bytes sae=[]{Bytes b={48,0,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,8,0xc0,0,0,0,0,0x0f,0xac,6};b[1]=b.size()-2;return b;}();
+ ic.ic_wpa3=1;ic.ic_sae_pt_valid=1;ic.ic_rsnakms=IEEE80211_AKM_PSK|IEEE80211_AKM_SAE;
+ saeap(true,true);assert(joins()&&mfp()&&ap.ni_rsnakms==IEEE80211_AKM_SAE&&rsnie()==sae);
+ saeap(false,true);assert(joins()&&mfp()&&ap.ni_rsnakms==IEEE80211_AKM_SAE&&rsnie()==sae);
+ saeap(true,false);assert(joins()&&mfp()&&ap.ni_rsnakms==IEEE80211_AKM_PSK&&rsnie()==with_mfp);
+ saeap(false,false);assert(!joins());
+ ic.ic_sae_pt_valid=0;saeap(true,true);assert(joins()&&mfp()&&ap.ni_rsnakms==IEEE80211_AKM_PSK);saeap(false,true);assert(!joins());
+ ic.ic_wpa3=0;ic.ic_sae_pt_valid=1;saeap(true,true);assert(joins()&&mfp()&&ap.ni_rsnakms==IEEE80211_AKM_PSK);
+ ic.ic_sae_pt_valid=0;ic.ic_rsnakms=IEEE80211_AKM_PSK;ap.ni_rsnxecaps=0;
+
  // SA Query frames carry the transaction they are told, two octets.
  {mbuf_t m=ieee80211_get_sa_query(&ic,&ap,IEEE80211_ACTION_SA_QUERY_RESP,0x1234);assert(m&&flat(m)==(Bytes{8,1,0x34,0x12}));mbuf_freem(m);}
  assert(live==0);
- puts("PASS production 802.11w negotiation and transmit: element unchanged towards access points without it, MFPC and BIP cipher towards capable ones (with and without PMKID), off and required policies in the join decision, CCMP and BIP-CMAC-128 needed, no stale choice; Protected bit only for robust frames to the access point once its keys are installed");
+ puts("PASS production 802.11w negotiation and transmit: element unchanged towards access points without it, MFPC and BIP cipher towards capable ones (with and without PMKID), off and required policies in the join decision, CCMP and BIP-CMAC-128 needed, no stale choice; SAE chosen with WPA3 on, a password token and hash-to-element, AKM 8 alone with MFPR, PSK otherwise; Protected bit only for robust frames to the access point once its keys are installed");
 }
 '''
 ref.run('mfp-association', ref.MBUF + ref.net80211() + stubs + code + main)

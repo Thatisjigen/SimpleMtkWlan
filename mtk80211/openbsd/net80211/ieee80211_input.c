@@ -2481,6 +2481,11 @@ ieee80211_recv_auth(struct ieee80211com *ic, mbuf_t m,
     DPRINTF(("auth %d seq %d from %s\n", algo, seq,
              ether_sprintf((u_int8_t *)wh->i_addr2)));
     
+    if (algo == IEEE80211_AUTH_ALG_SAE) {
+        ieee80211_auth_sae(ic, wh, frm, mbuf_len(m) - sizeof(*wh) - 6,
+            ni, rxi, seq, status);
+        return;
+    }
     /* only "open" auth mode is supported */
     if (algo != IEEE80211_AUTH_ALG_OPEN) {
         DPRINTF(("unsupported auth algorithm %d from %s\n",

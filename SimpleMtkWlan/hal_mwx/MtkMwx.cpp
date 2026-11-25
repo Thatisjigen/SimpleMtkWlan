@@ -3551,13 +3551,18 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	 * pairwise key in hardware, like data (MT_TXD3_PROTECT_FRAME on
 	 * transmit, mwx_rx_hwdec_restore() on receive); the group-addressed
 	 * ones the access point sends are verified in software (BIP, see
-	 * mwx_set_key()). Off by default: -mtkpmf offers it, -mtkpmfreq also
-	 * refuses access points that do not support it.
+	 * mwx_set_key()). WPA3-Personal (SAE), on by default, needs it, so it is
+	 * offered with it; -mtkwpa3off turns both off, and then -mtkpmf offers
+	 * 802.11w alone. -mtkpmfreq also refuses access points that do not
+	 * support it.
 	 */
 	{
 		int flag = 0;
 
-		if (PE_parse_boot_argn("-mtkpmf", &flag, sizeof(flag)) ||
+		ic->ic_wpa3 = !PE_parse_boot_argn("-mtkwpa3off", &flag,
+		    sizeof(flag));
+		if (ic->ic_wpa3 ||
+		    PE_parse_boot_argn("-mtkpmf", &flag, sizeof(flag)) ||
 		    PE_parse_boot_argn("-mtkpmfreq", &flag, sizeof(flag))) {
 			ic->ic_caps |= IEEE80211_C_MFP;
 			if (PE_parse_boot_argn("-mtkpmfreq", &flag,
@@ -3565,9 +3570,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 				ic->ic_flags |= IEEE80211_F_MFPR;
 		}
 		MWX_DEV_LOG(sc,
-		    "management frame protection offered=%d required=%d\n",
+		    "management frame protection offered=%d required=%d wpa3=%d\n",
 		    !!(ic->ic_caps & IEEE80211_C_MFP),
-		    !!(ic->ic_flags & IEEE80211_F_MFPR));
+		    !!(ic->ic_flags & IEEE80211_F_MFPR), ic->ic_wpa3);
 	}
 
 	/*

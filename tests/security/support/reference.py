@@ -309,7 +309,8 @@ NET80211 = r'''
 enum ieee80211_opmode {IEEE80211_M_STA=1,IEEE80211_M_HOSTAP=6,IEEE80211_M_MONITOR=8};
 enum ieee80211_state {IEEE80211_S_INIT=0,IEEE80211_S_SCAN=1,IEEE80211_S_AUTH=2,IEEE80211_S_ASSOC=3,IEEE80211_S_RUN=4};
 enum ieee80211_cipher {IEEE80211_CIPHER_NONE=0,IEEE80211_CIPHER_USEGROUP=1,IEEE80211_CIPHER_WEP40=2,IEEE80211_CIPHER_TKIP=4,IEEE80211_CIPHER_CCMP=8,IEEE80211_CIPHER_WEP104=0x10,IEEE80211_CIPHER_BIP=0x20};
-enum ieee80211_akm {IEEE80211_AKM_NONE=0,IEEE80211_AKM_8021X=1,IEEE80211_AKM_PSK=2,IEEE80211_AKM_SHA256_8021X=4,IEEE80211_AKM_SHA256_PSK=8};
+enum ieee80211_akm {IEEE80211_AKM_NONE=0,IEEE80211_AKM_8021X=1,IEEE80211_AKM_PSK=2,IEEE80211_AKM_SHA256_8021X=4,IEEE80211_AKM_SHA256_PSK=8,IEEE80211_AKM_SAE=0x10};
+#define IEEE80211_RSNXECAP_H2E 0x0020
 '''
 
 NET80211_STRUCTS = r'''
@@ -322,7 +323,7 @@ struct ieee80211_stats {u_int32_t is_ccmp_replays=0,is_tkip_replays=0,is_cmac_re
 struct ieee80211com;
 struct ieee80211_node {u_int8_t ni_macaddr[6]={},ni_bssid[6]={},ni_pmkid[16]={};u_int32_t ni_flags=0;u_int16_t ni_rsncaps=0;
  u_int ni_rsnprotos=0,ni_rsnakms=0,ni_rsnciphers=0;enum ieee80211_cipher ni_rsncipher=IEEE80211_CIPHER_NONE,ni_rsngroupcipher=IEEE80211_CIPHER_NONE,
- ni_rsngroupmgmtcipher=IEEE80211_CIPHER_NONE;ieee80211_key ni_pairwise_key={};int ni_inact=0;u_int16_t ni_txseq=0;ieee80211com*ni_ic=nullptr;void*ni_chan=nullptr;};
+ ni_rsngroupmgmtcipher=IEEE80211_CIPHER_NONE;u_int8_t ni_rsnxecaps=0;ieee80211_key ni_pairwise_key={};int ni_inact=0;u_int16_t ni_txseq=0;ieee80211com*ni_ic=nullptr;void*ni_chan=nullptr;};
 struct CTimeout;
 struct _ifnet {const char*if_xname="mtk0";int if_flags=0,if_timer=0;void(*if_start)(_ifnet*)=nullptr;};
 struct mbuf_queue {std::vector<mbuf_t> q;};
@@ -332,7 +333,7 @@ struct ieee80211com {_ifnet ic_if;enum ieee80211_opmode ic_opmode=IEEE80211_M_ST
  ieee80211_key ic_nw_keys[IEEE80211_GROUP_NKID]={};int ic_def_txkey=0,ic_igtk_kid=0;ieee80211_stats ic_stats;u_int16_t ic_deauth_reason=0;
  enum ieee80211_cipher ic_rsngroupmgmtcipher=IEEE80211_CIPHER_BIP;
  CTimeout*ic_sa_query_to=nullptr;u_int16_t ic_sa_query_trid=0;u_int8_t ic_sa_query_state=0,ic_sa_query_count=0;void*ic_softc=nullptr;
- CTimeout*ic_assoc_comeback_to=nullptr;u_int8_t ic_assoc_comeback=0,ic_assoc_comebacks=0,ic_assoc_reauths=0;int ic_mgt_timer=0;
+ CTimeout*ic_assoc_comeback_to=nullptr;u_int8_t ic_assoc_comeback=0,ic_assoc_comebacks=0,ic_assoc_reauths=0;int ic_mgt_timer=0,ic_wpa3=0,ic_sae_pt_valid=0;
  void(*ic_event_handler)(ieee80211com*,int,void*)=nullptr;int(*ic_set_key)(ieee80211com*,ieee80211_node*,ieee80211_key*)=nullptr;
  void(*ic_delete_key)(ieee80211com*,ieee80211_node*,ieee80211_key*)=nullptr;int(*ic_send_mgmt)(ieee80211com*,ieee80211_node*,int,int,int)=nullptr;};
 '''

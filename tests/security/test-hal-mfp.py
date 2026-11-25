@@ -18,10 +18,14 @@ hal = (ref.ROOT / 'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
 front = (ref.ROOT / 'AirportMtkWlan/AirportItlwmV2.cpp').read_text()
 attach = ref.between(hal, '\t/*\n\t * Management frame protection (802.11w), negotiated with the access',
                      '\t/*\n\t * 802.11n. 20/40 MHz must be advertised')
-# macOS is told nothing new. Capabilities 75 and 76 (byte 9) are not about
-# 802.11w: macOS tests them before SAE and GCMP, which the driver does not have
+# macOS is told nothing new for 802.11w. Only WPA3 (ic_wpa3, off with -mtkwpa3off) sets the bit of
+# byte 6 and capability 75 (byte 9, bit 3) that macOS wants before an SAE join;
+# capability 76 (byte 9, bit 4) gates GCMP, which the driver does not have.
 wcl = ref.between(front, '#ifdef AIRPORT_WCL\n    // WPA2 can use TKIP for group traffic', '#else\n')
-assert 'capabilities[17]' in wcl and 'capabilities[9]' not in wcl
+gate = wcl.index('if (fHalService->get80211Controller()->ic_wpa3) {')
+sae = wcl[gate:wcl.index('}', gate)]
+assert 'capabilities[17]' in wcl and wcl.count('capabilities[9]') == 1 and wcl.count('capabilities[6]') == 1
+assert 'cd->capabilities[9] |= 0x08;' in sae and 'cd->capabilities[6] |= 0x01;' in sae and '0x10' not in sae
 code = (ref.extract(hal, 'mwx_set_key') + '\n' + ref.extract(hal, 'mwx_delete_key') + '\n' +
         ref.extract(hal, 'mwx_setkey_task') + '\n' + ref.extract(hal, 'mwx_mgmt_prot_leave') + '\n' +
         'static void pmf_attach(struct mwx_softc *sc, struct ieee80211com *ic)\n{\n' + attach + '}\n')
@@ -107,10 +111,12 @@ int main(){
  ni.ni_flags=0;mwx_mgmt_prot_leave(&sc,-1);assert(mgmt.empty()&&starts==1&&delays==1&&ni.ni_flags==0);
  ic->ic_bss=nullptr;mwx_mgmt_prot_leave(&sc,-1);ic->ic_bss=&ni;
 
- // --- Boot-args: off by default, -mtkpmf offered, -mtkpmfreq required.
- auto boot=[&](const char*args){bootargs=args;ic->ic_caps=0;ic->ic_flags=IEEE80211_F_RSNON;pmf_attach(&sc,ic);return (ic->ic_caps&IEEE80211_C_MFP?1:0)|(ic->ic_flags&IEEE80211_F_MFPR?2:0);};
- assert(boot("")==0&&boot("-mtkhe debug=0x100")==0&&ic->ic_flags==IEEE80211_F_RSNON);
- assert(boot("-mtkpmf")==1&&boot("-v -mtkpmf -mtkhe")==1&&boot("-mtkpmfreq")==3&&boot("-v -mtkpmfreq -mtkhe")==3&&boot("-mtkpmf -mtkpmfreq")==3);
+ // --- Boot-args: WPA3 and with it 802.11w on by default, -mtkwpa3off turns
+ // both off, -mtkpmf then offers 802.11w alone, -mtkpmfreq requires it.
+ auto boot=[&](const char*args){bootargs=args;ic->ic_caps=0;ic->ic_flags=IEEE80211_F_RSNON;ic->ic_wpa3=0;pmf_attach(&sc,ic);return (ic->ic_caps&IEEE80211_C_MFP?1:0)|(ic->ic_flags&IEEE80211_F_MFPR?2:0)|(ic->ic_wpa3?4:0);};
+ assert(boot("")==5&&boot("-mtkhe debug=0x100")==5&&boot("-mtkpmf")==5&&boot("-mtkpmfreq")==7&&ic->ic_flags==(IEEE80211_F_RSNON|IEEE80211_F_MFPR));
+ assert(boot("-mtkwpa3off")==0&&boot("-v -mtkwpa3off -mtkhe")==0&&ic->ic_flags==IEEE80211_F_RSNON);
+ assert(boot("-mtkwpa3off -mtkpmf")==1&&boot("-mtkwpa3off -mtkpmfreq")==3&&boot("-mtkpmf -mtkpmfreq -mtkwpa3off")==3);
  puts("PASS production HAL 802.11w: IGTK in software only (set, reject, delete, transition guard), pairwise/group keys through the firmware task with data and management packet numbers restarted, protected Deauthentication before leaving a protected BSS and only then, boot-args, SAE and GCMP capabilities towards macOS left clear");
 }
 '''

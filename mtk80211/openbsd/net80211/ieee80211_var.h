@@ -560,7 +560,7 @@ struct ieee80211com {
 	 * WPA3-Personal (SAE) state.  The password token (PT) is derived once
 	 * from password + SSID, the password element (PWE) once per peer, and
 	 * both are cached because each derivation is expensive.  ic_wpa3 is
-	 * 0 unless the -itlwmwpa3 boot argument enabled SAE.
+	 * 1 unless the -mtkwpa3off boot argument turned SAE off.
 	 */
 	u_int8_t		ic_sae_pt[IEEE80211_SAE_MAX_ECC_PRIME_LEN * 2];
 	u_int8_t		ic_sae_pwe[IEEE80211_SAE_MAX_ECC_PRIME_LEN * 2];

@@ -55,8 +55,8 @@ hardware layer:
 | Native macOS Wi-Fi menu (IO80211Family / Skywalk), Tahoe | ✅ `AirportMtkWlan` |
 | Native Wi-Fi menu, Sequoia 15.2+ | ⚠️ builds, not tested on hardware with this HAL |
 | 802.11ax (HE, MT7920 and MT7922) | ✅ on by default (`-mtknohe` turns it off) |
-| Management frame protection (802.11w / PMF) with WPA2 | ⚠️ new, off by default (`-mtkpmf` turns it on) |
-| WPA3-only (SAE) networks | ❌ |
+| Management frame protection (802.11w / PMF) with WPA2 | ⚠️ new, on by default with WPA3 (`-mtkwpa3off` turns both off) |
+| WPA3-Personal (SAE, hash-to-element) networks | ⚠️ new, on by default (`-mtkwpa3off` turns it off) |
 | Sleep / wake (firmware reloaded on wake, reconnects by itself) | ✅ |
 | AirDrop / Handoff / Continuity (AWDL) | ❌ |
 
@@ -139,10 +139,12 @@ Optional boot-args:
 * `-mtkallowaspm` — keep PCIe ASPM (L0s, L1) and the L1 substates on; by
   default attach turns them off on the card and the port above it, as Linux
   mt76 does.
-* `-mtkpmf` — negotiate management frame protection (802.11w) with the
-  access points that offer it. Without it a forged deauthentication frame
-  disconnects the station.
-* `-mtkpmfreq` — require it: access points without 802.11w are not joined.
+* `-mtkwpa3off` — no WPA3-Personal (SAE), and no management frame
+  protection (802.11w) either, which is on by default because SAE requires it.
+  Without 802.11w a forged deauthentication frame disconnects the station.
+* `-mtkpmf` — with `-mtkwpa3off`, negotiate 802.11w alone with the access
+  points that offer it.
+* `-mtkpmfreq` — require 802.11w: access points without it are not joined.
 * `-mtkno160`, `-mtknopool`, `-mtknowtblba`, `-novht`, `-noht40` — targeted
   diagnostic fallbacks.
 
