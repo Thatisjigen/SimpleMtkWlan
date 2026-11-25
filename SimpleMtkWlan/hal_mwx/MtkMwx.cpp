@@ -10566,6 +10566,7 @@ struct mwx_awdl {
 	uint32_t		baq_head, baq_count;
 	uint32_t		c_sta_add, c_sta_del, c_sta_fail, c_sta_busy, c_baq_full, c_split;
 	uint32_t		c_ba_heard, c_ba_skip, c_mgmt_other;	/* for the log's first lines */
+	uint32_t		c_ba_htc;	/* Block Ack actions heard with an HT Control field (mwx_awdl_rx_tap()) */
 	uint32_t		c_vht_ok, c_vht_fail, c_vht20, c_amsdu, c_amsdu_sub;
 	uint32_t		c_rxba_ok, c_rxba_no, c_rxba_del;
 	uint32_t		c_txba_ask, c_txba_ok, c_txba_no, c_txba_late, c_txba_del, c_txba_drop;
@@ -13028,16 +13029,29 @@ mwx_awdl_rx_tap(struct mwx_softc *sc, struct mbuf *m, const struct ieee80211_rxi
 		    rssi < 0 && rssi > -128 ? rssi : 0, mtkAwdlUptimeUs(), h[0] == 0xd0 ? kMtkAwdlWhole : part);
 		return true;
 	}
-	/* A Block Ack action frame a peer sent to awdl0, for the radio thread, which answers it (mwx_awdl_ba_frame()) */
-	if (!a->ba_off && n >= 25 && h[0] == (IEEE80211_FC0_TYPE_MGT | IEEE80211_FC0_SUBTYPE_ACTION) &&
-	    h[24] == IEEE80211_CATEG_BA && memcmp(h + 16, mwx_awdl_bssid, 6) == 0 && memcmp(h + 4, a->addr, 6) == 0) {
+	/*
+	 * A Block Ack action frame a peer sent to awdl0, for the radio thread, which answers it (mwx_awdl_ba_frame()). With
+	 * the Order bit set a 4-byte HT Control field follows the sequence control and moves the category from byte 24 to
+	 * 28: the queued copy leaves the field out and clears the bit, so it reads as the plain frame (wh0ami7/ForbiddenItlwm
+	 * c65f795, a peer that answers at an HE rate with +HTC). htc= in the Block Ack line counts them.
+	 */
+	bool htc = n >= 30 && (h[1] & IEEE80211_FC1_ORDER) && h[28] == IEEE80211_CATEG_BA && h[29] <= 2;
+	bool plain = n >= 25 && !(h[1] & IEEE80211_FC1_ORDER) && h[24] == IEEE80211_CATEG_BA;
+	if (!a->ba_off && h[0] == (IEEE80211_FC0_TYPE_MGT | IEEE80211_FC0_SUBTYPE_ACTION) && (plain || htc) &&
+	    memcmp(h + 16, mwx_awdl_bssid, 6) == 0 && memcmp(h + 4, a->addr, 6) == 0) {
 		if (!a->armed)
 			return true;
 		if (a->baq_count < MWX_AWDL_BAQ) {
 			struct mwx_awdl_baq *q = &a->baq[(a->baq_head + a->baq_count) % MWX_AWDL_BAQ];
+			size_t skip = htc ? 4 : 0;
 
-			q->len = (uint8_t)(len < sizeof(q->frame) ? len : sizeof(q->frame));
-			if (mbuf_copydata(m, 0, q->len, q->frame) == 0) {
+			q->len = (uint8_t)(len - skip < sizeof(q->frame) ? len - skip : sizeof(q->frame));
+			if (mbuf_copydata(m, 0, 24, q->frame) == 0 &&
+			    mbuf_copydata(m, 24 + skip, q->len - 24, q->frame + 24) == 0) {
+				if (htc) {
+					q->frame[1] &= ~IEEE80211_FC1_ORDER;
+					a->c_ba_htc++;
+				}
 				q->ch = (uint8_t)(rxi->rxi_chan ? rxi->rxi_chan : a->rx_ch);
 				a->baq_count++;
 				if (a->timer != NULL && !a->dying)
@@ -13463,11 +13477,12 @@ mtkAwdlRadioBlockAck(char *buffer, size_t length)
 		return;
 	}
 	n = (size_t)snprintf(buffer, length,
-	    "ba off=%d bss=%d%s sta=%u/%u/%u/%u rx=%u/%u/%u tx=%u/%u/%u/%u/%u/%u frames=%u/%u hold=%u split=%u qfull=%u",
+	    "ba off=%d bss=%d%s sta=%u/%u/%u/%u rx=%u/%u/%u tx=%u/%u/%u/%u/%u/%u frames=%u/%u hold=%u split=%u qfull=%u "
+	    "htc=%u",
 	    a->ba_off, a->bss_on, a->bss_failed ? "!" : "", a->c_sta_add, a->c_sta_del, a->c_sta_fail, a->c_sta_busy,
 	    a->c_rxba_ok,
 	    a->c_rxba_no, a->c_rxba_del, a->c_txba_ask, a->c_txba_ok, a->c_txba_no, a->c_txba_late, a->c_txba_del,
-	    a->c_txba_drop, a->c_ba_ok, a->c_ba_fail, a->c_ba_hold, a->c_split, a->c_baq_full);
+	    a->c_txba_drop, a->c_ba_ok, a->c_ba_fail, a->c_ba_hold, a->c_split, a->c_baq_full, a->c_ba_htc);
 	for (i = 0; i < MWX_AWDL_PEERS && n < length; i++) {
 		const struct mwx_awdl_peer *p = &a->peers[i];
 

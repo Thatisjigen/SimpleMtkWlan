@@ -223,7 +223,9 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   the MAC aggregates it. Away from the station's channel, or when the first
   aggregated frames do not come back, frames take the single-frame path on
   ALTX0. `-mtkawdlnoba` leaves all of it out; `awdl: radio ba` and
-  `awdl: rx qos` in the log count it. Group-addressed AWDL frames (PSF and MIF
+  `awdl: rx qos` in the log count it. A Block Ack action with the Order bit
+  set carries an HT Control field before its category; the tap leaves the
+  field out (`htc=` counts those frames). Group-addressed AWDL frames (PSF and MIF
   broadcast, mDNS multicast) go out with `MT_TXD3_NO_ACK`, as mt76 sets it for
   every frame mac80211 sends to a group address 1 (on the MT7925 it is
   `MT_TXD3_BCM`; bit 4 here is `MT_TXD3_DAS`): `mtkawdlnoack=<0-3>` picks the
