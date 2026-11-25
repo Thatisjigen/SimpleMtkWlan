@@ -172,7 +172,9 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   Our key, BA and HT/VHT code paths are shared with SimpleMtkWlan.
 - airportd asks for short scans of a few channels; `mt7921_mcu_hw_scan`
   honours `ic_wcl_scan_*` (channels, SSID, active). In RUN such restricted
-  scans are allowed every 10 s, full sweeps every 120 s (`mwx_bgscan`).
+  scans are allowed every 10 s per band, full sweeps every 120 s
+  (`mwx_bgscan`): airportd asks for 2.4 GHz and then at once for 5 GHz, and
+  with one count for both bands the 5 GHz half was always refused as busy.
   Background scans pass a dwell time of 0, the firmware's own, as Linux mt76
   does; scans without an association dwell 120 ms per channel. macOS's
   passive scans (type 2, auto-join) probe with the wildcard SSID too when

@@ -630,6 +630,7 @@ struct mwx_softc {
 	}			sc_mcu_wait[16];
 	uint8_t			sc_scan_seq_num;
 	uint64_t		sc_last_bgscan_ns;
+	uint64_t		sc_last_bgscan_band_ns[2];	/* 2.4 and 5 GHz */
 
 	/* phy / hw */
 	struct mwx_hw_capa	sc_capa;
@@ -2164,18 +2165,35 @@ mwx_bgscan(struct ieee80211com *ic)
 	 * refresh its network list, which halved throughput. Allow at most
 	 * one background scan per 2 minutes while in RUN.
 	 */
+	unsigned bands = 3;	/* a full sweep covers 2.4 and 5 GHz */
+
 	if (ic->ic_state == IEEE80211_S_RUN) {
 		uint64_t min_ns = 120ULL * 1000000000ULL;
 
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
 #ifdef AIRPORT_WCL
 		/*
 		 * macOS asks for a few channels at a time (well under a second
-		 * off channel); only full sweeps get the 2 minute limit.
+		 * off channel); only full sweeps get the 2 minute limit. It asks
+		 * for one band after the other, 5 GHz as soon as the 2.4 GHz
+		 * answer came, so the 10 s between two such scans count per
+		 * band: counted over both, the 5 GHz half was always refused as
+		 * busy, and macOS showed no 5 GHz network while associated.
 		 */
-		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted)
+		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
 			min_ns = 10ULL * 1000000000ULL;
+			bands = AirportWCL::scanBands(ic->ic_wcl_scan_channels,
+			    true, [ic](unsigned ch) {
+				return ch <= IEEE80211_CHAN_MAX &&
+				    ic->ic_channels[ch].ic_flags != 0;
+			    });
+			for (unsigned b = 0; b < 2; b++)
+				if ((bands & (1u << b)) &&
+				    sc->sc_last_bgscan_band_ns[b] != 0 &&
+				    now_ns - sc->sc_last_bgscan_band_ns[b] < min_ns)
+					return EBUSY;
+		} else
 #endif
-		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
 		if (sc->sc_last_bgscan_ns != 0 &&
 		    now_ns - sc->sc_last_bgscan_ns < min_ns)
 			return EBUSY;
@@ -2188,8 +2206,12 @@ mwx_bgscan(struct ieee80211com *ic)
 	}
 
 	/* Failed submissions must remain immediately retryable, per adapter. */
-	if (now_ns != 0)
+	if (now_ns != 0) {
 		sc->sc_last_bgscan_ns = now_ns;
+		for (unsigned b = 0; b < 2; b++)
+			if (bands & (1u << b))
+				sc->sc_last_bgscan_band_ns[b] = now_ns;
+	}
 	sc->sc_flags |= MWX_FLAG_BGSCAN;
 	return 0;
 }

@@ -467,6 +467,17 @@ inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsign
     return !restricted || (channel < 256 && (channels[channel / 8] & (1U << (channel % 8))));
 }
 
+// The bands a scan covers, bit 0 for 2.4 GHz and bit 1 for 5 GHz: those of the
+// channels it selects that the card has.
+template <typename Enabled>
+inline unsigned scanBands(const uint8_t *channels, bool restricted, Enabled enabled) {
+    unsigned bands = 0;
+    for (unsigned channel = 1; channel < 256; ++channel)
+        if (scanChannelSelected(channels, restricted, channel) && enabled(channel))
+            bands |= channel <= 14 ? 1u : 2u;
+    return bands;
+}
+
 // A channel a station may probe on in every regulatory domain: 2.4 GHz 1 to 11
 // and 5 GHz 36 to 48. The others (12 and 13, the DFS channels, 149 and up) depend
 // on the country or need radar detection.
