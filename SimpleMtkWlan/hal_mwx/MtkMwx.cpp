@@ -2045,7 +2045,15 @@ mwx_newstate_task(void *ptr)
 			sc->sc_sta_added = 1;
 		break;
 	case IEEE80211_S_ASSOC:
-		mwx_mcu_set_deep_sleep(sc, 1);
+		/*
+		 * Keep full power, as AUTH left it and RUN wants it: the
+		 * association response is due now. With deep sleep allowed
+		 * here, the answer to the first association request never
+		 * reached us on 5 GHz, although the access point went on with
+		 * the 4-way handshake, and the request went out again a second
+		 * later; an access point that negotiated 802.11w refuses that
+		 * second request.
+		 */
 		break;
 	case IEEE80211_S_RUN:
 		if (ic->ic_opmode == IEEE80211_M_MONITOR)

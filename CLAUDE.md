@@ -125,7 +125,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
 - Advertise HT `CBW20_40` in the HT caps even when running VHT80: APs only
   transmit 80 MHz to clients that claim 40 MHz support.
 - net80211 sends AUTH/ASSOC_REQ once and waits 5 s; `debugPoll()` retransmits
-  them up to 3 times. A lost association response is common on 2.4 GHz.
+  them up to 3 times. The chip stays at full power from AUTH to RUN: with
+  deep sleep allowed in ASSOC, the first association response was lost at
+  every 5 GHz join, and an access point that negotiated 802.11w refuses the
+  request sent again.
 - Scan completions that arrive in RUN without `F_BGSCAN` are stale and must
   be ignored (they caused re-joins). Prefer 5 GHz within 15 RSSI points.
 - BAR frames are not delivered by the firmware (`bar_rx=0` in the `ba` debug
