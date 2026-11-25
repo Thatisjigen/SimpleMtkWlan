@@ -1098,6 +1098,36 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
 #ifdef MTK_AWDL
 static_assert(APPLE80211_VIF_AWDL == 6, "wifip2pd asks for the AWDL interface with role 6");
 
+/*
+ * HT_CAPABILITY (ioctl 154): version, then the HT Capabilities element with its header. The AWDL peer manager builds
+ * the data rate TLV of its frames from it (IO80211PeerManager::getHtCapabilityIE) and, refused, leaves it out
+ * ("Invalid _htCapabilityLength 0"); peers then send to awdl0 at legacy rates only (thanhnndev, mt7925-macos-wifi
+ * 45ac9bf). These are the capabilities the driver gives net80211, the ones an access point gets in our association
+ * request. With AWDL off (mtkAwdlEnabled()) the ioctl stays unsupported, as before.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+getHT_CAPABILITY(apple80211_ht_capability *hc)
+{
+    static_assert(sizeof(struct apple80211_ht_capability) == 4 + 28, "version and the 28-byte element");
+    if (hc == NULL)
+        return kIOReturnBadArgument;
+    if (!mtkAwdlEnabled())
+        return kIOReturnUnsupported;
+    struct ieee80211com *ic = fHalService->get80211Controller();
+    bzero(hc, sizeof(*hc));
+    hc->version = APPLE80211_VERSION;
+    hc->hc_id = IEEE80211_ELEMID_HTCAPS;
+    hc->hc_len = 26;
+    hc->hc_cap = htole16(ic->ic_htcaps);
+    hc->hc_param = ic->ic_ampdu_params;
+    memcpy(hc->hc_mcsset, ic->ic_sup_mcs, sizeof(ic->ic_sup_mcs) < 10 ? sizeof(ic->ic_sup_mcs) : 10);
+    hc->hc_mcsset[12] = 0x01;   /* TX MCS set defined, equal to the RX set */
+    hc->hc_extcap = htole16(ic->ic_htxcaps);
+    hc->hc_txbf = htole32(ic->ic_txbfcaps);
+    hc->hc_antenna = ic->ic_aselcaps;
+    return kIOReturnSuccess;
+}
+
 IOReturn AirportItlwmSkywalkInterface::
 setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
 {

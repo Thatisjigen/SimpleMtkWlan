@@ -64,17 +64,15 @@ extern "C" void mtk_dbg_log(const char *fmt, ...)
  * The log holds raw kernel state (object pointers, interface addresses) that is
  * only useful while debugging an attach failure. Publishing it as an IORegistry
  * property makes it world-readable (any user, "ioreg -l"), which defeats KASLR,
- * so it is published only when asked for with the -mtkdbglog boot argument, or
- * with -mtkawdl: AWDL is still experimental and switched on by hand, and its test
- * needs this log, so one argument does both.
+ * so it is published only when asked for with the -mtkdbglog boot argument. AWDL
+ * is on without an argument; a test that reads its counters asks for the log too.
  */
 static bool mtkDbgPublishAllowed()
 {
     static int allowed = -1;
     if (allowed < 0) {
         char flag[16];
-        allowed = (PE_parse_boot_argn("-mtkdbglog", flag, sizeof(flag)) ||
-                   PE_parse_boot_argn("-mtkawdl", flag, sizeof(flag))) ? 1 : 0;
+        allowed = PE_parse_boot_argn("-mtkdbglog", flag, sizeof(flag)) ? 1 : 0;
     }
     return allowed > 0;
 }
