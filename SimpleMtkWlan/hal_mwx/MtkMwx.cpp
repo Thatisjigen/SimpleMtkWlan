@@ -10327,8 +10327,9 @@ MtkMwx::debugPoll()
  *    that mt76_connac_mcu_uni_add_dev sends for a second interface;
  *  - sending: the normal TX path with the 802.11 header kept (mt76_connac2_mac_write_txwi), on ALTX0, the
  *    queue mt76 uses for frames sent outside the station's schedule, at a fixed OFDM rate on either band, or at
- *    VHT for unicast data on the station's channel when the link is 80 MHz wide (mwx_awdl_vht_rates), there with
- *    the frames queued for one peer gathered into A-MSDUs (mwx_awdl_amsdu());
+ *    VHT for unicast data in a 5 GHz window: at 80 MHz on the station's channel when the link is that wide
+ *    (mwx_awdl_vht_rates), at 20 MHz in the others (mwx_awdl_vht20_rates), with the frames queued for one peer
+ *    gathered into A-MSDUs (mwx_awdl_amsdu());
  *  - the regulatory country: the access point's Country element, as cfg80211 hands it to
  *    mt7921_regd_notifier. With the world domain the firmware sends on the access point's own 5 GHz channel
  *    only (thanhnndev, mt7925-macos-wifi af60e21).
@@ -10396,6 +10397,8 @@ MtkMwx::debugPoll()
 #define MWX_AWDL_TXI_VHT	0x20	/* in txinfo[]: sent at a VHT rate */
 #define MWX_AWDL_TXI_AGG	0x40	/* in txinfo[]: a frame of the aggregated path */
 #define MWX_AWDL_TXI_5GHZ	0x80	/* in txinfo[]: sent on 5 GHz */
+#define MWX_AWDL_VHT20		1	/* win_vht: a 5 GHz window away from an 80 MHz link, VHT at 20 MHz */
+#define MWX_AWDL_VHT80		2	/* win_vht: on the station's channel while the link is 80 MHz wide */
 #define MWX_AWDL_VHT_HOLD_MS	2000	/* after VHT failed down to 54 Mb/s, before it is tried again */
 #define MWX_AWDL_VHT_SLOW	5	/* transmissions of one frame beyond which its VHT step goes down */
 #define MWX_AWDL_AMSDU_MAX	3839	/* an A-MSDU we send: the largest every HT receiver takes */
@@ -10417,7 +10420,8 @@ static const uint16_t mwx_awdl_ht_rates[] = {
  * entry, 0 = not in use), entered from 54 Mb/s as the OFDM ladder goes up. A frame that fails, or needs more than
  * MWX_AWDL_VHT_SLOW transmissions, takes its step down one, and the first one back to 54 Mb/s for MWX_AWDL_VHT_HOLD_MS;
  * a frame that needs a few only keeps the ladder from climbing. An A-MSDU of two frames at these rates, sent again
- * a few times, still takes less air than one frame at 54 Mb/s. In any other window a frame keeps its OFDM rate.
+ * a few times, still takes less air than one frame at 54 Mb/s. In the other 5 GHz windows the same steps go at 20 MHz
+ * (mwx_awdl_vht20_rates); on 2.4 GHz a frame keeps its OFDM rate.
  */
 static const uint16_t mwx_awdl_vht_rates[] = {
 	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 4,
@@ -10425,6 +10429,21 @@ static const uint16_t mwx_awdl_vht_rates[] = {
 	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | (1 << MT_TX_RATE_NSS_SHIFT) | 7,
 	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | (1 << MT_TX_RATE_NSS_SHIFT) | 9,
 };
+
+/*
+ * The ladder's steps at 20 MHz, for unicast data in a 5 GHz window away from an 80 MHz link: the remain-on-channel
+ * period is 20 MHz wide, and a peer that listens there at a larger width still hears its primary channel.
+ * Dino-VN/MtkWireless (1fa74dc9) sends VHT at 20 MHz in its 20 MHz remain-on-channel periods, two streams MCS 7 and 8;
+ * its 80 MHz periods were granted but heard nothing. One stream MCS 4 and 7, then two streams MCS 7 and 8, long GI:
+ * MCS 9 is not defined at 20 MHz for one or two streams. mtkawdlvht20=0 keeps OFDM there.
+ */
+static const uint16_t mwx_awdl_vht20_rates[] = {
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 4,
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | 7,
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | (1 << MT_TX_RATE_NSS_SHIFT) | 7,
+	(MT_PHY_TYPE_VHT << MT_TX_RATE_MODE_SHIFT) | (1 << MT_TX_RATE_NSS_SHIFT) | 8,
+};
+static_assert(sizeof(mwx_awdl_vht20_rates) == sizeof(mwx_awdl_vht_rates), "one ladder, two widths");
 
 static const uint8_t mwx_awdl_bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
 
@@ -10540,14 +10559,14 @@ struct mwx_awdl {
 	bool			bss_on;		/* AWDL's BSS and its group record are in the firmware */
 	bool			bss_failed;	/* refused: no records until the firmware starts again */
 	bool			win_onch;	/* the window in progress is on the station's channel */
-	bool			win_vht;	/* ... and that is 80 MHz wide: unicast data may go at VHT rates */
+	uint8_t			win_vht;	/* unicast data may go at VHT rates: MWX_AWDL_VHT20 or MWX_AWDL_VHT80, 0 not */
 	uint8_t			sta_used;	/* bit per station record slot */
 	uint16_t		mgmt_sn;
 	struct mwx_awdl_baq	baq[MWX_AWDL_BAQ];	/* main work loop adds, radio thread takes; both gated */
 	uint32_t		baq_head, baq_count;
 	uint32_t		c_sta_add, c_sta_del, c_sta_fail, c_sta_busy, c_baq_full, c_split;
 	uint32_t		c_ba_heard, c_ba_skip, c_mgmt_other;	/* for the log's first lines */
-	uint32_t		c_vht_ok, c_vht_fail, c_amsdu, c_amsdu_sub;
+	uint32_t		c_vht_ok, c_vht_fail, c_vht20, c_amsdu, c_amsdu_sub;
 	uint32_t		c_rxba_ok, c_rxba_no, c_rxba_del;
 	uint32_t		c_txba_ask, c_txba_ok, c_txba_no, c_txba_late, c_txba_del, c_txba_drop;
 	uint32_t		c_ba_ok, c_ba_fail, c_ba_hold;
@@ -11521,8 +11540,9 @@ mwx_awdl_delba(struct mwx_awdl *a, const struct mwx_awdl_peer *p, uint8_t tid, b
  * One frame on the air, as mt7921_mac_write_txwi() and mt7921_mac_write_txwi_80211() above describe a
  * management frame, with these differences: the queue is ALTX0; the rate is a fixed OFDM one whatever the
  * station's band (the station's basic rate is CCK on 2.4 GHz, which a 5 GHz window cannot send): 6 Mb/s for
- * action and group frames, and for unicast data the rate the peer's acknowledgements allow, VHT at 80 MHz included
- * where the link is that wide (mwx_awdl_vht_rates); the frame comes from OMAC 1 once that carries awdl0's address,
+ * action and group frames, and for unicast data the rate the peer's acknowledgements allow, VHT included: at 80 MHz
+ * where the link is that wide (mwx_awdl_vht_rates), at 20 MHz in the other 5 GHz windows (mwx_awdl_vht20_rates);
+ * the frame comes from OMAC 1 once that carries awdl0's address,
  * so that the MAC matches the peer's acknowledgement.
  */
 /*
@@ -11642,6 +11662,22 @@ mwx_awdl_noack_mask(void)
 	return (uint8_t)mask;
 }
 
+/* VHT at 20 MHz in the 5 GHz windows away from an 80 MHz link (mwx_awdl_vht20_rates); mtkawdlvht20=0 turns it off. */
+static bool
+mwx_awdl_vht20_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		int v = 1;
+
+		if (!PE_parse_boot_argn("mtkawdlvht20", &v, sizeof(v)))
+			v = 1;
+		on = v != 0;
+	}
+	return on != 0;
+}
+
 static int
 mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 {
@@ -11681,8 +11717,10 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 				a->c_ba_hold++;		/* the agreement's first frames are not back yet */
 			}
 			ridx = p->rate;
-			if (p->vht != 0 && a->win_vht)
+			if (p->vht != 0 && a->win_vht == MWX_AWDL_VHT80)
 				vht = mwx_awdl_vht_rates[p->vht - 1];
+			else if (p->vht != 0 && a->win_vht == MWX_AWDL_VHT20)
+				vht = mwx_awdl_vht20_rates[p->vht - 1];
 			info = (uint8_t)(2 + slot);
 			count = 8;
 		}
@@ -11709,7 +11747,10 @@ mwx_awdl_tx(struct mwx_softc *sc, const uint8_t *frame, size_t len)
 	omac = a->omac_on ? 1 : sc->sc_vif.omac_idx;
 	if (vht != 0) {
 		rate = vht;
-		bw = CMD_CBW_80MHZ;
+		if (a->win_vht == MWX_AWDL_VHT80)
+			bw = CMD_CBW_80MHZ;
+		else
+			a->c_vht20++;
 		info |= MWX_AWDL_TXI_VHT;
 	} else {
 		rate = mt76_rates[ridx].hw_value;
@@ -11851,7 +11892,7 @@ mwx_awdl_tx_done(struct mwx_softc *sc, uint16_t msdu, uint32_t txval)
 				if (p->rate < MWX_AWDL_RATE_MAX)
 					p->rate++;
 				else if (p->vht == 0 && mtkAwdlUptimeUs() >= p->vht_hold_us)
-					p->vht = 1;	/* VHT from the next window on the station's channel */
+					p->vht = 1;	/* VHT from the next window that allows it */
 				p->good = 0;
 			}
 		} else {
@@ -12578,9 +12619,15 @@ mwx_awdl_window(struct mwx_softc *sc, const MtkAwdlWindow *w)
 	a->rx_open = true;
 	a->c_win++;
 	a->c_win_ch[mwx_awdl_bucket(w->channel)]++;
-	/* Aggregated frames only where the radio stays: see mwx_awdl_tx_agg(). VHT at the link's 80 MHz there. */
+	/* Aggregated frames only where the radio stays: see mwx_awdl_tx_agg(). VHT at the link's 80 MHz there, at 20 MHz
+	 * in the other 5 GHz windows. */
 	a->win_onch = onch && !a->ba_off;
-	a->win_vht = onch && bw == CMD_CBW_80MHZ;
+	if (onch && bw == CMD_CBW_80MHZ)
+		a->win_vht = MWX_AWDL_VHT80;
+	else if (w->channel > 14 && mwx_awdl_vht20_on())
+		a->win_vht = MWX_AWDL_VHT20;
+	else
+		a->win_vht = 0;
 	agg = false;
 	for (i = 0; a->win_onch && i < MWX_AWDL_PEERS; i++)
 		agg |= a->peers[i].tx_state == MWX_AWDL_TXBA_ON;
@@ -13429,8 +13476,8 @@ mtkAwdlRadioBlockAck(char *buffer, size_t length)
 			    p->tx_state, p->ba_rate, p->rate, p->vht);
 	}
 	if (n < length)
-		n += (size_t)snprintf(buffer + n, length - n, " vht=%u/%u amsdu=%u/%u", a->c_vht_ok, a->c_vht_fail,
-		    a->c_amsdu, a->c_amsdu_sub);
+		n += (size_t)snprintf(buffer + n, length - n, " vht=%u/%u vht20=%u%s amsdu=%u/%u", a->c_vht_ok,
+		    a->c_vht_fail, a->c_vht20, mwx_awdl_vht20_on() ? "" : "(off)", a->c_amsdu, a->c_amsdu_sub);
 	if (n < length)
 		n += (size_t)snprintf(buffer + n, length - n, " agg");
 	for (i = 0; i < 16 && n < length; i++) {

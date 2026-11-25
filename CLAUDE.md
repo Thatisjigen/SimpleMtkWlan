@@ -200,8 +200,10 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   BSS, which carries AWDL's BSSID) and, for an associated station, leaves them
   open between windows while the timeline runs, sends on ALTX0 from OMAC 1, which holds
   awdl0's address (unicast
-  data from 6 to 54 Mb/s, and on the station's channel at 80 MHz on up to VHT80
-  two streams MCS 9, there as A-MSDUs of up to 3839 bytes), and touches nothing
+  data from 6 to 54 Mb/s, then on 5 GHz at VHT as A-MSDUs of up to 3839 bytes:
+  on the station's channel at 80 MHz up to VHT80 two streams MCS 9, in the
+  other windows at 20 MHz up to two streams MCS 8, `mtkawdlvht20=0` keeping
+  OFDM there; `vht=` and `vht20=` in `awdl: radio ba`), and touches nothing
   until awdl0 starts it. The interface keeps the AWDL timeline,
   posts the availability window events, builds the synchronization and master
   indication frames, hands received action frames to the Family's peer manager
