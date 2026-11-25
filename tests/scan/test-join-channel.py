@@ -33,6 +33,7 @@ pre = r'''
 #include <cstring>
 #include <cstdio>
 #include <cerrno>
+#include <initializer_list>
 #include "WCL.hpp"
 #define AIRPORT_WCL 1
 #define __packed __attribute__((packed))
@@ -151,6 +152,42 @@ int main()
        captured.channels[0].channel_num == 36 && captured.channels[1].channel_num == 149 &&
        captured.channel_dwell_time == 120, "macOS scan unchanged");
 
+ // A passive scan of macOS (auto-join) probes with the wildcard SSID when every
+ // channel it covers allows probing: 1 to 11 and 36 to 48.
+ auto passive = [&](std::initializer_list<unsigned> channels) {
+  card(sc);
+  sc.sc_ic.ic_wcl_scan_requested = true;
+  sc.sc_ic.ic_wcl_scan_restricted = true;
+  for (unsigned ch : channels)
+   sc.sc_ic.ic_wcl_scan_channels[ch / 8] |= 1u << (ch % 8);
+  check(mt7921_mcu_hw_scan(&sc, 0) == 0 && count() == channels.size() &&
+        captured.channel_dwell_time == 120, "passive scan channels");
+  return captured.scan_type;
+ };
+ check(passive({11, 44}) == 1 && captured.probe_req_num == 2 && captured.ssid_type == 1 &&
+       captured.ssids_num == 0, "passive scan of safe channels probes, wildcard");
+ check(passive({1, 6, 36, 40, 48}) == 1, "passive scan of safe channels probes");
+ // One DFS channel, 12 or 13, or 149 and up keep the whole scan passive.
+ check(passive({44, 52}) == 0 && passive({11, 13}) == 0 && passive({36, 149}) == 0 &&
+       passive({100}) == 0, "passive scan with other channels stays passive");
+ // So does a passive scan of every channel.
+ card(sc);
+ sc.sc_ic.ic_wcl_scan_requested = true;
+ check(mt7921_mcu_hw_scan(&sc, 0) == 0 && count() == 41 && captured.scan_type == 0,
+       "passive full scan stays passive");
+ // A channel the card does not have does not count.
+ card(sc);
+ sc.sc_ic.ic_channels[52] = {0, 0};
+ sc.sc_ic.ic_wcl_scan_requested = true;
+ sc.sc_ic.ic_wcl_scan_restricted = true;
+ sc.sc_ic.ic_wcl_scan_channels[44 / 8] |= 1u << (44 % 8);
+ sc.sc_ic.ic_wcl_scan_channels[52 / 8] |= 1u << (52 % 8);
+ check(mt7921_mcu_hw_scan(&sc, 0) == 0 && count() == 1 && captured.scan_type == 1,
+       "missing channel ignored");
+ for (unsigned ch = 0; ch < 256; ++ch)
+  check(AirportWCL::probeAllowed(ch) == ((ch >= 1 && ch <= 11) || ch == 36 || ch == 40 || ch == 44 || ch == 48),
+        "probe channels");
+
  // Chanspecs: 20 MHz as this driver reports them; anything else sweeps.
  struct { uint16_t spec; unsigned channel; } specs[] = {
   {0xd038, 56}, {0xd024, 36}, {0xd0c4, 196}, {0x1001, 1}, {0x100b, 11}, {0x100e, 14},
@@ -159,7 +196,7 @@ int main()
  for (auto &s : specs)
   check(AirportWCL::joinChannel(s.spec) == s.channel, "chanspec decoding");
 
- printf("PASS join scan on the named channel, used once, sweep fallback, other scans unchanged, chanspecs\n");
+ printf("PASS join scan on the named channel, used once, sweep fallback, other scans unchanged, macOS passive scans probe on 1-11 and 36-48 only, chanspecs\n");
 }
 '''
 

@@ -6720,9 +6720,16 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	 * with its SSID (hidden networks), on its channels. Scans the driver
 	 * starts itself stay passive over every channel, as with SimpleMtkWlan.
 	 * Like Linux mt76: probing with no SSID is the wildcard (ssid_type 1).
+	 * A passive one probes as well when every channel it covers allows it
+	 * (AirportWCL::passiveScanMayProbe), so that the access points answer
+	 * at once instead of a beacon the dwell may miss.
 	 */
 	if (ic->ic_wcl_scan_requested &&
-	    AirportWCL::scanUsesProbes(true, ic->ic_wcl_scan_active)) {
+	    AirportWCL::scanUsesProbes(true, ic->ic_wcl_scan_active ||
+	    AirportWCL::passiveScanMayProbe(ic->ic_wcl_scan_channels,
+	    ic->ic_wcl_scan_restricted, [ic](unsigned ch) {
+		return ch <= IEEE80211_CHAN_MAX && ic->ic_channels[ch].ic_flags != 0;
+	    }))) {
 		req->scan_type = 1;
 		req->probe_req_num = 2;
 		if (ic->ic_wcl_scan_ssid_length > 0 &&
@@ -6839,12 +6846,13 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 #endif
 
 	MWX_DEV_LOG(sc,
-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x join_channel=%u\n",
+	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x join_channel=%u active=%u\n",
 	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
 	    req->ext_channels_num, le16toh(req->timeout_value),
 	    le16toh(req->channel_dwell_time),
 	    le16toh(req->channel_min_dwell_time),
-	    le32toh(req->scan_func), req->ssid_type, join_channel);
+	    le32toh(req->scan_func), req->ssid_type, join_channel,
+	    req->scan_type);
 
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
 	if (rv != 0)

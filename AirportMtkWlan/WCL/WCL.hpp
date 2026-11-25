@@ -467,6 +467,34 @@ inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsign
     return !restricted || (channel < 256 && (channels[channel / 8] & (1U << (channel % 8))));
 }
 
+// A channel a station may probe on in every regulatory domain: 2.4 GHz 1 to 11
+// and 5 GHz 36 to 48. The others (12 and 13, the DFS channels, 149 and up) depend
+// on the country or need radar detection.
+inline bool probeAllowed(unsigned channel) {
+    return (channel >= 1 && channel <= 11) || (channel >= 36 && channel <= 48 && channel % 4 == 0);
+}
+
+// macOS's auto-join scans ask for no probes (type 2): a passive dwell on each
+// channel, and a scan of a few channels can miss the access point's beacon. Such a
+// scan may still probe, with the wildcard SSID, when it is restricted to channels
+// and every enabled one of them allows probing: one firmware request has one scan
+// type, and the firmware is told no channel flags, so it would probe a DFS channel
+// as well.
+template <typename Enabled>
+inline bool passiveScanMayProbe(const uint8_t *channels, bool restricted, Enabled enabled) {
+    if (!restricted)
+        return false;
+    bool any = false;
+    for (unsigned channel = 1; channel < 256; ++channel) {
+        if (!scanChannelSelected(channels, true, channel) || !enabled(channel))
+            continue;
+        if (!probeAllowed(channel))
+            return false;
+        any = true;
+    }
+    return any;
+}
+
 // The channel a join request names, when its chanspec is one this driver
 // puts in scan results: 20 MHz, channel | 0x1000 on 2.4 GHz and
 // channel | 0xd000 on 5 GHz. Anything else gives 0: scan every channel.

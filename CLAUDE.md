@@ -174,7 +174,12 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   honours `ic_wcl_scan_*` (channels, SSID, active). In RUN such restricted
   scans are allowed every 10 s, full sweeps every 120 s (`mwx_bgscan`).
   Background scans pass a dwell time of 0, the firmware's own, as Linux mt76
-  does; scans without an association dwell 120 ms per channel.
+  does; scans without an association dwell 120 ms per channel. macOS's
+  passive scans (type 2, auto-join) probe with the wildcard SSID too when
+  every channel they cover is 1 to 11 or 36 to 48
+  (`AirportWCL::passiveScanMayProbe`): the firmware is told no DFS flags
+  (`mt7921_mcu_set_channel_domain`) and one request has one scan type.
+  `active=` in the `scan request` line of the log says which it was.
   Outside RUN net80211 does not sweep on its own (`ic_wcl_scan_idle`), and
   `mwx_init` brings the interface up idle in the scan state: a sweep of its
   own made the first scan or join after power on, wake or a private address
