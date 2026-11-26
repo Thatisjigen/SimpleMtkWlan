@@ -10000,10 +10000,31 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 }
 
 /*
- * System sleep. The M.2 card is powered off in S3, so the firmware, the
- * DMA ring registers and the MSI state are gone on wake. Leave the network
- * (deauth while the radio still works), mask interrupts and ignore the
- * hardware until resume().
+ * Park a stopped chip the way Linux mt7921_pci_suspend() leaves a card that
+ * keeps power: the MAC's PCIe interrupts masked, the DMA off and the chip
+ * handed back to its firmware, which can then let it idle. No MCU command
+ * waits for an answer from here on: none would come.
+ */
+static void
+mwx_park(struct mwx_softc *sc, const char *who)
+{
+	sc->sc_mcu_mute = 1;
+	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
+	if (mwx_mcu_drv_pmctrl(sc) != 0)
+		MWX_DEV_LOG(sc, "%s: driver own failed\n", who);
+	if (mwx_dma_disable(sc, 0) != 0)
+		MWX_DEV_LOG(sc, "%s: DMA still busy\n", who);
+	if (mwx_mcu_fw_pmctrl(sc) != 0)
+		MWX_DEV_LOG(sc, "%s: firmware own failed\n", who);
+}
+
+/*
+ * System sleep. Leave the network (deauth while the radio still works),
+ * mask interrupts, park the chip and ignore the hardware until resume().
+ * In S3 the M.2 card loses power, so the firmware, the DMA ring registers
+ * and the MSI state are gone on wake anyway. In an S0 sleep it keeps power
+ * and the system may put it in D3: parked, the chip can idle there, as on
+ * Linux, and its link can go down to L1.2.
  */
 void
 MtkMwx::suspend()
@@ -10023,6 +10044,11 @@ MtkMwx::suspend()
 		mwx_stop(ifp);
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
 	sc->sc_suspended = 1;
+	if (sc->sc_memh == 0)
+		return;
+	mwx_park(sc, "suspend");
+	MWX_DEV_LOG(sc, "suspend: chip parked lpctl=0x%08x\n",
+	    mwx_read(sc, MT_CONN_ON_LPCTL));
 }
 
 /*
@@ -10042,7 +10068,7 @@ MtkMwx::resume(bool up)
 
 	if (sc == NULL || !sc->sc_suspended)
 		return;
-	sc->sc_mcu_mute = 0;	/* the card lost power: a new firmware will answer */
+	sc->sc_mcu_mute = 0;	/* parked at suspend: the reloaded firmware will answer */
 	MWX_DEV_LOG(sc, "resume lpctl=0x%08x\n", mwx_read(sc, MT_CONN_ON_LPCTL));
 	if (mwx_mcu_fw_pmctrl(sc) != 0 || mwx_mcu_drv_pmctrl(sc) != 0) {
 		MWX_DEV_LOG(sc, "resume: driver own failed, trying WFSYS reset\n");
@@ -10077,12 +10103,13 @@ MtkMwx::resume(bool up)
  * an M.2 card, so whatever boots next, this driver included, finds the
  * chip as it is left here.
  *
- * Leave it the way Linux mt7921_pci_suspend() leaves a card that keeps
- * power: interface stopped, interrupts masked, DMA off, the chip handed
- * back to its firmware. Bus mastering goes off too, so the card cannot
- * write to memory at all. The firmware keeps running; the next attach
- * takes the chip back and resets it. Once the interface is stopped no MCU
- * command is sent: nothing may wait for the firmware from there on.
+ * Leave it as a system sleep does, the way Linux mt7921_pci_suspend()
+ * leaves a card that keeps power: interface stopped, interrupts masked, DMA
+ * off, the chip handed back to its firmware (suspend(), mwx_park()). Bus
+ * mastering goes off too, so the card cannot write to memory at all. The
+ * firmware keeps running; the next attach takes the chip back and resets
+ * it. Once the interface is stopped no MCU command is sent: nothing may
+ * wait for the firmware from there on.
  */
 void
 MtkMwx::shutdown()
@@ -10093,18 +10120,10 @@ MtkMwx::shutdown()
 	if (sc == NULL || sc->sc_memh == 0 || sc->sc_suspended)
 		return;
 	MWX_DEV_LOG(sc, "shutdown lpctl=0x%08x\n", mwx_read(sc, MT_CONN_ON_LPCTL));
-	/* As before a system sleep: leave the network, mask the interrupts. */
+	/* As before a system sleep: leave the network, mask the interrupts, park. */
 	suspend();
 	if (!sc->sc_suspended)
 		return;		/* a teardown already owns the card */
-	sc->sc_mcu_mute = 1;	/* a late command must not wait for an answer */
-	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
-	if (mwx_mcu_drv_pmctrl(sc) != 0)
-		MWX_DEV_LOG(sc, "shutdown: driver own failed\n");
-	if (mwx_dma_disable(sc, 0) != 0)
-		MWX_DEV_LOG(sc, "shutdown: DMA still busy\n");
-	if (mwx_mcu_fw_pmctrl(sc) != 0)
-		MWX_DEV_LOG(sc, "shutdown: firmware own failed\n");
 	if (pci != NULL && pci->pa_tag != NULL)
 		pci->pa_tag->setBusMasterEnable(false);
 	sc->sc_fw_loaded = 0;

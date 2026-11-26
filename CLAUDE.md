@@ -145,8 +145,8 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   register that changed; `-mtkallowaspm` keeps the system firmware's setting.
 - Restart / power off: `AirportItlwm::systemWillShutdown()` takes the
   interface down like a system sleep, then `MtkMwx::shutdown()` parks the chip
-  (interrupts masked, DMA off, firmware own, bus mastering off). No MCU
-  command after the interface stop.
+  through `suspend()` and turns bus mastering off. No MCU command after the
+  interface stop.
 - TX: data uses the LMAC queue of its AC (`mt7921_mac_write_txwi`), management
   stays on VO. No `MT_TXD5_TX_STATUS_HOST`; TXWIs are released only by the TX
   free event. `mwx_start` sets oactive when `mwx_tx_has_room` fails and
@@ -156,9 +156,15 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   and keep the AP's answer in `ba_params`; the HAL then sets
   `MT_TXD7_HW_AMSDU` and STA_REC_BA `amsdu`, with `STA_REC_HW_AMSDU` in the
   peer record. `-mtknoamsdu` disables it.
-- Sleep/wake: the card loses power in S3. Front ends call
-  `MtkHalService::suspend()` / `resume()` from their power state handlers;
-  resume does driver own (WFSYS reset fallback — needed in practice) and
+- Sleep/wake: the card loses power in S3; in an S0 sleep it keeps it and the
+  system may put it in D3. Front ends call
+  `MtkHalService::suspend()` / `resume()` from their power state handlers.
+  suspend leaves the network and parks the chip as Linux
+  `mt7921_pci_suspend()` does before D3 (`mwx_park`: interrupts masked, DMA
+  off, firmware own; no MCU command waits from then on), so that it can idle
+  and its link reach L1.2 (`suspend: chip parked lpctl=` in the log, bit 2
+  set when the firmware owns it). resume does driver own (WFSYS reset
+  fallback — needed in practice) and
   reloads the firmware through the hard reset task. While `sc_suspended`,
   `mwx_intr` and `debugPoll` must not touch the hardware. AirportItlwm takes
   its interface down for the sleep; `resume(true)` marks it up again when it
