@@ -5703,20 +5703,24 @@ mwx_pci_flr(struct mwx_softc *sc, IOPCIDevice *dev)
 }
 
 /*
- * PCIe link power states, turned off as Linux mt76 does at probe
- * (mt76_pci_disable_aspm() in mt76/pci.c): read the ASPM control of the card
- * and of the port above it, stop if both ends are already off, and otherwise
- * clear the card before its upstream port. The L1 PM Substates enables go
- * too, as with Linux's pci_disable_link_state(): L1.1 and L1.2 are only
- * entered through L1, so L1 is turned off first and the substates after it,
- * each at the downstream end before the upstream one, in the order Linux
- * uses. Every register that changes is logged with the value read back.
- * -mtkallowaspm leaves the link as the firmware set it.
+ * PCIe link power states of the awake card, turned off as Linux mt76 does at
+ * probe (mt76_pci_disable_aspm() in mt76/pci.c): read the ASPM control of
+ * the card and of the port above it, stop if both ends are already off, and
+ * otherwise clear the card before its upstream port. The ASPM L1.1 and L1.2
+ * enables go too, as with Linux's pci_disable_link_state(): they are only
+ * entered through ASPM L1, so L1 is turned off first and the substates after
+ * it, each at the downstream end before the upstream one, in the order Linux
+ * uses. The PCI-PM L1.1 and L1.2 enables stay as the system firmware set
+ * them: the link enters PCI-PM L1 only while the card is in D3, so they
+ * change nothing for the awake card, and they let the link of a card put in
+ * D3 for an S0 sleep go down to L1.2. Every register that changes is logged
+ * with the value read back. -mtkallowaspm leaves the link as the system
+ * firmware set it.
  */
 #define	MWX_PCIE_LNKCTL			0x10		/* in the PCIe capability */
 #define	MWX_PCIE_LNKCTL_ASPM		0x0003		/* ASPM Control: L0s, L1 */
 #define	MWX_PCIE_L1SS_CTL1		0x08		/* in the L1 PM Substates capability */
-#define	MWX_PCIE_L1SS_CTL1_EN		0x0000000f	/* PCI-PM and ASPM L1.2, L1.1 */
+#define	MWX_PCIE_L1SS_CTL1_ASPM		0x0000000c	/* ASPM L1.1, L1.2 (PCI-PM: 0x3) */
 
 struct mwx_link_end {
 	IOPCIDevice	*dev;
@@ -5752,10 +5756,10 @@ mwx_link_end_l1ss_off(struct mwx_softc *sc, const struct mwx_link_end *end)
 {
 	IOByteCount reg = end->l1ss + MWX_PCIE_L1SS_CTL1;
 
-	if (end->dev == NULL || !(end->l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_EN))
+	if (end->dev == NULL || !(end->l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_ASPM))
 		return;
 	end->dev->extendedConfigWrite32(reg,
-	    end->l1ss_ctl1 & ~MWX_PCIE_L1SS_CTL1_EN);
+	    end->l1ss_ctl1 & ~MWX_PCIE_L1SS_CTL1_ASPM);
 	MWX_DEV_LOG(sc, "aspm(%s): L1SS CTL1 0x%08x -> 0x%08x\n", end->name,
 	    end->l1ss_ctl1, end->dev->extendedConfigRead32(reg));
 }
@@ -5789,9 +5793,9 @@ mwx_pci_disable_aspm(struct mwx_softc *sc, IOPCIDevice *dev)
 	mwx_link_end_read(&card, dev, "ep");
 	mwx_link_end_read(&port, up, "parent");
 	if (!(card.lnkctl & MWX_PCIE_LNKCTL_ASPM) &&
-	    !(card.l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_EN) &&
+	    !(card.l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_ASPM) &&
 	    !(port.lnkctl & MWX_PCIE_LNKCTL_ASPM) &&
-	    !(port.l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_EN))
+	    !(port.l1ss_ctl1 & MWX_PCIE_L1SS_CTL1_ASPM))
 		return;		/* already off at both ends */
 	mwx_link_end_aspm_off(sc, &card);
 	mwx_link_end_aspm_off(sc, &port);

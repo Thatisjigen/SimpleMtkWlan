@@ -137,10 +137,12 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   PCIe FLR. When the patch semaphore answers `PATCH_IS_DL` the ROM patch is
   skipped and only the WM firmware is loaded, as in Linux.
 - PCIe link power: `mwx_pci_disable_aspm()` clears ASPM L0s/L1 and then the
-  L1.1/L1.2 enables at attach, the card before its upstream port, as Linux
-  does at probe (`mt76_pci_disable_aspm`, `pci_disable_link_state`). The
-  `aspm(ep)` and `aspm(parent)` log lines show each register that changed;
-  `-mtkallowaspm` keeps the firmware's setting.
+  ASPM L1.1/L1.2 enables at attach, the card before its upstream port, as
+  Linux does at probe (`mt76_pci_disable_aspm`, `pci_disable_link_state`).
+  The PCI-PM L1.1/L1.2 enables stay as the system firmware set them: PCI-PM
+  L1 only happens with the card in D3, where they let the link reach L1.2
+  during an S0 sleep. The `aspm(ep)` and `aspm(parent)` log lines show each
+  register that changed; `-mtkallowaspm` keeps the system firmware's setting.
 - Restart / power off: `AirportItlwm::systemWillShutdown()` takes the
   interface down like a system sleep, then `MtkMwx::shutdown()` parks the chip
   (interrupts masked, DMA off, firmware own, bus mastering off). No MCU
