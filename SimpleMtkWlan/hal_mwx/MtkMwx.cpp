@@ -1883,6 +1883,49 @@ mwx_scan(struct mwx_softc *sc)
 	return 0;
 }
 
+#ifdef AIRPORT_WCL
+/*
+ * Leaving a network with nothing asked for and nothing scanning: the front
+ * end's leaveWCLNetwork(), when macOS disconnects, goes to sleep or picks
+ * another network. macOS asks for every scan and every join itself.
+ */
+static bool
+mwx_leave_unasked(struct mwx_softc *sc, enum ieee80211_state ostate)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	return ostate > IEEE80211_S_SCAN && !ic->ic_wcl_scan_requested &&
+	    !ic->ic_wcl_join_requested &&
+	    !(sc->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) &&
+	    !(ic->ic_flags & IEEE80211_F_BGSCAN);
+}
+
+/*
+ * Enter the scan state without a hardware scan and wait there for macOS's
+ * next request, as mwx_init() does and as ieee80211_end_scan() leaves it
+ * when nothing was asked for: beginWCLScan() and startWCLJoin() start the
+ * next hardware scan through ieee80211_next_scan(). mwx_scan() swept all
+ * 41 channels on such a leave, about 5 s: a join macOS asked for right
+ * after waited for it, and before a system sleep the radio was still
+ * scanning when the chip was parked.
+ */
+static void
+mwx_scan_idle(struct mwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ifnet *ifp = &ic->ic_if;
+
+	if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) != IFM_AUTO)
+		ieee80211_setmode(ic, IEEE80211_MODE_AUTO);
+	ieee80211_reset_scan(ifp);
+	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
+	ieee80211_node_cleanup(ic, ic->ic_bss);
+	ic->ic_state = IEEE80211_S_SCAN;
+	ic->ic_wcl_scan_idle = true;
+	MWX_DEV_LOG(sc, "leave: scan state idle until macOS asks\n");
+}
+#endif
+
 int
 mwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 {
@@ -2046,6 +2089,12 @@ mwx_newstate_task(void *ptr)
 	case IEEE80211_S_INIT:
 		break;
 	case IEEE80211_S_SCAN:
+#ifdef AIRPORT_WCL
+		if (mwx_leave_unasked(sc, ostate)) {
+			mwx_scan_idle(sc);
+			break;
+		}
+#endif
 		rv = mwx_scan(sc);
 		if (rv)
 			break;

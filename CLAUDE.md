@@ -193,7 +193,11 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   Outside RUN net80211 does not sweep on its own (`ic_wcl_scan_idle`), and
   `mwx_init` brings the interface up idle in the scan state: a sweep of its
   own made the first scan or join after power on, wake or a private address
-  change wait 5.6 s for it.
+  change wait 5.6 s for it. Leaving a network with nothing asked for and
+  nothing scanning (`mwx_leave_unasked`) enters the same idle state
+  (`mwx_scan_idle`, `leave: scan state idle until macOS asks` in the log):
+  the sweep it used to start made the next join wait for it and was still
+  running when a system sleep parked the chip.
 - A join (`startWCLJoin`) first listens 220 ms on the channel of the
   request's chanspec only (`ic_wcl_join_channel`, spent by the first
   non-background scan); if the BSS is not heard there, net80211 sweeps every
