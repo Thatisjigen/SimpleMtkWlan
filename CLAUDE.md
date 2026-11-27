@@ -202,6 +202,12 @@ stubs (new fields, structs or helper calls) rather than weakening its asserts.
   request's chanspec only (`ic_wcl_join_channel`, spent by the first
   non-background scan); if the BSS is not heard there, net80211 sweeps every
   channel. Before, every join swept 41 channels (5.6 s) first.
+- Link quality to WCL: the beacon path counts the associated BSS's beacons
+  and, every 8, checks the link quality; on Tahoe it posts the LqmUpdate
+  with the beacon counts at most every 5 s (`lqmBeaconUpdateDue`). The family
+  answers each one with `APPLE80211_M_RSSI_CHANGED`, which airportd and
+  symptomsd handle: every 8 beacons that was more than one a second.
+  WCLNetManager leaves the network after 60 s without beacons in an update.
 - `mwx_init` adopts the MAC address macOS sets (private Wi-Fi address) and
   registers the firmware vif with it, otherwise DHCP replies are filtered.
 - `IO80211InterfaceRole` must read `Infrastructure` or airportd ignores the

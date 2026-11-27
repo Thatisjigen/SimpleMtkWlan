@@ -594,6 +594,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     joinPending = true;
     assocNotified = firstBeaconNotified = portAuthorized = false;
     wclAssociatedBeacons = 0;
+    wclLqmReportedAt = 0;
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
@@ -677,6 +678,7 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     joinTimer->cancelTimeout();
     ic->ic_wcl_join_requested = false;
     wclAssociatedBeacons = 0;
+    wclLqmReportedAt = 0;
     wclBssValid = false;
     disassocIsVoluntary = true;
     ic->ic_deauth_reason = IEEE80211_REASON_AUTH_LEAVE;
@@ -829,11 +831,15 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                     }
 #else
                     AirportWCL::LqmBeaconUpdate update;
-                    if (AirportWCL::makeBeaconUpdate(
+                    uint64_t now = 0;
+                    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+                    if (AirportWCL::lqmBeaconUpdateDue(now, wclLqmReportedAt) &&
+                        AirportWCL::makeBeaconUpdate(
                             wclLqmBeacons - wclLqmReportedBeacons, update)) {
                         instance->postMessage(this, AirportWCL::LqmUpdate,
                             &update, sizeof(update), true);
                         wclLqmReportedBeacons = wclLqmBeacons;
+                        wclLqmReportedAt = now;
                     }
 #endif
                     updateWCLLinkQuality();

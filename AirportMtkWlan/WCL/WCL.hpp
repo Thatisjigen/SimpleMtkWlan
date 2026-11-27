@@ -121,6 +121,15 @@ inline bool makeBeaconUpdate(uint32_t receivedDelta, LqmBeaconUpdate &out)
     return true;
 }
 
+// The family answers every LqmUpdate with APPLE80211_M_RSSI_CHANGED, which airportd and symptomsd
+// then handle. With the beacon counts WCLNetManager only stamps the link alive, and it leaves the
+// network once 60 s pass without beacons: one update every 5 s is plenty.
+constexpr uint64_t kLqmBeaconUpdateIntervalNs = 5000000000ULL;
+inline bool lqmBeaconUpdateDue(uint64_t nowNs, uint64_t lastNs)
+{
+    return lastNs == 0 || nowNs - lastNs >= kLqmBeaconUpdateIntervalNs;
+}
+
 struct DriverAvailability {
     uint32_t version;
     uint32_t reserved0;

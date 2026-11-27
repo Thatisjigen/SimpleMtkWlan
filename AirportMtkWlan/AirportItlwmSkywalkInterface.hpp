@@ -477,6 +477,7 @@ private:
     uint32_t wclAssociatedBeacons = 0;
     uint32_t wclLqmBeacons = 0;
     uint32_t wclLqmReportedBeacons = 0;
+    uint64_t wclLqmReportedAt = 0;      // uptime in ns of the last LqmUpdate, 0 before the first of a join
     int wclReportedLinkQuality = -2;
     ifnet_t wclLinkQualityInterface = nullptr;
     bool joinPending;
